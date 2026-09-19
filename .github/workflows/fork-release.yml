@@ -1,0 +1,208 @@
+name: Fork release
+
+# Builds the artifacts this fork exists to hand to other projects and attaches
+# them to a GitHub Release on a fork-only tag:
+#
+#   moq-relay   the relay binary, to deploy on a host with a public UDP port
+#   moq_ffi     the uniffi cdylib a C#/.NET host (e.g. a Dalamud plugin)
+#               P/Invokes, for linux-x64 and win-x64
+#
+# Rust consumers do not need this workflow at all: pin the fork by git in
+# Cargo.toml (see the README). This is for the things you cannot pin by
+# git: a deployable relay binary and a native library to ship beside managed
+# code.
+#
+# Upstream's own release workflows (moq-relay.yml, libmoq.yml, release-rs.yml,
+# ...) are left alone: they are tag-driven on `moq-relay-v*` / `libmoq-v*` and
+# publish to registries this fork has no business publishing to. The tag prefix
+# here (`spaceghost-v*`) cannot collide with any of them.
+
+on:
+  push:
+    tags:
+      - "spaceghost-v*"
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Create a Release from the build (otherwise build only)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 90
+
+    strategy:
+      # One target failing should not hide whether the others work.
+      fail-fast: false
+      matrix:
+        include:
+          # ubuntu-22.04 on purpose: the binary it produces needs at most
+          # GLIBC_2.34, so it runs on anything from Ubuntu 22.04 / RHEL 9
+          # forward. A build on ubuntu-latest would demand the runner's much
+          # newer glibc at runtime.
+          - name: moq-relay (linux-x64)
+            runs-on: ubuntu-22.04
+            crate: moq-relay
+            artifact: moq-relay
+            kind: bin
+          - name: moq-relay (linux-arm64)
+            runs-on: ubuntu-22.04-arm
+            crate: moq-relay
+            artifact: moq-relay
+            kind: bin
+          # moq-ffi is already crate-type = ["staticlib", "cdylib"], so the
+          # shared library a .NET DllImport needs falls out of a plain build.
+          - name: moq_ffi (linux-x64)
+            runs-on: ubuntu-22.04
+            crate: moq-ffi
+            artifact: libmoq_ffi.so
+            kind: lib
+          # Dalamud plugins are Windows-side even under Proton, so the DLL is
+          # the one that matters for FFXIV.
+          - name: moq_ffi (win-x64)
+            runs-on: windows-latest
+            crate: moq-ffi
+            artifact: moq_ffi.dll
+            kind: lib
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # rust-toolchain.toml pins 1.95.0; rustup honours it, so this only needs
+      # to put rustup on the box.
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - name: Build
+        shell: bash
+        # --locked so the build uses the committed Cargo.lock and a release is
+        # reproducible from the tag alone.
+        run: cargo build --locked --release -p ${{ matrix.crate }}
+
+      - name: Stage artifact
+        id: stage
+        shell: bash
+        env:
+          ARTIFACT: ${{ matrix.artifact }}
+          KIND: ${{ matrix.kind }}
+          RUNNER: ${{ matrix.runs-on }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+
+          case "$RUNNER" in
+            ubuntu-22.04) rid=linux-x64 ;;
+            ubuntu-22.04-arm) rid=linux-arm64 ;;
+            windows-latest) rid=win-x64 ;;
+            *) echo "unmapped runner $RUNNER" >&2; exit 1 ;;
+          esac
+
+          src="target/release/${ARTIFACT}"
+          [[ "$KIND" == "bin" && "$RUNNER" == windows-* ]] && src="${src}.exe"
+          if [[ ! -f "$src" ]]; then
+            echo "expected ${src} to exist; release build produced:" >&2
+            find target/release -maxdepth 1 -type f >&2
+            exit 1
+          fi
+
+          cp "$src" "dist/${ARTIFACT}"
+          ( cd dist && sha256sum "${ARTIFACT}" > "${ARTIFACT}.sha256" )
+          echo "rid=${rid}" >>"$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ matrix.crate }}-${{ steps.stage.outputs.rid }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Release
+    needs: build
+    # Only publish from a tag, or from a dispatch that asked for it. A dispatch
+    # with publish=false is a build check and creates nothing.
+    if: github.ref_type == 'tag' || inputs.publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: artifacts
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # A tag push releases at that tag. A dispatch mints a dated one, so
+          # the prefix stays unmistakably fork-local either way. The tag itself
+          # is created by `gh release create --target` below rather than pushed
+          # from here: this checkout deliberately keeps no credentials.
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            tag="${{ github.ref_name }}"
+          else
+            tag="spaceghost-v$(date -u +%Y.%m.%d).${{ github.run_number }}"
+          fi
+
+          # Flatten: each matrix job uploaded into its own directory
+          # (moq-relay-linux-x64, moq-ffi-win-x64, ...) and every one of them
+          # holds a file with the same bare name, so prefix each asset with its
+          # directory to keep release asset names distinct.
+          mkdir -p dist
+          for dir in artifacts/*/; do
+            for f in "$dir"*; do
+              [[ -f "$f" ]] || continue
+              cp "$f" "dist/$(basename "$dir")-$(basename "$f")"
+            done
+          done
+          find dist -type f
+
+          relay_ver="$(sed -n 's/^version = "\(.*\)"/\1/p' rs/moq-relay/Cargo.toml | head -1)"
+
+          # YAML strips this block's common indentation, so the continuation
+          # lines below start at column 0 in the generated script and the
+          # markdown fences are not indented into a code block.
+          notes="Fork build of \`Spaceghost/moq\` from \`${GITHUB_SHA}\`.
+
+          Upstream \`moq-relay\` version: \`${relay_ver}\`. This is **not** an upstream release; the \`spaceghost-v\` prefix exists so it can never be mistaken for one.
+
+          Rust consumers should pin the fork by git rather than use these files:
+
+          \`\`\`toml
+          [dependencies]
+          moq-net = { git = \"https://github.com/Spaceghost/moq\", tag = \"${tag}\" }
+          moq-native = { git = \"https://github.com/Spaceghost/moq\", tag = \"${tag}\" }
+          \`\`\`
+
+          Assets: \`moq-relay\` for linux-x64/linux-arm64, and the \`moq_ffi\` cdylib for linux-x64/win-x64 (the native library a .NET host P/Invokes). Each has a \`.sha256\` beside it."
+
+          gh release create "$tag" \
+            --target "$GITHUB_SHA" \
+            --title "spaceghost ${tag#spaceghost-v}" \
+            --notes "$notes" \
+            --prerelease \
+            dist/*

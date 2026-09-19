@@ -1,0 +1,63 @@
+name: Fork sync
+
+# Keeps this fork current with moq-dev/moq: `main` is fast-forwarded to the
+# upstream tip and the local patch series on `spaceghost` is rebased on top.
+# A conflict, or a patch that has landed upstream, stops the run and files an
+# issue rather than dropping anything. See .github/scripts/fork-sync.sh and the
+# README's "Fork maintenance" section.
+
+on:
+  schedule:
+    # Daily, 05:17 UTC. Off the hour because scheduled runs bunch up on the
+    # hour and get queued. GitHub disables schedules after 60 days without
+    # repository activity, so a sync that goes quiet for two months needs one
+    # manual dispatch to restart.
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Do the fetch and rebase but push nothing"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  issues: write
+
+# Never two syncs at once: the second would race the first's force-push.
+concurrency:
+  group: fork-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync with upstream
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # This is fork-specific plumbing. If someone forks the fork, it stays off.
+    if: github.repository_owner == 'Spaceghost'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history: the rebase needs the merge base of the patch branch
+          # and upstream, which a shallow clone does not have.
+          fetch-depth: 0
+          # Keep the credentials; this job pushes.
+          persist-credentials: true
+          # GITHUB_TOKEN cannot push commits that add or change files under
+          # .github/workflows/. The patch series does contain such files, but
+          # rebasing does not change their content, so the default token is
+          # enough in the ordinary case. It is NOT enough the day upstream edits
+          # a workflow file or a local patch touches one: that push is rejected
+          # and the run fails loudly. Fix by adding FORK_SYNC_TOKEN, a
+          # fine-grained PAT scoped to this repository with Contents:
+          # read/write, Workflows: read/write and Issues: read/write.
+          token: ${{ secrets.FORK_SYNC_TOKEN || github.token }}
+
+      - name: Sync
+        env:
+          GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN || github.token }}
+          DRY_RUN: ${{ inputs.dry_run || 'false' }}
+        run: .github/scripts/fork-sync.sh
