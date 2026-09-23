@@ -15,6 +15,7 @@ members = [
     "rs/moq-flate",
     "rs/moq-gst",
     "rs/moq-hls",
+    "rs/moq-iroh-c",
     "rs/moq-json",
     "rs/moq-loc",
     "rs/moq-msf",
@@ -56,6 +57,7 @@ default-members = [
     # "rs/moq-gst",   # requires GStreamer
     "rs/moq-flate",
     "rs/moq-hls",
+    "rs/moq-iroh-c",
     "rs/moq-json",
     "rs/moq-loc",
     "rs/moq-msf",
