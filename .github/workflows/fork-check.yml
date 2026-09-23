@@ -8,7 +8,8 @@ name: Fork check
 #
 # Upstream's check.yml is untouched and still runs every pull request, including
 # every pull request from a fork, on GitHub-hosted arm64. This workflow never
-# runs for a pull request and never outside Spaceghost/moq, because a
+# runs for a pull request, never outside Spaceghost/moq, and never for a run
+# anyone but the repository owner started, because a
 # self-hosted runner executes whatever the workflow file says. The dispatcher
 # refuses fork pull requests on its own as well. Setting the repository
 # variable CI_SELF_HOSTED to "false" turns this workflow off.
@@ -31,7 +32,10 @@ concurrency:
 
 jobs:
   check:
-    if: github.repository == 'Spaceghost/moq' && vars.CI_SELF_HOSTED != 'false'
+    if: >-
+      github.repository == 'Spaceghost/moq' && vars.CI_SELF_HOSTED != 'false'
+      && github.actor == github.repository_owner
+      && github.triggering_actor == github.repository_owner
     runs-on: [self-hosted, moq, fedora-rust]
     timeout-minutes: 120
     steps:
