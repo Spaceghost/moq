@@ -15,10 +15,10 @@ explicit access policy. Start from the local config and change these:
 5. Raise Linux UDP socket buffers (below).
 
 ```toml
-[server]
+[listen]
 bind = "[::]:443"
 
-[server.tls]
+[listen.tls]
 cert = "/etc/letsencrypt/live/relay.example.com/fullchain.pem"
 key = "/etc/letsencrypt/live/relay.example.com/privkey.pem"
 

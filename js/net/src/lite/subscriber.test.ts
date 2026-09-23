@@ -2,7 +2,7 @@ import { expect, spyOn, test } from "bun:test";
 import { Signal } from "@moq/signals";
 import type { Probe as ProbeStats } from "../connection/stats.ts";
 import { error, reason } from "../error.ts";
-import { OriginSchema, UNKNOWN_ORIGIN } from "../origin.ts";
+import { HopSchema, isAnonymous, MAX_HOPS, Route, UNKNOWN_HOP } from "../hop.ts";
 import * as Path from "../path.ts";
 import { Writer } from "../stream.ts";
 import * as Time from "../time.ts";
@@ -19,7 +19,7 @@ test("closing the subscriber suppresses probe stream warnings", async () => {
 			writable: new WritableStream<Uint8Array>(),
 		}),
 	} as unknown as WebTransport;
-	const subscriber = new Subscriber(quic, Version.DRAFT_03, OriginSchema.parse(1n), new Signal<ProbeStats>({}));
+	const subscriber = new Subscriber(quic, Version.DRAFT_03, HopSchema.parse(1n), new Signal<ProbeStats>({}));
 	const warn = spyOn(console, "warn").mockImplementation(() => {});
 
 	try {
@@ -65,7 +65,7 @@ function announceHarness(version: Version, origin = 1n) {
 		},
 	} as unknown as WebTransport;
 
-	const subscriber = new Subscriber(quic, version, OriginSchema.parse(origin));
+	const subscriber = new Subscriber(quic, version, HopSchema.parse(origin));
 
 	const send = async (f: (w: Writer) => Promise<void>) => {
 		const written: Uint8Array[] = [];
@@ -123,14 +123,110 @@ function announceHarness(version: Version, origin = 1n) {
 	};
 }
 
-const PUBLISHER_A = OriginSchema.parse(7n);
-const PUBLISHER_B = OriginSchema.parse(8n);
-const PUBLISHER_C = OriginSchema.parse(9n);
-const PEER = OriginSchema.parse(2n);
+const PUBLISHER_A = HopSchema.parse(7n);
+const PUBLISHER_B = HopSchema.parse(8n);
+const PUBLISHER_C = HopSchema.parse(9n);
+const PEER = HopSchema.parse(2n);
+
+test("a local empty hop chain is not anonymous", () => {
+	expect(isAnonymous(Route.default)).toBe(false);
+	expect(isAnonymous({ hops: [UNKNOWN_HOP], cost: Route.default.cost })).toBe(true);
+});
+
+test("a max-length chain plus withheld responder is dropped", async () => {
+	const { subscriber, send, settle } = announceHarness(Version.DRAFT_06);
+	const announced = subscriber.announced();
+	await settle();
+
+	const hops = Array.from({ length: MAX_HOPS }, (_, i) => HopSchema.parse(BigInt(i + 1)));
+	await send((w) => new AnnounceOk(UNKNOWN_HOP, 0).encode(w, Version.DRAFT_06));
+	await send((w) =>
+		encodeAnnounceBroadcast(w, { status: "active", suffix: Path.from("full"), hops }, Version.DRAFT_06),
+	);
+	await send((w) =>
+		encodeAnnounceBroadcast(
+			w,
+			{ status: "active", suffix: Path.from("room"), hops: [PUBLISHER_A] },
+			Version.DRAFT_06,
+		),
+	);
+	expect(await announced.next()).toMatchObject({
+		prefix: Path.from("room"),
+		kind: "announced",
+		route: { hops: [PUBLISHER_A, UNKNOWN_HOP] },
+	});
+
+	announced.close();
+	subscriber.close();
+});
+
+test("an unidentified responder keeps hop 0 on a nonempty chain", async () => {
+	const { subscriber, send, settle } = announceHarness(Version.DRAFT_06);
+	const announced = subscriber.announced();
+	await settle();
+
+	await send((w) => new AnnounceOk(UNKNOWN_HOP, 0).encode(w, Version.DRAFT_06));
+	await send((w) =>
+		encodeAnnounceBroadcast(
+			w,
+			{ status: "active", suffix: Path.from("room"), hops: [PUBLISHER_A] },
+			Version.DRAFT_06,
+		),
+	);
+	expect(await announced.next()).toMatchObject({
+		prefix: Path.from("room"),
+		kind: "announced",
+		route: { hops: [PUBLISHER_A, UNKNOWN_HOP] },
+	});
+
+	announced.close();
+	subscriber.close();
+});
+
+test("a received empty hop list is filled with hop 0 and marked anonymous", async () => {
+	const { subscriber, send, settle } = announceHarness(Version.DRAFT_06);
+	const announced = subscriber.announced();
+	await settle();
+
+	await send((w) => new AnnounceOk(UNKNOWN_HOP, 0).encode(w, Version.DRAFT_06));
+	await send((w) =>
+		encodeAnnounceBroadcast(w, { status: "active", suffix: Path.from("room"), hops: [] }, Version.DRAFT_06),
+	);
+	expect(await announced.next()).toMatchObject({
+		prefix: Path.from("room"),
+		kind: "announced",
+		route: { hops: [UNKNOWN_HOP] },
+	});
+
+	announced.close();
+	subscriber.close();
+});
+
+test("a received chain with hop 0 is marked anonymous", async () => {
+	const { subscriber, send, settle } = announceHarness(Version.DRAFT_06);
+	const announced = subscriber.announced();
+	await settle();
+
+	await send((w) => new AnnounceOk(PEER, 0).encode(w, Version.DRAFT_06));
+	await send((w) =>
+		encodeAnnounceBroadcast(
+			w,
+			{ status: "active", suffix: Path.from("room"), hops: [UNKNOWN_HOP, PUBLISHER_A] },
+			Version.DRAFT_06,
+		),
+	);
+	expect(await announced.next()).toMatchObject({
+		prefix: Path.from("room"),
+		kind: "announced",
+	});
+
+	announced.close();
+	subscriber.close();
+});
 
 test("a restart from the same publisher is a route change, not a republish", async () => {
 	const { subscriber, send, settle } = announceHarness(Version.DRAFT_06);
-	const announced = subscriber.announced(Path.empty());
+	const announced = subscriber.announced();
 	await settle();
 
 	await send((w) => new AnnounceOk(PEER, 0).encode(w, Version.DRAFT_06));
@@ -141,28 +237,64 @@ test("a restart from the same publisher is a route change, not a republish", asy
 			Version.DRAFT_06,
 		),
 	);
-	expect(await announced.next()).toEqual({ path: Path.from("room"), active: true });
+	expect(await announced.next()).toMatchObject({ prefix: Path.from("room"), kind: "announced" });
 
-	// Same publisher over a new route. In-flight subscriptions resume across it, so the
-	// subscriber must not surface anything that would make a consumer re-subscribe.
+	// Same publisher over an identical route. In-flight subscriptions resume across it,
+	// and there is no metadata to forward, so the subscriber must not surface a restart.
 	await send((w) => encodeAnnounceBroadcast(w, { status: "restart", id: 0n, hops: [PUBLISHER_A] }, Version.DRAFT_06));
 
 	// A different publisher took the path: nothing carries over, so this one does surface,
-	// as an end before the start. Reaching it proves the reroute above emitted nothing.
+	// as an end before the start. Reaching it proves the identical reroute above emitted nothing.
 	await send((w) => encodeAnnounceBroadcast(w, { status: "restart", id: 0n, hops: [PUBLISHER_B] }, Version.DRAFT_06));
-	expect(await announced.next()).toEqual({ path: Path.from("room"), active: false });
-	expect(await announced.next()).toEqual({ path: Path.from("room"), active: true });
+	expect(await announced.next()).toMatchObject({ prefix: Path.from("room"), kind: "retracted" });
+	expect(await announced.next()).toMatchObject({ prefix: Path.from("room"), kind: "announced" });
 
 	// A third publisher takes over. The replacement above has to leave its own publisher on
 	// record, or this one reads as a first announcement and skips the end.
 	await send((w) => encodeAnnounceBroadcast(w, { status: "restart", id: 0n, hops: [PUBLISHER_C] }, Version.DRAFT_06));
-	expect(await announced.next()).toEqual({ path: Path.from("room"), active: false });
-	expect(await announced.next()).toEqual({ path: Path.from("room"), active: true });
+	expect(await announced.next()).toMatchObject({ prefix: Path.from("room"), kind: "retracted" });
+	expect(await announced.next()).toMatchObject({ prefix: Path.from("room"), kind: "announced" });
 
 	// And the new owner's own reroute is still transparent.
 	await send((w) => encodeAnnounceBroadcast(w, { status: "restart", id: 0n, hops: [PUBLISHER_C] }, Version.DRAFT_06));
 	await send((w) => encodeAnnounceBroadcast(w, { status: "endedId", id: 0n }, Version.DRAFT_06));
-	expect(await announced.next()).toEqual({ path: Path.from("room"), active: false });
+	expect(await announced.next()).toMatchObject({ prefix: Path.from("room"), kind: "retracted" });
+
+	announced.close();
+	subscriber.close();
+});
+
+test("a restart that re-prices the same publisher emits the new route", async () => {
+	const { subscriber, send, settle } = announceHarness(Version.DRAFT_06);
+	const announced = subscriber.announced();
+	await settle();
+
+	await send((w) => new AnnounceOk(PEER, 0).encode(w, Version.DRAFT_06));
+	await send((w) =>
+		encodeAnnounceBroadcast(
+			w,
+			{ status: "active", suffix: Path.from("room"), hops: [PUBLISHER_A] },
+			Version.DRAFT_06,
+		),
+	);
+	expect(await announced.next()).toMatchObject({
+		prefix: Path.from("room"),
+		kind: "announced",
+		route: { hops: [PUBLISHER_A, PEER], cost: { warm: 0n, cold: 0n } },
+	});
+
+	await send((w) =>
+		encodeAnnounceBroadcast(
+			w,
+			{ status: "restart", id: 0n, hops: [PUBLISHER_A], cost: { warm: 4n, cold: 4n } },
+			Version.DRAFT_06,
+		),
+	);
+	expect(await announced.next()).toMatchObject({
+		prefix: Path.from("room"),
+		kind: "updated",
+		route: { hops: [PUBLISHER_A, PEER], cost: { warm: 4n, cold: 4n } },
+	});
 
 	announced.close();
 	subscriber.close();
@@ -170,21 +302,21 @@ test("a restart from the same publisher is a route change, not a republish", asy
 
 test("a lite-05 duplicate announce follows the same restart rule", async () => {
 	const { subscriber, send, settle } = announceHarness(Version.DRAFT_05);
-	const announced = subscriber.announced(Path.empty());
+	const announced = subscriber.announced();
 	await settle();
 
 	await send((w) => new AnnounceOk(PEER, 0).encode(w, Version.DRAFT_05));
-	const active = (hops: ReturnType<typeof OriginSchema.parse>[]) => (w: Writer) =>
+	const active = (hops: ReturnType<typeof HopSchema.parse>[]) => (w: Writer) =>
 		encodeAnnounceBroadcast(w, { status: "active", suffix: Path.from("room"), hops }, Version.DRAFT_05);
 
 	await send(active([PUBLISHER_A]));
-	expect(await announced.next()).toEqual({ path: Path.from("room"), active: true });
+	expect(await announced.next()).toMatchObject({ prefix: Path.from("room"), kind: "announced" });
 
 	// On lite-05 a restart travels as a duplicate ANNOUNCE rather than its own message.
 	await send(active([PUBLISHER_A]));
 	await send(active([PUBLISHER_B]));
-	expect(await announced.next()).toEqual({ path: Path.from("room"), active: false });
-	expect(await announced.next()).toEqual({ path: Path.from("room"), active: true });
+	expect(await announced.next()).toMatchObject({ prefix: Path.from("room"), kind: "retracted" });
+	expect(await announced.next()).toMatchObject({ prefix: Path.from("room"), kind: "announced" });
 
 	announced.close();
 	subscriber.close();
@@ -197,19 +329,19 @@ test("a lite-05 duplicate announce follows the same restart rule", async () => {
 // `unknown_publisher_restart_replaces` regression.
 test("a restart from an unidentified publisher replaces rather than reroutes", async () => {
 	const { subscriber, send, settle } = announceHarness(Version.DRAFT_06);
-	const announced = subscriber.announced(Path.empty());
+	const announced = subscriber.announced();
 	await settle();
 
-	await send((w) => new AnnounceOk(UNKNOWN_ORIGIN, 0).encode(w, Version.DRAFT_06));
+	await send((w) => new AnnounceOk(UNKNOWN_HOP, 0).encode(w, Version.DRAFT_06));
 	await send((w) =>
 		encodeAnnounceBroadcast(w, { status: "active", suffix: Path.from("room"), hops: [] }, Version.DRAFT_06),
 	);
-	expect(await announced.next()).toEqual({ path: Path.from("room"), active: true });
+	expect(await announced.next()).toMatchObject({ prefix: Path.from("room"), kind: "announced" });
 
 	// Nobody is named on either side, so this is not provably the same content.
 	await send((w) => encodeAnnounceBroadcast(w, { status: "restart", id: 0n, hops: [] }, Version.DRAFT_06));
-	expect(await announced.next()).toEqual({ path: Path.from("room"), active: false });
-	expect(await announced.next()).toEqual({ path: Path.from("room"), active: true });
+	expect(await announced.next()).toMatchObject({ prefix: Path.from("room"), kind: "retracted" });
+	expect(await announced.next()).toMatchObject({ prefix: Path.from("room"), kind: "announced" });
 
 	announced.close();
 	subscriber.close();
@@ -266,7 +398,7 @@ async function runProbeScript(version: Version, probes: Probe[], initial: ProbeS
 	} as unknown as WebTransport;
 
 	const signal = new Signal<ProbeStats>(initial);
-	const subscriber = new Subscriber(quic, version, OriginSchema.parse(1n), signal);
+	const subscriber = new Subscriber(quic, version, HopSchema.parse(1n), signal);
 	const running = subscriber.runProbe();
 
 	await Promise.resolve();
@@ -311,7 +443,7 @@ test("an announce skipped as a reflected loop still holds its path", async () =>
 	// The subscriber's own origin, so a chain naming it reflects back through us.
 	const SELF = 1n;
 	const { subscriber, send, abortReason, sessionEnded, settle } = announceHarness(Version.DRAFT_06, SELF);
-	const announced = subscriber.announced(Path.empty());
+	const announced = subscriber.announced();
 	await settle();
 
 	await send((w) => new AnnounceOk(PEER, 0).encode(w, Version.DRAFT_06));
@@ -321,7 +453,7 @@ test("an announce skipped as a reflected loop still holds its path", async () =>
 	await send((w) =>
 		encodeAnnounceBroadcast(
 			w,
-			{ status: "active", suffix: Path.from("room"), hops: [OriginSchema.parse(SELF)] },
+			{ status: "active", suffix: Path.from("room"), hops: [HopSchema.parse(SELF)] },
 			Version.DRAFT_06,
 		),
 	);
@@ -353,7 +485,7 @@ test("an announce skipped as a reflected loop still holds its path", async () =>
 test("a restart replaces an announce that was skipped as a reflected loop", async () => {
 	const SELF = 1n;
 	const { subscriber, send, settle } = announceHarness(Version.DRAFT_06, SELF);
-	const announced = subscriber.announced(Path.empty());
+	const announced = subscriber.announced();
 	await settle();
 
 	await send((w) => new AnnounceOk(PEER, 0).encode(w, Version.DRAFT_06));
@@ -362,7 +494,7 @@ test("a restart replaces an announce that was skipped as a reflected loop", asyn
 	await send((w) =>
 		encodeAnnounceBroadcast(
 			w,
-			{ status: "active", suffix: Path.from("room"), hops: [OriginSchema.parse(SELF)] },
+			{ status: "active", suffix: Path.from("room"), hops: [HopSchema.parse(SELF)] },
 			Version.DRAFT_06,
 		),
 	);
@@ -370,11 +502,11 @@ test("a restart replaces an announce that was skipped as a reflected loop", asyn
 
 	// The id stays live, so the peer may restart it into a route that is usable here.
 	await send((w) => encodeAnnounceBroadcast(w, { status: "restart", id: 0n, hops: [PUBLISHER_A] }, Version.DRAFT_06));
-	expect(await announced.next()).toEqual({ path: Path.from("room"), active: true });
+	expect(await announced.next()).toMatchObject({ prefix: Path.from("room"), kind: "announced" });
 
 	// Retiring the id ends what the restart attached, and nothing else.
 	await send((w) => encodeAnnounceBroadcast(w, { status: "endedId", id: 0n }, Version.DRAFT_06));
-	expect(await announced.next()).toEqual({ path: Path.from("room"), active: false });
+	expect(await announced.next()).toMatchObject({ prefix: Path.from("room"), kind: "retracted" });
 
 	announced.close();
 	subscriber.close();
@@ -383,7 +515,7 @@ test("a restart replaces an announce that was skipped as a reflected loop", asyn
 test("retiring an id whose announce was skipped ends nothing", async () => {
 	const SELF = 1n;
 	const { subscriber, send, settle } = announceHarness(Version.DRAFT_06, SELF);
-	const announced = subscriber.announced(Path.empty());
+	const announced = subscriber.announced();
 	await settle();
 
 	await send((w) => new AnnounceOk(PEER, 0).encode(w, Version.DRAFT_06));
@@ -392,7 +524,7 @@ test("retiring an id whose announce was skipped ends nothing", async () => {
 	await send((w) =>
 		encodeAnnounceBroadcast(
 			w,
-			{ status: "active", suffix: Path.from("room"), hops: [OriginSchema.parse(SELF)] },
+			{ status: "active", suffix: Path.from("room"), hops: [HopSchema.parse(SELF)] },
 			Version.DRAFT_06,
 		),
 	);
@@ -404,13 +536,13 @@ test("retiring an id whose announce was skipped ends nothing", async () => {
 			Version.DRAFT_06,
 		),
 	);
-	expect(await announced.next()).toEqual({ path: Path.from("lobby"), active: true });
+	expect(await announced.next()).toMatchObject({ prefix: Path.from("lobby"), kind: "announced" });
 
 	// Retire the skipped one, then the live one. The first must surface nothing, so the
 	// only end a consumer sees is "lobby".
 	await send((w) => encodeAnnounceBroadcast(w, { status: "endedId", id: 0n }, Version.DRAFT_06));
 	await send((w) => encodeAnnounceBroadcast(w, { status: "endedId", id: 1n }, Version.DRAFT_06));
-	expect(await announced.next()).toEqual({ path: Path.from("lobby"), active: false });
+	expect(await announced.next()).toMatchObject({ prefix: Path.from("lobby"), kind: "retracted" });
 
 	announced.close();
 	subscriber.close();
@@ -418,16 +550,16 @@ test("retiring an id whose announce was skipped ends nothing", async () => {
 
 test("a draft-02 initial announcement can still be retracted", async () => {
 	const { subscriber, send, settle } = announceHarness(Version.DRAFT_02);
-	const announced = subscriber.announced(Path.empty());
+	const announced = subscriber.announced();
 	await settle();
 
 	// ANNOUNCE_INIT carries the initial set. These are advertisements like any other, so
 	// the peer may retract one later and the consumer has to hear about it.
 	await send((w) => new AnnounceInit([Path.from("room")]).encode(w, Version.DRAFT_02));
-	expect(await announced.next()).toEqual({ path: Path.from("room"), active: true });
+	expect(await announced.next()).toMatchObject({ prefix: Path.from("room"), kind: "announced" });
 
 	await send((w) => encodeAnnounceBroadcast(w, { status: "ended", suffix: Path.from("room") }, Version.DRAFT_02));
-	expect(await announced.next()).toEqual({ path: Path.from("room"), active: false });
+	expect(await announced.next()).toMatchObject({ prefix: Path.from("room"), kind: "retracted" });
 
 	announced.close();
 	subscriber.close();
@@ -436,7 +568,7 @@ test("a draft-02 initial announcement can still be retracted", async () => {
 test("a duplicate start is reported even when its own route reflects", async () => {
 	const SELF = 1n;
 	const { subscriber, send, settle } = announceHarness(Version.DRAFT_06, SELF);
-	const announced = subscriber.announced(Path.empty());
+	const announced = subscriber.announced();
 	await settle();
 
 	await send((w) => new AnnounceOk(PEER, 0).encode(w, Version.DRAFT_06));
@@ -449,7 +581,7 @@ test("a duplicate start is reported even when its own route reflects", async () 
 			Version.DRAFT_06,
 		),
 	);
-	expect(await announced.next()).toEqual({ path: Path.from("room"), active: true });
+	expect(await announced.next()).toMatchObject({ prefix: Path.from("room"), kind: "announced" });
 
 	// A second start for that path, carrying a route that loops back through us. Skipping
 	// it must not pre-empt the violation: the peer sent two starts with no end between
@@ -457,7 +589,7 @@ test("a duplicate start is reported even when its own route reflects", async () 
 	await send((w) =>
 		encodeAnnounceBroadcast(
 			w,
-			{ status: "active", suffix: Path.from("room"), hops: [OriginSchema.parse(SELF)] },
+			{ status: "active", suffix: Path.from("room"), hops: [HopSchema.parse(SELF)] },
 			Version.DRAFT_06,
 		),
 	);
@@ -470,7 +602,7 @@ test("a duplicate start is reported even when its own route reflects", async () 
 
 test("a draft-02 initial set naming a path twice is refused", async () => {
 	const { subscriber, send, abortReason, sessionEnded, settle } = announceHarness(Version.DRAFT_02);
-	const announced = subscriber.announced(Path.empty());
+	const announced = subscriber.announced();
 	await settle();
 
 	// One advertisement per path, and the initial set is advertisements. Two entries for
@@ -494,7 +626,7 @@ test("a draft-02 initial set naming a path twice is refused", async () => {
 test("a violation on a very long path still ends the session", async () => {
 	const SELF = 1n;
 	const { subscriber, send, sessionEnded, settle } = announceHarness(Version.DRAFT_06, SELF);
-	const announced = subscriber.announced(Path.empty());
+	const announced = subscriber.announced();
 	await settle();
 
 	await send((w) => new AnnounceOk(PEER, 0).encode(w, Version.DRAFT_06));
@@ -505,7 +637,7 @@ test("a violation on a very long path still ends the session", async () => {
 	const long = Path.from("x".repeat(2000));
 	const active: AnnounceBroadcast = { status: "active", suffix: long, hops: [PUBLISHER_A] };
 	await send((w) => encodeAnnounceBroadcast(w, active, Version.DRAFT_06));
-	expect(await announced.next()).toEqual({ path: long, active: true });
+	expect(await announced.next()).toMatchObject({ prefix: long, kind: "announced" });
 
 	await send((w) => encodeAnnounceBroadcast(w, active, Version.DRAFT_06));
 	await expect(announced.next()).rejects.toThrow("duplicate announce");
@@ -521,12 +653,12 @@ test("a draft-04 duplicate start is a violation, not a restart", async () => {
 	// restart, is exempt. The Rust loop routes every other version through `start_announce`,
 	// which rejects it.
 	const { subscriber, send, sessionEnded, settle } = announceHarness(Version.DRAFT_04);
-	const announced = subscriber.announced(Path.empty());
+	const announced = subscriber.announced();
 	await settle();
 
 	const active: AnnounceBroadcast = { status: "active", suffix: Path.from("room"), hops: [PUBLISHER_A] };
 	await send((w) => encodeAnnounceBroadcast(w, active, Version.DRAFT_04));
-	expect(await announced.next()).toEqual({ path: Path.from("room"), active: true });
+	expect(await announced.next()).toMatchObject({ prefix: Path.from("room"), kind: "announced" });
 
 	await send((w) => encodeAnnounceBroadcast(w, active, Version.DRAFT_04));
 
@@ -538,14 +670,14 @@ test("a draft-04 duplicate start is a violation, not a restart", async () => {
 
 test("a draft-05 duplicate start is still a restart", async () => {
 	const { subscriber, send, settle } = announceHarness(Version.DRAFT_05);
-	const announced = subscriber.announced(Path.empty());
+	const announced = subscriber.announced();
 	await settle();
 
 	await send((w) => new AnnounceOk(PEER, 0).encode(w, Version.DRAFT_05));
 
 	const active: AnnounceBroadcast = { status: "active", suffix: Path.from("room"), hops: [PUBLISHER_A] };
 	await send((w) => encodeAnnounceBroadcast(w, active, Version.DRAFT_05));
-	expect(await announced.next()).toEqual({ path: Path.from("room"), active: true });
+	expect(await announced.next()).toMatchObject({ prefix: Path.from("room"), kind: "announced" });
 
 	// Same publisher over a new route: transparent, and emphatically not an error.
 	await send((w) => encodeAnnounceBroadcast(w, active, Version.DRAFT_05));
@@ -553,8 +685,8 @@ test("a draft-05 duplicate start is still a restart", async () => {
 	// A different publisher does surface, which is what proves the reroute above passed.
 	const replaced: AnnounceBroadcast = { status: "active", suffix: Path.from("room"), hops: [PUBLISHER_B] };
 	await send((w) => encodeAnnounceBroadcast(w, replaced, Version.DRAFT_05));
-	expect(await announced.next()).toEqual({ path: Path.from("room"), active: false });
-	expect(await announced.next()).toEqual({ path: Path.from("room"), active: true });
+	expect(await announced.next()).toMatchObject({ prefix: Path.from("room"), kind: "retracted" });
+	expect(await announced.next()).toMatchObject({ prefix: Path.from("room"), kind: "announced" });
 
 	announced.close();
 	subscriber.close();

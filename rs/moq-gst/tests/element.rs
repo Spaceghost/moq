@@ -1034,7 +1034,7 @@ fn a_pad_requested_from_the_eos_notify_is_refused() {
 }
 
 // A write that the producer rejects is the failure the property exists for. A frame past
-// MAX_GROUP_CACHE is the deterministic way to cause one: moq-net refuses it before reserving a group.
+// MAX_CACHE_BYTES is the deterministic way to cause one: moq-net refuses it before reserving a group.
 #[test]
 fn a_rejected_write_moves_the_pad_to_error() {
 	init();
@@ -1491,8 +1491,8 @@ fn connect_failure_retries_without_erroring() {
 	let msg = bus.timed_pop_filtered(gst::ClockTime::from_seconds(3), &[gst::MessageType::Error]);
 	let connected = sink.property::<bool>("connected");
 	let status = sink.property::<gstmoq::ConnectionStatus>("status");
-	let send_bitrate = sink.property::<u64>("estimated-send-bitrate");
-	let recv_bitrate = sink.property::<u64>("estimated-recv-bitrate");
+	let send_bitrate = sink.property::<u64>("estimated-send-rate");
+	let recv_bitrate = sink.property::<u64>("estimated-recv-rate");
 	let _ = pipeline.set_state(gst::State::Null);
 
 	assert!(

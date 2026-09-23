@@ -1,5 +1,6 @@
 import { Decoder as Flate } from "@moq/flate";
 
+import { isDeflate } from "../compression.ts";
 import { merge } from "../diff.ts";
 import type { Config } from "./encoder.ts";
 
@@ -25,9 +26,9 @@ export class Decoder<T> {
 	// The reconstructed value, `undefined` until the first snapshot.
 	#current?: unknown;
 
-	constructor(config: Config<T> = {}) {
+	constructor(config: Pick<Config<T>, "schema" | "compression"> = {}) {
 		this.#schema = config.schema;
-		this.#decompress = config.compression ?? false;
+		this.#decompress = isDeflate(config.compression);
 	}
 
 	/**

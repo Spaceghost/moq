@@ -7,6 +7,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- [**breaking**] One handle publishes a rendition. `catalog::Producer::{video,audio,text,track}` and
+  their `Reserved` counterparts take the media track, container, and an optional config and return
+  a `container::Producer<C, R>` that owns the catalog entry: `set` publishes or replaces the config,
+  `modify` edits it through a guard (`Error::NotPublished` before the first `set`), `cut`/`finish`
+  publish the measured estimate, and dropping the producer retires the entry. `catalog::Rendition`,
+  `VideoTrack`, `AudioTrack`, `Reserved::producer`, `Producer::media_producer`, and `Producer::enroll`
+  are private; `import::Track` and `import::TrackStream` drop their catalog-extension parameter.
+  `RenditionConfig` requires `Clone + Send` and opts into estimate detection with `detects()`.
+- [**breaking**] `catalog::Producer::lock` is now `modify` and returns a `Result`, refusing a
+  finished catalog. A guard that fails to publish on drop aborts the catalog tracks with the error
+  instead of logging a warning, so consumers and the next `modify` both see it. `Guard::commit` is
+  unchanged and leaves the tracks open on failure.
+- [**breaking**] Advertise the broadcast timeline through `catalog.archive`
+  (`hang::catalog::Archive`). `timeline::Producer::section` returns `Archive`.
+- [**breaking**] Replace `timeline::Config::wall` with the broadcast `Clock`'s fixed wall
+  mapping, advertised at the catalog root as `clock: { wall, timescale }` independently of
+  any archive. `catalog::Config::with_clock` names the content's real start for an import;
+  `catalog::Producer::clock` shares the epoch. Zero timescales, walls before the moq epoch,
+  and walls past the JSON-safe integer range are refused.
+- `import::ContainerStream::new` takes a bare `ContainerFormat` instead of a `ContainerInit`. It
+  only ever read the format, so the init's leading bytes were accepted and dropped. A stream
+  recovers its own framing, so push everything through `decode` instead.
+
+- Import formats are typed: `import::{AudioFormat, VideoFormat, ContainerFormat}` replace the format
+  string on each `Init`, so a format of the wrong kind no longer compiles. `FromStr` accepts every
+  alias and is where a caller crossing a string boundary finds out, reporting `Error::WrongKind`
+  with the kind that does take it. `Display` gives the canonical name, so aliases like `h264` and
+  `avc3` no longer produce differently named tracks.
+- `Error::NotSelfDescribing` replaces the unknown-format error `TrackStream::video` raised for a
+  video codec a raw byte stream cannot be split into.
+- `import::Track::new` splits into `Track::audio` and `Track::video`, `import::TrackStream::new`
+  becomes `TrackStream::video`, and `import::Init` splits into `AudioInit`, `VideoInit`, and
+  `ContainerInit`. Each entry point takes only the fields its kind can honor, so a video hint on an
+  audio import or a label on a container is no longer expressible.
+- `Error::UnsupportedField` becomes `Error::WrongKind`, which names the kind that does handle the
+  format rather than reporting it as unknown. `import::Kind::of` exposes the same classification.
+
+### Added
+
+- `rate::{Policy, Control}`, the media bitrate policy audio, video, and transcode senders share
+  (moved from `moq_video::encode::rate`). An inverted policy starts at its ceiling.
+- Propagate rendition labels through single-track media imports.
+- `Clock::with_wall` / `Clock::new_at` for imports and synthetic sources, `Clock::source`
+  translating a source's own zero onto the broadcast mapping (first frame anchors live, a
+  reset re-anchors forward preserving the idle gap, in-group B-frame reordering survives),
+  and `Error::UnmappableTimestamp` refusing a mapping that would move backwards past the
+  broadcast's start or out of range.
+- `From<hang::catalog::VideoConfig> for catalog::VideoHint`, a total conversion for a caller that
+  already has a whole rendition. Replaces the per-field copy in `moq-video`, which dropped the label.
+
+### Changed
+
+- `import::Container::new` and `import::ContainerStream::new` take an `import::Init` instead of a
+  format and buffer, and reject the single-rendition `label` and `video` fields rather than
+  dropping them.
+- An audio format rejects an `import::Init` video hint instead of dropping it.
+- `catalog::VideoHint::label` is no longer public. `import::Init::label` is the single source of a
+  rendition label, matching the hang draft, which classifies it as a common rendition field.
+
 ## [0.9.16](https://github.com/moq-dev/moq/compare/moq-mux-v0.9.15...moq-mux-v0.9.16) - 2026-09-17
 
 ### Fixed

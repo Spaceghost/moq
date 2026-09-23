@@ -3,7 +3,7 @@
 use anyhow::Context;
 use hang::moq_net;
 
-/// Wait for `broadcast` to be announced on `origin`, then subscribe to it.
+/// Wait for a route to cover `broadcast` on `origin`, then subscribe to it.
 ///
 /// The wait is the whole point. Subscribing goes through
 /// `origin::Consumer::request_broadcast`, which resolves `Unroutable` on the
@@ -12,7 +12,7 @@ use hang::moq_net;
 /// window is already up, so this shows as a black frame rather than as a hang.
 pub(super) async fn subscribe(origin: moq_net::origin::Consumer, broadcast: &str) -> anyhow::Result<moq_mux::Source> {
 	origin
-		.announced_broadcast(broadcast)
+		.routed(broadcast)
 		.await
 		.with_context(|| format!("origin closed before broadcast `{broadcast}` was announced"))?;
 
@@ -32,7 +32,7 @@ mod tests {
 	async fn subscribe_waits_for_the_announcement() {
 		tokio::time::pause();
 
-		let origin = moq_net::Origin::random().produce();
+		let origin = moq_tokio::origin::spawn();
 		let consumer = origin.consume();
 
 		// Direct resolution has no route before the announcement.
@@ -44,9 +44,8 @@ mod tests {
 		let parked = tokio::time::timeout(Duration::from_secs(60), &mut waiting).await;
 		assert!(parked.is_err(), "expected to still be waiting on the announcement");
 
-		let _broadcast = origin
-			.create_broadcast("room.hang", moq_net::broadcast::Route::new().with_announce(true))
-			.unwrap();
+		let _broadcast = origin.create_broadcast("room.hang").unwrap();
+		_broadcast.announce(Default::default()).unwrap();
 		waiting.await.unwrap();
 	}
 }

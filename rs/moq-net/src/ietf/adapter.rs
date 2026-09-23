@@ -1,7 +1,7 @@
 use std::{
 	collections::{HashMap, VecDeque},
 	sync::{Arc, Mutex, Weak},
-	task::Poll,
+	task::{Context, Poll},
 };
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
@@ -115,6 +115,7 @@ pub struct VirtualRecvStream {
 	buffer: Bytes,
 	rx: Queue<Bytes>,
 	closed: bool,
+	park: kio::Park,
 	shared: Weak<Shared>,
 	/// The request this stream serves, known up front when the peer opened it and
 	/// filled in by the first write when we did.
@@ -127,83 +128,106 @@ impl VirtualRecvStream {
 			buffer: initial,
 			rx,
 			closed: false,
+			park: kio::Park::default(),
 			shared: Arc::downgrade(&shared),
 			request_id,
 		}
 	}
 
-	/// Fill the buffer from the queue if empty. Returns false if the stream is closed.
-	async fn fill(&mut self) -> bool {
-		if !self.buffer.is_empty() {
-			return true;
+	/// Fill the buffer from the queue if empty; `self.closed` marks the FIN.
+	fn poll_fill(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+		if !self.buffer.is_empty() || self.closed {
+			return Poll::Ready(());
 		}
 
-		if self.closed {
-			return false;
-		}
-
-		match self.rx.pop().await {
-			Some(data) => {
+		let waiter = self.park.hold(cx);
+		match self.rx.poll_pop(waiter) {
+			Poll::Ready(Some(data)) => {
 				self.buffer = data;
-				true
+				Poll::Ready(())
 			}
-			None => {
+			Poll::Ready(None) => {
 				self.closed = true;
-				false
+				Poll::Ready(())
 			}
+			Poll::Pending => Poll::Pending,
 		}
 	}
 }
 
-impl web_transport_trait::RecvStream for VirtualRecvStream {
+impl web_transport_trait::poll::RecvStream for VirtualRecvStream {
 	type Error = crate::Error;
 
-	async fn read(&mut self, dst: &mut [u8]) -> Result<Option<usize>, Self::Error> {
-		if !self.fill().await {
-			return Ok(None);
+	fn poll_read(&mut self, cx: &mut Context<'_>, dst: &mut [u8]) -> Poll<Result<Option<usize>, Self::Error>> {
+		if dst.is_empty() {
+			return Poll::Ready(Ok(Some(0)));
+		}
+
+		std::task::ready!(self.poll_fill(cx));
+		if self.buffer.is_empty() {
+			return Poll::Ready(Ok(None));
 		}
 
 		let n = dst.len().min(self.buffer.len());
 		dst[..n].copy_from_slice(&self.buffer[..n]);
 		self.buffer.advance(n);
-		Ok(Some(n))
+		Poll::Ready(Ok(Some(n)))
 	}
 
-	async fn read_buf<B: BufMut + web_transport_trait::MaybeSend>(
+	fn poll_read_buf<B: BufMut>(
 		&mut self,
+		cx: &mut Context<'_>,
 		buf: &mut B,
-	) -> Result<Option<usize>, Self::Error> {
-		if !self.fill().await {
-			return Ok(None);
+	) -> Poll<Result<Option<usize>, Self::Error>> {
+		if !buf.has_remaining_mut() {
+			return Poll::Ready(Ok(Some(0)));
+		}
+
+		std::task::ready!(self.poll_fill(cx));
+		if self.buffer.is_empty() {
+			return Poll::Ready(Ok(None));
 		}
 
 		let n = buf.remaining_mut().min(self.buffer.len());
 		buf.put(self.buffer.split_to(n));
-		Ok(Some(n))
+		Poll::Ready(Ok(Some(n)))
 	}
 
-	async fn read_chunk(&mut self, max: usize) -> Result<Option<Bytes>, Self::Error> {
-		if !self.fill().await {
-			return Ok(None);
+	fn poll_read_chunk(&mut self, cx: &mut Context<'_>, max: usize) -> Poll<Result<Option<Bytes>, Self::Error>> {
+		if max == 0 {
+			return Poll::Ready(Ok(Some(Bytes::new())));
+		}
+
+		std::task::ready!(self.poll_fill(cx));
+		if self.buffer.is_empty() {
+			return Poll::Ready(Ok(None));
 		}
 
 		let n = max.min(self.buffer.len());
-		Ok(Some(self.buffer.split_to(n)))
+		Poll::Ready(Ok(Some(self.buffer.split_to(n))))
 	}
 
 	fn stop(&mut self, _code: u32) {
 		self.rx.close();
 	}
 
-	async fn closed(&mut self) -> Result<(), Self::Error> {
-		// Wait until the queue is closed
+	fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
 		if self.closed {
-			return Ok(());
+			return Poll::Ready(Ok(()));
 		}
-		// Drain remaining messages
-		while self.rx.pop().await.is_some() {}
-		self.closed = true;
-		Ok(())
+
+		// Drain (and discard) remaining messages until the queue closes.
+		let waiter = self.park.hold(cx);
+		loop {
+			match self.rx.poll_pop(waiter) {
+				Poll::Ready(Some(_)) => {}
+				Poll::Ready(None) => {
+					self.closed = true;
+					return Poll::Ready(Ok(()));
+				}
+				Poll::Pending => return Poll::Pending,
+			}
+		}
 	}
 }
 
@@ -312,31 +336,11 @@ impl VirtualSendStream {
 	}
 }
 
-impl web_transport_trait::SendStream for VirtualSendStream {
-	type Error = crate::Error;
-
-	async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
-		let len = buf.len();
-
-		if let Some(pending) = &mut self.pending {
-			pending.buf.extend_from_slice(buf);
-
-			if let Some(request_id) = pending.try_parse()? {
-				let mut pending = self.pending.take().unwrap();
-				let buf = std::mem::take(&mut pending.buf).freeze();
-				pending.register(request_id);
-				if !self.control_tx.push(buf) {
-					return Err(crate::Error::Closed);
-				}
-			}
-		} else if !self.control_tx.push(Bytes::copy_from_slice(buf)) {
-			return Err(crate::Error::Closed);
-		}
-
-		Ok(len)
-	}
-
-	async fn write_chunk(&mut self, chunk: Bytes) -> Result<(), Self::Error> {
+impl VirtualSendStream {
+	/// Route a chunk: accumulate while the request_id is still unknown, then
+	/// register and flush; forward directly afterwards. Never blocks, since the
+	/// control queue is unbounded.
+	fn push(&mut self, chunk: Bytes) -> Result<(), crate::Error> {
 		if let Some(pending) = &mut self.pending {
 			pending.buf.extend_from_slice(&chunk);
 
@@ -354,6 +358,23 @@ impl web_transport_trait::SendStream for VirtualSendStream {
 
 		Ok(())
 	}
+}
+
+impl web_transport_trait::poll::SendStream for VirtualSendStream {
+	type Error = crate::Error;
+
+	fn poll_write(&mut self, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, Self::Error>> {
+		let len = buf.len();
+		Poll::Ready(self.push(Bytes::copy_from_slice(buf)).map(|()| len))
+	}
+
+	fn poll_write_buf<B: Buf>(&mut self, _cx: &mut Context<'_>, buf: &mut B) -> Poll<Result<usize, Self::Error>> {
+		// Taking the whole buffer is safe because this never returns Pending; a
+		// `Bytes` source hands its chunk over without a copy.
+		let len = buf.remaining();
+		let chunk = buf.copy_to_bytes(len);
+		Poll::Ready(self.push(chunk).map(|()| len))
+	}
 
 	fn set_priority(&mut self, _order: u8) {}
 
@@ -369,39 +390,32 @@ impl web_transport_trait::SendStream for VirtualSendStream {
 
 	fn reset(&mut self, _code: u32) {}
 
-	async fn closed(&mut self) -> Result<(), Self::Error> {
-		Ok(())
+	fn poll_closed(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+		Poll::Ready(Ok(()))
 	}
 }
 
 // === Adapter Send/Recv Enums ===
 
-pub enum AdapterSend<S: web_transport_trait::Session> {
+pub enum AdapterSend<S: crate::transport::poll::Session> {
 	Real(S::SendStream),
 	Virtual(VirtualSendStream),
 }
 
-impl<S: web_transport_trait::Session> web_transport_trait::SendStream for AdapterSend<S> {
+impl<S: crate::transport::poll::Session> web_transport_trait::poll::SendStream for AdapterSend<S> {
 	type Error = crate::Error;
 
-	async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+	fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, Self::Error>> {
 		match self {
-			Self::Real(s) => s.write(buf).await.map_err(|_| crate::Error::Closed),
-			Self::Virtual(s) => s.write(buf).await,
+			Self::Real(s) => s.poll_write(cx, buf).map(|r| r.map_err(|_| crate::Error::Closed)),
+			Self::Virtual(s) => s.poll_write(cx, buf),
 		}
 	}
 
-	async fn write_buf<B: Buf + web_transport_trait::MaybeSend>(&mut self, buf: &mut B) -> Result<usize, Self::Error> {
+	fn poll_write_buf<B: Buf>(&mut self, cx: &mut Context<'_>, buf: &mut B) -> Poll<Result<usize, Self::Error>> {
 		match self {
-			Self::Real(s) => s.write_buf(buf).await.map_err(|_| crate::Error::Closed),
-			Self::Virtual(s) => s.write_buf(buf).await,
-		}
-	}
-
-	async fn write_chunk(&mut self, chunk: Bytes) -> Result<(), Self::Error> {
-		match self {
-			Self::Real(s) => s.write_chunk(chunk).await.map_err(|_| crate::Error::Closed),
-			Self::Virtual(s) => s.write_chunk(chunk).await,
+			Self::Real(s) => s.poll_write_buf(cx, buf).map(|r| r.map_err(|_| crate::Error::Closed)),
+			Self::Virtual(s) => s.poll_write_buf(cx, buf),
 		}
 	}
 
@@ -426,43 +440,44 @@ impl<S: web_transport_trait::Session> web_transport_trait::SendStream for Adapte
 		}
 	}
 
-	async fn closed(&mut self) -> Result<(), Self::Error> {
+	fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
 		match self {
-			Self::Real(s) => s.closed().await.map_err(|_| crate::Error::Closed),
-			Self::Virtual(s) => s.closed().await,
+			Self::Real(s) => s.poll_closed(cx).map(|r| r.map_err(|_| crate::Error::Closed)),
+			Self::Virtual(s) => s.poll_closed(cx),
 		}
 	}
 }
 
-pub enum AdapterRecv<S: web_transport_trait::Session> {
+pub enum AdapterRecv<S: crate::transport::poll::Session> {
 	Real(S::RecvStream),
 	Virtual(VirtualRecvStream),
 }
 
-impl<S: web_transport_trait::Session> web_transport_trait::RecvStream for AdapterRecv<S> {
+impl<S: crate::transport::poll::Session> web_transport_trait::poll::RecvStream for AdapterRecv<S> {
 	type Error = crate::Error;
 
-	async fn read(&mut self, dst: &mut [u8]) -> Result<Option<usize>, Self::Error> {
+	fn poll_read(&mut self, cx: &mut Context<'_>, dst: &mut [u8]) -> Poll<Result<Option<usize>, Self::Error>> {
 		match self {
-			Self::Real(s) => s.read(dst).await.map_err(|_| crate::Error::Closed),
-			Self::Virtual(s) => s.read(dst).await,
+			Self::Real(s) => s.poll_read(cx, dst).map(|r| r.map_err(|_| crate::Error::Closed)),
+			Self::Virtual(s) => s.poll_read(cx, dst),
 		}
 	}
 
-	async fn read_buf<B: BufMut + web_transport_trait::MaybeSend>(
+	fn poll_read_buf<B: BufMut>(
 		&mut self,
+		cx: &mut Context<'_>,
 		buf: &mut B,
-	) -> Result<Option<usize>, Self::Error> {
+	) -> Poll<Result<Option<usize>, Self::Error>> {
 		match self {
-			Self::Real(s) => s.read_buf(buf).await.map_err(|_| crate::Error::Closed),
-			Self::Virtual(s) => s.read_buf(buf).await,
+			Self::Real(s) => s.poll_read_buf(cx, buf).map(|r| r.map_err(|_| crate::Error::Closed)),
+			Self::Virtual(s) => s.poll_read_buf(cx, buf),
 		}
 	}
 
-	async fn read_chunk(&mut self, max: usize) -> Result<Option<Bytes>, Self::Error> {
+	fn poll_read_chunk(&mut self, cx: &mut Context<'_>, max: usize) -> Poll<Result<Option<Bytes>, Self::Error>> {
 		match self {
-			Self::Real(s) => s.read_chunk(max).await.map_err(|_| crate::Error::Closed),
-			Self::Virtual(s) => s.read_chunk(max).await,
+			Self::Real(s) => s.poll_read_chunk(cx, max).map(|r| r.map_err(|_| crate::Error::Closed)),
+			Self::Virtual(s) => s.poll_read_chunk(cx, max),
 		}
 	}
 
@@ -473,10 +488,10 @@ impl<S: web_transport_trait::Session> web_transport_trait::RecvStream for Adapte
 		}
 	}
 
-	async fn closed(&mut self) -> Result<(), Self::Error> {
+	fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
 		match self {
-			Self::Real(s) => s.closed().await.map_err(|_| crate::Error::Closed),
-			Self::Virtual(s) => s.closed().await,
+			Self::Real(s) => s.poll_closed(cx).map(|r| r.map_err(|_| crate::Error::Closed)),
+			Self::Virtual(s) => s.poll_closed(cx),
 		}
 	}
 }
@@ -691,40 +706,46 @@ impl Shared {
 }
 
 #[derive(Clone)]
-pub struct ControlStreamAdapter<S: web_transport_trait::Session> {
+pub struct ControlStreamAdapter<S: crate::transport::poll::Session> {
 	inner: S,
 	shared: Arc<Shared>,
 	control: Control,
 	version: Version,
+	// Bridges Context-based polls onto the kio queues; empty on clone.
+	park: kio::Park,
 }
 
-impl<S: web_transport_trait::Session> ControlStreamAdapter<S> {
+impl<S: crate::transport::poll::Session> ControlStreamAdapter<S> {
 	pub fn new(inner: S, control: Control, version: Version) -> Self {
 		Self {
 			inner,
 			shared: Arc::new(Shared::default()),
 			control,
 			version,
+			park: kio::Park::default(),
 		}
 	}
 
 	/// Open a real (non-virtual) bidi stream, bypassing control stream multiplexing.
 	/// Used for v16 SubscribeNamespace which moved to its own bidi stream.
-	pub async fn open_native_bi(&self) -> Result<(AdapterSend<S>, AdapterRecv<S>), crate::Error> {
+	pub async fn open_native_bi(&mut self) -> Result<(AdapterSend<S>, AdapterRecv<S>), crate::Error> {
 		let (send, recv) = self.inner.open_bi().await.map_err(|_| crate::Error::Closed)?;
 		Ok((AdapterSend::Real(send), AdapterRecv::Real(recv)))
 	}
 
 	/// Run the control stream read + write tasks.
 	/// This reads from the control stream and routes messages to virtual streams,
-	/// and also drains the write queue to the control stream writer.
+	/// and also drains the write queue to the control stream writer. A decoded
+	/// GOAWAY is surfaced through `goaway` so [`crate::Session::recv_goaway`] resolves
+	/// instead of the session tearing down.
 	pub async fn run(
 		&self,
 		reader: Reader<S::RecvStream, Version>,
 		writer: Writer<S::SendStream, Version>,
+		goaway: crate::goaway::Protocol,
 	) -> Result<(), Error> {
 		let res = {
-			let mut read = std::pin::pin!(self.run_read(reader));
+			let mut read = std::pin::pin!(self.run_read(reader, goaway));
 			let mut write = std::pin::pin!(self.run_write(writer));
 			kio::wait(|waiter| {
 				if let Poll::Ready(res) = waiter.poll_future(read.as_mut()) {
@@ -747,6 +768,43 @@ impl<S: web_transport_trait::Session> ControlStreamAdapter<S> {
 		res
 	}
 
+	/// Queue a GOAWAY message onto the shared control stream (draft-14-16).
+	///
+	/// Framed as `[type_id varint][size u16][body]` like every other control
+	/// message. Best-effort: an encode failure or a closed control stream is
+	/// logged and dropped, since the session is tearing down anyway.
+	pub(super) fn send_goaway(&self, uri: &str, timeout_ms: u64, version: Version) {
+		use crate::coding::Encode;
+
+		let msg = crate::ietf::GoAway {
+			new_session_uri: std::borrow::Cow::Borrowed(uri),
+			timeout: timeout_ms,
+		};
+
+		let mut body = BytesMut::new();
+		if let Err(err) = msg.encode_msg(&mut body, version) {
+			tracing::warn!(%err, "failed to encode goaway");
+			return;
+		}
+
+		// The size prefix is a u16 on a stream shared with every other request, so a
+		// wrapping cast here would desynchronize the framing for all of them.
+		let Ok(size) = u16::try_from(body.len()) else {
+			tracing::warn!(len = body.len(), "goaway too large for the control stream");
+			return;
+		};
+
+		let mut raw = BytesMut::new();
+		if crate::ietf::GoAway::ID.encode(&mut raw, version).is_err() || size.encode(&mut raw, version).is_err() {
+			return;
+		}
+		raw.extend_from_slice(&body);
+
+		if !self.shared.control.push(raw.freeze()) {
+			tracing::debug!("control stream closed; goaway not sent");
+		}
+	}
+
 	/// Writer task: drains the queue and writes to the control stream.
 	async fn run_write(&self, mut writer: Writer<S::SendStream, Version>) -> Result<(), Error> {
 		while let Some(msg) = self.shared.control.pop().await {
@@ -757,7 +815,11 @@ impl<S: web_transport_trait::Session> ControlStreamAdapter<S> {
 	}
 
 	/// Dispatcher loop that reads control stream messages and routes them.
-	async fn run_read(&self, mut reader: Reader<S::RecvStream, Version>) -> Result<(), Error> {
+	async fn run_read(
+		&self,
+		mut reader: Reader<S::RecvStream, Version>,
+		goaway: crate::goaway::Protocol,
+	) -> Result<(), Error> {
 		loop {
 			let type_id: u64 = match reader.decode_maybe().await? {
 				Some(id) => id,
@@ -778,7 +840,21 @@ impl<S: web_transport_trait::Session> ControlStreamAdapter<S> {
 				Route::CloseStream(request_id) => self.shared.close(request_id, raw),
 				Route::MaxRequestId(max) => self.control.max_request_id(max),
 				Route::Ignore => {}
-				Route::GoAway => return Err(Error::Unsupported),
+				Route::GoAway => {
+					let mut data = body;
+					let msg = crate::ietf::GoAway::decode_msg(&mut data, self.version)?;
+					tracing::info!(message = ?msg, "received GOAWAY");
+
+					// Draft-14-16 have no timeout field.
+					// A second GOAWAY is a protocol violation the draft requires we
+					// close over, so let it propagate and end the session.
+					goaway.record(crate::goaway::Goaway {
+						uri: msg.new_session_uri.into_owned(),
+						timeout: None,
+					})?;
+					// Keep processing control messages: existing subscriptions
+					// flow until the session actually closes.
+				}
 			}
 		}
 	}
@@ -993,65 +1069,66 @@ fn lookup_namespace_request_id(
 	Ok(namespaces.get(direction, &ns))
 }
 
-impl<S: web_transport_trait::Session> web_transport_trait::Session for ControlStreamAdapter<S> {
+impl<S: crate::transport::poll::Session> web_transport_trait::poll::Session for ControlStreamAdapter<S> {
 	type SendStream = AdapterSend<S>;
 	type RecvStream = AdapterRecv<S>;
 	type Error = crate::Error;
 
-	async fn accept_bi(&self) -> Result<(Self::SendStream, Self::RecvStream), Self::Error> {
-		match self.version {
-			// v16: SubscribeNamespace uses real bidi streams, so race both sources.
-			Version::Draft16 => {
-				// Native first: real bidi streams are rare and transport-paced, so
-				// they can't starve the queue, while a control-message flood could
-				// starve a native SubscribeNamespace under queue-first order.
-				let mut accept = std::pin::pin!(self.inner.accept_bi());
-				kio::wait(|waiter| {
-					if let Poll::Ready(result) = waiter.poll_future(accept.as_mut()) {
-						return Poll::Ready(match result {
-							Ok((send, recv)) => Ok((AdapterSend::Real(send), AdapterRecv::Real(recv))),
-							Err(_) => Err(crate::Error::Closed),
-						});
-					}
-					if let Poll::Ready(result) = self.shared.incoming.poll_pop(waiter) {
-						return Poll::Ready(match result {
-							Some((send, recv)) => Ok((AdapterSend::Virtual(send), AdapterRecv::Virtual(recv))),
-							None => Err(crate::Error::Closed),
-						});
-					}
-					Poll::Pending
-				})
-				.await
+	fn poll_accept_bi(
+		&mut self,
+		cx: &mut Context<'_>,
+	) -> Poll<Result<(Self::SendStream, Self::RecvStream), Self::Error>> {
+		// v16: SubscribeNamespace uses real bidi streams, so poll both sources.
+		// Native first: real bidi streams are rare and transport-paced, so they
+		// can't starve the queue, while a control-message flood could starve a
+		// native SubscribeNamespace under queue-first order.
+		if self.version == Version::Draft16 {
+			match self.inner.poll_accept_bi(cx) {
+				Poll::Ready(Ok((send, recv))) => {
+					return Poll::Ready(Ok((AdapterSend::Real(send), AdapterRecv::Real(recv))));
+				}
+				Poll::Ready(Err(_)) => return Poll::Ready(Err(crate::Error::Closed)),
+				Poll::Pending => {}
 			}
-			// v14/v15: Only virtual streams from control stream.
-			_ => match self.shared.incoming.pop().await {
-				Some((send, recv)) => Ok((AdapterSend::Virtual(send), AdapterRecv::Virtual(recv))),
-				None => Err(crate::Error::Closed),
-			},
+		}
+
+		let waiter = self.park.hold(cx);
+		match std::task::ready!(self.shared.incoming.poll_pop(waiter)) {
+			Some((send, recv)) => Poll::Ready(Ok((AdapterSend::Virtual(send), AdapterRecv::Virtual(recv)))),
+			None => Poll::Ready(Err(crate::Error::Closed)),
 		}
 	}
 
-	async fn open_bi(&self) -> Result<(Self::SendStream, Self::RecvStream), Self::Error> {
+	fn poll_open_bi(
+		&mut self,
+		_cx: &mut Context<'_>,
+	) -> Poll<Result<(Self::SendStream, Self::RecvStream), Self::Error>> {
 		let (send, recv) = self.shared.open_outgoing(self.version);
-		Ok((AdapterSend::Virtual(send), AdapterRecv::Virtual(recv)))
+		Poll::Ready(Ok((AdapterSend::Virtual(send), AdapterRecv::Virtual(recv))))
 	}
 
-	async fn open_uni(&self) -> Result<Self::SendStream, Self::Error> {
-		let s = self.inner.open_uni().await.map_err(|_| crate::Error::Closed)?;
-		Ok(AdapterSend::Real(s))
+	fn poll_open_uni(&mut self, cx: &mut Context<'_>) -> Poll<Result<Self::SendStream, Self::Error>> {
+		self.inner
+			.poll_open_uni(cx)
+			.map(|r| r.map(AdapterSend::Real).map_err(|_| crate::Error::Closed))
 	}
 
-	async fn accept_uni(&self) -> Result<Self::RecvStream, Self::Error> {
-		let s = self.inner.accept_uni().await.map_err(|_| crate::Error::Closed)?;
-		Ok(AdapterRecv::Real(s))
+	fn poll_accept_uni(&mut self, cx: &mut Context<'_>) -> Poll<Result<Self::RecvStream, Self::Error>> {
+		self.inner
+			.poll_accept_uni(cx)
+			.map(|r| r.map(AdapterRecv::Real).map_err(|_| crate::Error::Closed))
 	}
 
-	fn send_datagram(&self, payload: Bytes) -> Result<(), Self::Error> {
-		self.inner.send_datagram(payload).map_err(|_| crate::Error::Closed)
+	fn poll_send_datagram(&mut self, cx: &mut Context<'_>, payload: &[u8]) -> Poll<Result<(), Self::Error>> {
+		self.inner
+			.poll_send_datagram(cx, payload)
+			.map(|r| r.map_err(|_| crate::Error::Closed))
 	}
 
-	async fn recv_datagram(&self) -> Result<Bytes, Self::Error> {
-		self.inner.recv_datagram().await.map_err(|_| crate::Error::Closed)
+	fn poll_recv_datagram(&mut self, cx: &mut Context<'_>) -> Poll<Result<Bytes, Self::Error>> {
+		self.inner
+			.poll_recv_datagram(cx)
+			.map(|r| r.map_err(|_| crate::Error::Closed))
 	}
 
 	fn max_datagram_size(&self) -> usize {
@@ -1062,13 +1139,16 @@ impl<S: web_transport_trait::Session> web_transport_trait::Session for ControlSt
 		self.inner.protocol()
 	}
 
-	fn close(&self, code: u32, reason: &str) {
+	fn close(&mut self, code: u32, reason: &str) {
 		self.inner.close(code, reason)
 	}
 
-	async fn closed(&self) -> Self::Error {
-		let _ = self.inner.closed().await;
-		crate::Error::Closed
+	fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Self::Error> {
+		self.inner.poll_closed(cx).map(|_| crate::Error::Closed)
+	}
+
+	fn stats(&self) -> impl web_transport_trait::Stats {
+		self.inner.stats()
 	}
 }
 
@@ -1124,9 +1204,9 @@ fn decode_publish_namespace_body(body: &Bytes, version: Version) -> Result<PathO
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::transport::poll::{RecvStream as _, SendStream as _};
 	use bytes::BytesMut;
 	use futures::FutureExt as _;
-	use web_transport_trait::{RecvStream as _, SendStream as _};
 
 	fn make_body_with_request_id(id: u64, version: Version) -> Bytes {
 		let mut buf = BytesMut::new();

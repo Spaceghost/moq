@@ -18,12 +18,15 @@ use url::Url;
 use crate::{Error, Result, client::Client, ingest::IngestSink, session};
 
 pub(crate) async fn dial(client: &Client, url: Url, broadcast: moq_net::broadcast::Producer) -> Result<()> {
-	let sink = Box::new(IngestSink::new(broadcast)?);
+	let config = moq_mux::catalog::Config::default()
+		.with_max_age(client.config().max_age)
+		.with_bandwidth(client.config().bandwidth.clone());
+	let sink = Box::new(IngestSink::new(broadcast, config)?);
 
 	let (socket, candidates) = session::bind_udp(&client.config().ice_candidates).await?;
 	let mut rtc = Rtc::new(Instant::now());
 	for addr in &candidates {
-		let cand = Candidate::host(*addr, "udp").map_err(str0m::RtcError::from)?;
+		let cand = Candidate::host(*addr, "udp").map_err(Error::rtc)?;
 		rtc.add_local_candidate(cand);
 	}
 
@@ -34,9 +37,7 @@ pub(crate) async fn dial(client: &Client, url: Url, broadcast: moq_net::broadcas
 		api.add_media(MediaKind::Audio, Direction::RecvOnly, None, None, None),
 		api.add_media(MediaKind::Video, Direction::RecvOnly, None, None, None),
 	];
-	let (offer, pending) = api
-		.apply()
-		.ok_or_else(|| Error::Other(anyhow::anyhow!("no SDP changes to apply")))?;
+	let (offer, pending) = api.apply().ok_or(Error::NoSdpChanges)?;
 
 	let res = client
 		.http()
@@ -45,20 +46,16 @@ pub(crate) async fn dial(client: &Client, url: Url, broadcast: moq_net::broadcas
 		.header(reqwest::header::ACCEPT, "application/sdp")
 		.body(offer.to_sdp_string())
 		.send()
-		.await
-		.map_err(|err| Error::Other(anyhow::anyhow!("WHEP POST failed: {err}")))?;
+		.await?;
 
 	if !res.status().is_success() {
-		return Err(Error::Other(anyhow::anyhow!("WHEP server returned {}", res.status())));
+		return Err(Error::HttpStatus(res.status().as_u16()));
 	}
 
-	let body = res
-		.text()
-		.await
-		.map_err(|err| Error::Other(anyhow::anyhow!("reading WHEP answer body: {err}")))?;
+	let body = res.text().await?;
 	let answer = SdpAnswer::from_sdp_string(&body).map_err(|err| Error::InvalidSdp(err.to_string()))?;
 
-	rtc.sdp_api().accept_answer(pending, answer).map_err(Error::Rtc)?;
+	rtc.sdp_api().accept_answer(pending, answer).map_err(Error::rtc)?;
 	tracing::info!(%url, "whep client connected");
 
 	// 1:1 socket (no demux on the client): pump its datagrams into the session.

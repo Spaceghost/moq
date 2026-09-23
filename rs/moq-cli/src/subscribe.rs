@@ -1,6 +1,5 @@
 use std::time::Duration;
 
-use clap::ValueEnum;
 use hang::catalog::{AudioCodecKind, VideoCodecKind};
 use moq_mux::catalog::{self, CatalogFormat, Stream};
 use moq_mux::select;
@@ -23,12 +22,12 @@ pub enum SubscribeFormat {
 	Flv,
 }
 
-/// `clap` adapter for [`CatalogFormat`] (which is `#[non_exhaustive]` and so
+/// `Usage` adapter for [`CatalogFormat`] (which is `#[non_exhaustive]` and so
 /// can't derive `ValueEnum` itself).
-#[derive(ValueEnum, Clone, Copy)]
+#[derive(usage::ValueEnum, Clone, Copy)]
 pub enum CatalogFormatArg {
 	Hang,
-	#[value(name = "hangz")]
+	#[usage(name = "hangz")]
 	HangZ,
 	Msf,
 }
@@ -43,8 +42,8 @@ impl From<CatalogFormatArg> for CatalogFormat {
 	}
 }
 
-/// `clap` adapter for [`VideoCodecKind`].
-#[derive(ValueEnum, Clone, Copy)]
+/// `Usage` adapter for [`VideoCodecKind`].
+#[derive(usage::ValueEnum, Clone, Copy)]
 pub enum VideoCodecArg {
 	H264,
 	H265,
@@ -65,8 +64,8 @@ impl From<VideoCodecArg> for VideoCodecKind {
 	}
 }
 
-/// `clap` adapter for [`AudioCodecKind`].
-#[derive(ValueEnum, Clone, Copy)]
+/// `Usage` adapter for [`AudioCodecKind`].
+#[derive(usage::ValueEnum, Clone, Copy)]
 pub enum AudioCodecArg {
 	Aac,
 	Opus,
@@ -85,22 +84,23 @@ impl From<AudioCodecArg> for AudioCodecKind {
 
 /// Rendition selection flags for stdout container sinks and native playback.
 /// With no flags set, every rendition is kept.
-#[derive(clap::Args, Clone, Default)]
+#[derive(usage::Args, Clone, Default)]
+#[usage(unknown_flags = "error", args_override_self = false)]
 pub struct SelectArgs {
 	/// Pick the video rendition with this exact name.
-	#[arg(long)]
+	#[usage(long)]
 	pub video_name: Option<String>,
 
 	/// Keep only video renditions whose codec family matches.
-	#[arg(long)]
+	#[usage(long, value_enum)]
 	pub video_codec: Option<VideoCodecArg>,
 
 	/// Pick the audio rendition with this exact name.
-	#[arg(long)]
+	#[usage(long)]
 	pub audio_name: Option<String>,
 
 	/// Keep only audio renditions whose codec family matches.
-	#[arg(long)]
+	#[usage(long, value_enum)]
 	pub audio_codec: Option<AudioCodecArg>,
 }
 
@@ -136,11 +136,15 @@ pub struct SubscribeArgs {
 	/// The format to write to stdout.
 	pub format: SubscribeFormat,
 
-	/// Maximum latency before skipping groups.
-	pub max_latency: Duration,
+	/// How far playback may drift from the live edge before skipping groups.
+	pub max_age: Duration,
 
-	/// Cap the output fragment duration (default: one GOP). Applies to fmp4 / mkv.
+	/// Cap the output duration: publisher groups by default for fMP4, video GOPs for MKV.
 	pub fragment_duration: Option<Duration>,
+
+	/// Pad MPEG-TS output with null packets to this rate, in bits per second,
+	/// overriding the catalog's recorded multiplex rate.
+	pub mux_rate: Option<u64>,
 
 	/// Catalog format for track discovery (default: detect from the broadcast suffix).
 	pub catalog: Option<CatalogFormatArg>,
@@ -207,8 +211,7 @@ impl Subscribe {
 	/// Build the catalog stream, narrowed by the rendition selection flags. The
 	/// catalog source honors the requested format (e.g. compressed `HangZ` or `Msf`).
 	async fn stream(&self) -> anyhow::Result<catalog::Select<catalog::Consumer>> {
-		let broadcast = self.source.broadcast().await?;
-		let consumer = catalog::Consumer::new(&broadcast, self.catalog).await?;
+		let consumer = self.source.catalog(self.catalog).await?;
 		Ok(consumer.select(self.args.selection()?))
 	}
 
@@ -231,7 +234,7 @@ impl Subscribe {
 		// yields moof+mdat fragments in timestamp order across tracks.
 		let stream = self.stream().await?;
 		let mut fmp4 = moq_mux::container::fmp4::Export::new(self.source, stream)
-			.with_latency(self.args.max_latency)
+			.with_max_age(self.args.max_age)
 			.with_fragment_duration(self.args.fragment_duration);
 
 		while let Some(chunk) = fmp4.next().await? {
@@ -250,7 +253,7 @@ impl Subscribe {
 		// shape internally (synthesizing avcC/hvcC from inline parameter sets).
 		let stream = self.stream().await?;
 		let mut mkv = moq_mux::container::mkv::Export::new(self.source, stream)
-			.with_latency(self.args.max_latency)
+			.with_max_age(self.args.max_age)
 			.with_fragment_duration(self.args.fragment_duration);
 
 		while let Some(chunk) = mkv.next().await? {
@@ -265,7 +268,7 @@ impl Subscribe {
 		let mut stdout = tokio::io::stdout();
 
 		let stream = self.stream().await?;
-		let mut h264 = moq_mux::codec::h264::Export::new(self.source, stream).with_latency(self.args.max_latency);
+		let mut h264 = moq_mux::codec::h264::Export::new(self.source, stream).with_max_age(self.args.max_age);
 
 		while let Some(chunk) = h264.next().await? {
 			stdout.write_all(&chunk).await?;
@@ -279,7 +282,7 @@ impl Subscribe {
 		let mut stdout = tokio::io::stdout();
 
 		let stream = self.stream().await?;
-		let mut h265 = moq_mux::codec::h265::Export::new(self.source, stream).with_latency(self.args.max_latency);
+		let mut h265 = moq_mux::codec::h265::Export::new(self.source, stream).with_max_age(self.args.max_age);
 
 		while let Some(chunk) = h265.next().await? {
 			stdout.write_all(&chunk).await?;
@@ -299,7 +302,10 @@ impl Subscribe {
 		// (SCTE-35, teletext, DVB AC-3, ...) are re-emitted verbatim on their PIDs.
 		let mut ts = moq_mux::container::ts::Export::with_ts(self.source, self.catalog)
 			.await?
-			.with_latency(self.args.max_latency);
+			.with_max_age(self.args.max_age);
+		if let Some(mux_rate) = self.args.mux_rate {
+			ts = ts.with_mux_rate(mux_rate);
+		}
 
 		// A TS byte stream carries no per-frame timing, so delivery time is the only
 		// carrier of each frame's spacing: the exporter slices its output on the PCR
@@ -309,7 +315,7 @@ impl Subscribe {
 		// repair (#2984). See [`Delivery`] for how the pacing stays
 		// bounded; it needs to know whether each frame was waited for, hence the
 		// hand-rolled poll instead of `ts.next()`.
-		let mut delivery = Delivery::new(self.args.max_latency);
+		let mut delivery = Delivery::new(self.args.max_age);
 		loop {
 			let mut waited = false;
 			let frame = hang::moq_net::kio::wait(|waiter| match ts.poll_next(waiter) {
@@ -338,7 +344,7 @@ impl Subscribe {
 		// and AAC audio are supported; `fragment_duration` does not apply to FLV.
 		let mut flv = moq_mux::container::flv::Export::with_catalog_format(self.source, self.catalog)
 			.await?
-			.with_latency(self.args.max_latency);
+			.with_max_age(self.args.max_age);
 
 		while let Some(chunk) = flv.next().await? {
 			stdout.write_all(&chunk).await?;
@@ -385,7 +391,7 @@ impl Subscribe {
 /// gone out any earlier. What that gives up is a producer running faster than real
 /// time indefinitely: the sink keeps pace with it and falls further behind live
 /// without the budget noticing. Bounding *that* is the export's own
-/// `--latency-max`, which sheds media rather than compressing the clock.
+/// `--max-age`, which sheds media rather than compressing the clock.
 ///
 /// The budget is the lead plus whatever standing lag the pacer has absorbed
 /// ([`Pacer::slack`](moq_mux::Pacer::slack)), which is a distance it is holding on
@@ -529,7 +535,7 @@ mod tests {
 	/// media rate instead of being shed, because it is indistinguishable from the
 	/// TS export's own mux buffer from here: both hand over a frame that is ready
 	/// and ahead of the schedule. The size of such a backlog is bounded by the
-	/// export's `--latency-max`, which is where it belongs.
+	/// export's `--max-age`, which is where it belongs.
 	#[tokio::test(start_paused = true)]
 	async fn a_sink_that_cannot_keep_up_sheds_the_lag() {
 		let mut delivery = Delivery::new(Duration::from_millis(500));

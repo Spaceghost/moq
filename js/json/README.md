@@ -28,11 +28,11 @@ A JSON value is published over a [`@moq/net`](../net) track as a series of group
 import { Snapshot } from "@moq/json";
 
 // Publish: each update supersedes the last.
-const producer = new Snapshot.Producer(track);
+const producer = new Snapshot.Producer({ track });
 producer.update({ hello: "world" });
 
 // Consume: yields the latest reconstructed value, collapsing any backlog.
-const consumer = new Snapshot.Consumer(track);
+const consumer = new Snapshot.Consumer({ track: track.subscribe() });
 for await (const value of consumer) {
 	console.log(value);
 }
@@ -47,14 +47,14 @@ An ordered log of self-contained records, one JSON value per frame, all riding a
 ```ts
 import { Stream } from "@moq/json";
 
-const producer = new Stream.Producer(track);
+const producer = new Stream.Producer({ track });
 producer.append({ event: "started" });
 producer.append({ event: "stopped" });
 
-const consumer = new Stream.Consumer(track);
+const consumer = new Stream.Consumer({ track: track.subscribe() });
 for await (const record of consumer) {
 	console.log(record);
 }
 ```
 
-Both modes support optional group-scoped DEFLATE compression (`{ compression: true }` on both sides), interoperable with the Rust `moq-json` crate.
+Both modes support optional group-scoped DEFLATE compression (`{ compression: "deflate" }` on both sides), interoperable with the Rust `moq-json` crate. `Config` is the codec options; `Producer.Config` / `Consumer.Config` add the track.

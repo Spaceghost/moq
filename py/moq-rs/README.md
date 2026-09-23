@@ -29,10 +29,12 @@ import moq
 async def main():
     async with moq.connect("https://cdn.moq.dev/anon") as client:
         async for announcement in client.announced():
-            catalog = await announcement.broadcast.catalog()
+            # A route covers a prefix and carries no broadcast, so resolve the path.
+            broadcast = await client.request_broadcast(announcement.prefix)
+            catalog = await broadcast.catalog()
 
             for name, track in catalog.audio.items():
-                frames = await announcement.broadcast.subscribe_media(name, track)
+                frames = await broadcast.subscribe_media(name, track)
                 async with frames:
                     async for frame in frames:
                         print(f"Got frame: {len(frame.payload)} bytes, ts={frame.timestamp_us}")
@@ -53,11 +55,16 @@ async def main():
         broadcast = client.create_broadcast("my-stream")
 
         # Publish an Opus audio track (init bytes from your encoder)
-        audio = broadcast.publish_media("opus", opus_init_bytes)
+        audio = broadcast.publish_audio(moq.AudioFormat.OPUS, opus_init_bytes)
 
         # Write frames
+        # Audio has no keyframes, so `cut` is what gives it group boundaries.
         audio.write_frame(payload, timestamp_us=0)
+        audio.cut()
         audio.write_frame(payload, timestamp_us=20000)
+        audio.cut()
+
+        broadcast.announce()
 
         # Clean up
         audio.finish()
@@ -78,6 +85,7 @@ async def main():
     async with moq.Server("127.0.0.1:4443", tls_generate=["localhost"]) as server:
         broadcast = server.create_broadcast("hello")
         track = broadcast.publish_track("events")
+        broadcast.announce()
         print(f"listening on https://{server.local_addr}")
 
         sessions = []
@@ -122,34 +130,37 @@ client = moq.Client(
 - **`Server(bind="[::]:443", *, tls_cert=(), tls_key=(), tls_generate=(), publish=None, subscribe=None)`**. Async context manager + async iterator of incoming `Request`s.
   - `.local_addr`. The bound address (useful when binding to port `0`).
   - `.cert_fingerprints()`. SHA-256 fingerprints of the configured TLS certificates, for `serverCertificateHashes` browser cert pinning.
-  - `.create_broadcast(path) → BroadcastProducer`. Create a live broadcast served to incoming sessions; `finish()` unpublishes it.
+  - `.create_broadcast(path) → BroadcastProducer`. Create a locally discoverable broadcast; `announce()` advertises it to peers; `finish()` unpublishes it.
 - **`Request`**. An incoming session, yielded by `async for request in server`.
   - `.url`, `.path`, `.query`, `.transport`. The query-free path is uniform across transports; the root or missing path is `""`. The encoded query may contain credentials.
-  - `.set_publish(origin)`, `.set_consume(origin)`. Per-request overrides.
+  - `.set_publish(origin)`, `.set_consume(origin)`. Per-request overrides, captured at `accept()`. Raise if the request is already answered, cancelled, or currently accepting.
   - `await .accept() → Session`. Complete the handshake (hold the result to keep the connection alive).
-  - `await .reject(code)`. Reject with an HTTP status code.
+  - `await .reject(code)`. Reject with an application error code; 401 and 403 map to unauthorized.
   - `.cancel()`. Cancel an in-flight `accept()`/`reject()` call.
 - **`Session`**. An established connection. Holding it keeps the connection alive; it is also an `async with` context manager that shuts down on exit.
   - `await .closed()`. Wait until the session closes.
   - `.cancel(code)`, `.shutdown()`. Close with an error code, or gracefully (code 0).
-  - `.publisher() → OriginProducer`, `.consumer() → OriginConsumer`. The wired origin sides.
+  - `.publish() → OriginProducer`, `.consume() → OriginConsumer`. The wired origin sides.
   - `.stats() → ConnectionStats`. Snapshot RTT, bandwidth estimates, and byte/packet counters.
 
 ### Publishing
 
 - **`BroadcastProducer()`**. Create a broadcast to publish tracks into.
   - `.dynamic() → BroadcastDynamic`
-  - `.publish_media(format, init=b"", video=None) → MediaProducer`. Pass a `VideoHint` to pin catalog fields the stream can't reveal (bitrate) or publish the catalog before the first keyframe; audio formats resolve from their init bytes.
+  - `.publish_audio(format, init, *, label=None) → MediaProducer`. `init` is required: an OpusHead or AudioSpecificConfig resolves the whole rendition.
+  - `.publish_video(format, init=b"", *, label=None, hint=None) → MediaProducer`. `init` may be empty for a format that resolves in band; a `VideoHint` pins catalog fields the stream can't reveal (bitrate) or publishes the catalog before the first keyframe.
   - `.finish()`
 - **`BroadcastDynamic`**. Async source of tracks requested by subscribers.
   - `await .requested_track() → TrackRequest`. Call `.accept()` on it for a `TrackProducer`, or `.abort(code)` to reject.
   - Async iterator yielding `TrackRequest`
 - **`MediaProducer`**. Write frames to a track.
   - `.write_frame(payload, timestamp_us=0)`
+  - `.cut()` / `.seek(sequence)` draw a group boundary (audio has none of its own)
   - `.finish()`
 - **`TrackProducer` / `GroupProducer`**. Write raw payloads with no codec parsing.
   - `.write_frame(payload, timestamp_us=0)` writes a payload with a presentation timestamp in microseconds.
   - `.create_group(sequence)` creates a sparse or replayed group at an explicit sequence.
+  - `.finish()` ends at the live edge; the handle remains so `.abort(error_code)` can still run.
   - `.finish_at(final_sequence)` declares the first group that will never be produced while leaving lower groups writable.
   - `.abort(error_code)` terminates the track or group with an application error.
   - `.append_datagram(payload, timestamp_us=0) -> sequence` (`TrackProducer`) sends a best-effort datagram. Payloads are capped at 1200 bytes and there is no stream fallback.
@@ -157,62 +168,59 @@ client = moq.Client(
 ### Subscribing
 
 - **`BroadcastConsumer`**. Subscribe to tracks within a broadcast.
-  - `.route_updates() → RouteWatch` (async iterator; current route, then changes)
   - `await .subscribe_catalog() → CatalogConsumer`
   - `await .subscribe_track(name, subscription=None) → TrackConsumer`
   - `await .subscribe_media(name, track, subscription=None) → MediaConsumer`. `track` is the catalog record (e.g. `catalog.video[name]`); its container tells the decoder how to parse the bitstream.
   - `await .catalog() → Catalog` (convenience)
-- **`RouteWatch`**. Async iterator of `Route` that ends with the broadcast.
 - **`CatalogConsumer`**. Async iterator of `Catalog`.
 - **`MediaConsumer`**. Async iterator of `MediaFrame`.
 - **`TrackConsumer`**. Async iterator of raw groups, in sequence order.
   - `await .next_group() → GroupConsumer | None`. Sequence order; what the default iteration yields.
   - `await .recv_group() → GroupConsumer | None`. Arrival order, which may be out of sequence. Prefer it when latency matters more than order.
   - `.groups_as_arrived()`. Async iterator over `recv_group()`.
-  - `.read_frame() -> Frame | None` returns a timestamped raw frame.
+  - `.read_frame() -> Frame | None` returns the first timestamped frame of the next group. Empty groups are skipped; `None` is track EOF.
   - `await .recv_datagram() -> Datagram | None` for best-effort raw track datagrams.
   - `.info() → TrackInfo`
-  - `.update(subscription)`. Change delivery priority, group ordering priority, staleness, or group range after subscribing.
+  - `.update(subscription)`. Change delivery priority, staleness, or group range after subscribing.
 - **`GroupConsumer`**. Async iterator of timestamped `Frame`s.
   - `.read_frame() -> Frame | None` returns a timestamped raw frame.
 
-All consumers and route watches (`CatalogConsumer`, `MediaConsumer`, `TrackConsumer`, `AudioConsumer`, `GroupConsumer`, `RouteWatch`) are async context managers; exiting `async with` cancels the subscription or watch.
+Every handle whose cleanup is `cancel()` is an async context manager, so exiting `async with` releases it: the consumers (`CatalogConsumer`, `MediaConsumer`, `MediaGroupConsumer`, `TrackConsumer`, `AudioConsumer`, `GroupConsumer`, `JsonSnapshotConsumer`, `JsonStreamConsumer`, `AnnounceConsumer`, `AnnouncedBroadcast`) and the dynamic sources (`OriginDynamic`, `BroadcastDynamic`, `TrackDynamic`).
 
 ### Origin (advanced)
 
 - **`OriginProducer(cache_capacity_bytes=None)`**. Manage broadcast announcements. Set `cache_capacity_bytes` to bound cached groups under this origin.
   - `.consume() → OriginConsumer`
-  - `.dynamic() → OriginDynamic`
+  - `.dynamic(prefix, route=Route()) → OriginDynamic`
   - `.create_broadcast(path) → BroadcastProducer`
 - **`OriginDynamic`**. Async source of broadcasts requested by consumers.
-  - `await .requested_broadcast() → BroadcastRequest`. Call `.accept(broadcast)` to serve it, or `.abort(code)` to fail the requester.
+  - `await .requested_broadcast() → BroadcastRequest`. Call `.accept(broadcast)` to serve it, or `.reject(code)` to fail the requester.
   - Async iterator yielding `BroadcastRequest`
 - **`OriginConsumer`**. Discover broadcasts.
-  - `.announced(prefix) → Announced` (async iterator)
-  - `.announced_broadcast(path) → AnnouncedBroadcast` (awaitable, waits for a future announcement)
+  - `.announced(prefix, filter=None) → AnnounceConsumer` (async iterator); `filter` is a pattern relative to the literal prefix, while each update's `.prefix` stays origin-relative and `.captures` reports wildcard matches
+  - `.announced_broadcast(path) → AnnouncedBroadcast` (awaitable, waits until something serves the path)
   - `.request_broadcast(path) → BroadcastConsumer` (awaitable; announced now or a dynamic fallback, else raises)
 
 ### Types
 
 - **`Catalog`**. `.audio: dict[str, Audio]`, `.video: dict[str, Video]`, `.display`, `.rotation`, `.flip`.
 - **`Frame`**. `.payload: bytes`, `.timestamp_us: int`. The unit of every write and every raw read.
-- **`MediaFrame`**. `.payload: bytes`, `.timestamp_us: int`, `.keyframe: bool`. Returned by media subscriptions.
+- **`MediaFrame`**. `.payload: bytes`, `.timestamp_us: int`, `.keyframe: bool`. Returned by media subscriptions. `keyframe` marks a group start or video keyframe; for audio it is true only at a group start.
 - **`Datagram`**. `.sequence: int`, `.timestamp_us: int`, `.payload: bytes`. Delivered only on datagram-capable transports and lite-05 or newer moq-lite.
 - **`Audio`**. `.codec`, `.sample_rate`, `.channel_count`, `.bitrate`, `.description`.
 - **`Video`**. `.codec`, `.coded: Dimensions`, `.display_aspect`, `.bitrate`, `.stalled`, `.framerate`, `.description`. A true `.stalled` recommends temporarily avoiding the rendition without making it unavailable.
-- **`Subscription`**. Subscriber delivery preferences: priority, ordering priority, staleness, and optional group range.
-- **`TrackInfo`**. Publisher track properties: priority, ordering priority, cache window, and timescale.
+- **`Subscription`**. Subscriber delivery preferences: priority, staleness, and optional group range.
+- **`TrackInfo`**. Publisher track properties: priority, cache window, and timescale.
 - **`Dimensions`**. `.width: int`, `.height: int`.
 - **`Container`**. The catalog container enum, carried on each `Video`/`Audio` record.
-
-For both `Subscription` and `TrackInfo`, `ordered` controls prioritization only. When true, groups are prioritized in sequence order. Groups may always arrive out-of-order (or not at all) over the network.
 
 ### Logging and errors
 
 - **`log_level(level="info")`**. Initialize logging for the underlying Rust layer (`"error"`, `"warn"`, `"info"`, `"debug"`, `"trace"`). Call once per process.
-- **`Error`**. The exception raised by all operations. Catch a specific case via its variants, e.g. `except moq.Error.AlreadyResponded:` or `except moq.Error.Cancelled:`.
+- **`Error`**. The exception raised by all operations. Catch a specific case via its variants, e.g. `except moq.Error.AlreadyResponded:`, `except moq.Error.Cancelled:`, or `except moq.Error.Busy:` when a setter races an in-flight connect/listen/accept.
 - **`is_shutdown(err)`**. True for `Cancelled` and `Closed`, which arise from graceful shutdown rather than an actual failure. Use it to break out of an `async for` without treating the expected end-of-stream error as a problem.
-- **`is_auth(err)`**. True for `Unauthorized` (HTTP 401) and `Forbidden` (HTTP 403). Retrying without new credentials won't help, so surface these rather than reconnect.
+- **`is_auth(err)`**. True for `Unauthorized` (HTTP 401) and `Forbidden` (HTTP 403), and for a protocol Unauthorized session close. Retrying without new credentials won't help, so surface these rather than reconnect.
+- **`protocol_error(err)`**. The structured protocol failure (session or stream scope, verbatim wire code, known kind) when the peer sent one.
 
 ## See Also
 

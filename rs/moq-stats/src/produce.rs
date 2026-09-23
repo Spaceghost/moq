@@ -6,24 +6,24 @@ use std::time::Duration;
 
 use std::task::Poll;
 
-use moq_net::stats::{Presence, Registry, Role, Tier, Traffic};
+use moq_net::stats::{Presence, Registry, Report, Role, Tier, Traffic};
 use moq_net::{Path, PathOwned, broadcast, kio, origin, track};
 use serde::Serialize;
 use web_async::spawn;
 
-use crate::{COMPRESSED_SUFFIX, SessionsFrame, TrafficFrame, sessions_track, traffic_track};
+use crate::{COMPRESSED_SUFFIX, sessions_track, traffic_track};
 
-/// Settings for a [`Producer`]. Construct with [`ProducerConfig::new`] and chain
+/// Settings for a [`Producer`]. Construct with [`Config::new`] and chain
 /// the `with_*` setters (e.g.
-/// `ProducerConfig::new().with_origin(origin).with_prefix(".foo")`), then hand it
+/// `Config::new().with_origin(origin).with_prefix(".foo")`), then hand it
 /// to [`Producer::new`].
 ///
 /// With no origin set the resulting producer is a no-op: its registry is
 /// disabled (bumps are dropped) and no task spawns. Call
-/// [`ProducerConfig::with_origin`] to publish.
+/// [`Config::with_origin`] to publish.
 #[derive(Clone)]
 #[non_exhaustive]
-pub struct ProducerConfig {
+pub struct Config {
 	/// Origin the stats broadcasts are created on.
 	/// When `None`, [`Producer::new`] spawns no task and publishes nothing.
 	pub origin: Option<origin::Producer>,
@@ -50,7 +50,7 @@ pub struct ProducerConfig {
 	pub depth: usize,
 }
 
-impl ProducerConfig {
+impl Config {
 	/// A config with default settings: no origin (no-op), `.stats` prefix, 1s
 	/// interval, and no node suffix. Call [`Self::with_origin`] to actually
 	/// publish.
@@ -96,7 +96,7 @@ impl ProducerConfig {
 	}
 }
 
-impl Default for ProducerConfig {
+impl Default for Config {
 	fn default() -> Self {
 		Self::new()
 	}
@@ -148,8 +148,8 @@ impl Producer {
 	/// [`Producer`] clone is dropped. With no origin the producer is a no-op
 	/// (its registry is disabled, nothing is published) and no task spawns, so
 	/// it's safe to build outside an async runtime.
-	pub fn new(config: ProducerConfig) -> Self {
-		let ProducerConfig {
+	pub fn new(config: Config) -> Self {
+		let Config {
 			origin,
 			prefix,
 			node,
@@ -169,7 +169,9 @@ impl Producer {
 			};
 		};
 
-		let registry = Registry::new(moq_net::stats::Config::new().with_exclude(prefix.clone()));
+		// The prefix is a literal path, so its subtree claim cannot fail.
+		let exclude = moq_net::Pattern::subtree(prefix.as_str()).expect("the stats prefix is a literal path");
+		let registry = Registry::new(moq_net::stats::Config::new().with_exclude(exclude));
 		let keepalive = Arc::new(Keepalive);
 		let task = Task {
 			registry: registry.clone(),
@@ -209,158 +211,171 @@ impl Task {
 	/// Publishes stats broadcasts and writes a frame per drain. Runs until
 	/// every [`Producer`] clone is dropped (`weak.upgrade()` returns `None`).
 	async fn run(self, weak: Weak<Keepalive>) {
-		let node = self.node.as_ref().map(moq_net::Path::as_str);
-		let mut groups: HashMap<PathOwned, GroupPublisher> = HashMap::new();
+		let interval = self.interval;
+		let Some(mut drain) = Drain::new(self) else {
+			return;
+		};
 
-		if self.depth == 0 {
-			let Some(group) = GroupPublisher::create(&self.origin, &self.prefix, &Path::empty(), node) else {
-				return;
-			};
-			groups.insert(Path::empty().to_owned(), group);
-		}
-
-		let mut ticker = web_async::time::interval(self.interval);
+		let mut ticker = web_async::time::interval(interval);
 		ticker.set_missed_tick_behavior(web_async::time::MissedTickBehavior::Delay);
 
 		loop {
 			ticker.tick().await;
 
 			if weak.upgrade().is_none() {
-				for (_, publisher) in groups.drain() {
-					publisher.finish();
-				}
+				drain.finish();
 				return;
 			}
 
-			// Drain the registry: current per-broadcast values, with dead
-			// entries pruned (their final values are still in this report).
-			let report = self.registry.report();
+			drain.collect();
+			drain.publish();
+		}
+	}
+	fn node(&self) -> Option<&str> {
+		self.node.as_ref().map(moq_net::Path::as_str)
+	}
+}
 
-			let mut entries_by_group: HashMap<PathOwned, Vec<&moq_net::stats::TrafficEntry>> = HashMap::new();
-			for entry in &report.traffic {
-				entries_by_group
-					.entry(group_key(entry.path.as_str(), self.depth))
-					.or_default()
-					.push(entry);
+/// The publish task's state, kept across drains so a steady-state drain
+/// reuses its buffers instead of allocating per entry.
+struct Drain {
+	task: Task,
+	/// Keyed by the group's path; `""` at depth 0.
+	groups: HashMap<String, GroupPublisher>,
+	/// Refilled by every drain.
+	report: Report,
+	/// Groups whose broadcast the origin refused this drain, so a refusal is
+	/// logged once per drain rather than once per entry.
+	refused: Vec<String>,
+	/// Drain counter, stamped on the change-detection state an entry touches
+	/// so state the report no longer carries can be dropped.
+	tick: u64,
+}
+
+impl Drain {
+	/// Build the drain state. At depth 0 the single broadcast is announced
+	/// up front and lives for the producer's life; `None` if the origin
+	/// refused it.
+	fn new(task: Task) -> Option<Self> {
+		let mut groups = HashMap::new();
+		if task.depth == 0 {
+			let group = GroupPublisher::create(&task.origin, &task.prefix, &Path::empty(), task.node())?;
+			groups.insert(String::new(), group);
+		}
+		Some(Self {
+			task,
+			groups,
+			report: Report::default(),
+			refused: Vec::new(),
+			tick: 0,
+		})
+	}
+
+	/// Drain the registry and sort each entry into its group's pending frames,
+	/// creating group broadcasts and tracks on first sight.
+	fn collect(&mut self) {
+		self.task.registry.report(&mut self.report);
+		self.tick += 1;
+		self.refused.clear();
+
+		for group in self.groups.values_mut() {
+			group.traffic_rows.clear();
+			group.session_rows.clear();
+		}
+
+		for (i, entry) in self.report.traffic.iter().enumerate() {
+			let key = group_key(entry.path.as_str(), self.task.depth);
+			if let Some(group) = Self::group(&self.task, &mut self.groups, &mut self.refused, key) {
+				group.traffic_rows.push(i);
 			}
-
-			let mut sessions_by_group: HashMap<PathOwned, Vec<&moq_net::stats::SessionEntry>> = HashMap::new();
-			for entry in &report.sessions {
-				sessions_by_group
-					.entry(group_key(entry.root.as_str(), self.depth))
-					.or_default()
-					.push(entry);
+		}
+		for (i, entry) in self.report.sessions.iter().enumerate() {
+			let key = group_key(entry.root.as_str(), self.task.depth);
+			if let Some(group) = Self::group(&self.task, &mut self.groups, &mut self.refused, key) {
+				group.session_rows.push(i);
 			}
+		}
 
-			let mut active: HashSet<PathOwned> = HashSet::new();
-			active.extend(entries_by_group.keys().cloned());
-			active.extend(sessions_by_group.keys().cloned());
-			if self.depth == 0 {
-				active.insert(Path::empty().to_owned());
+		for group in self.groups.values_mut() {
+			group.collect(&self.report, self.tick);
+		}
+	}
+
+	/// Get or create the group publisher for `key`, `None` if the origin
+	/// refused its broadcast.
+	fn group<'a>(
+		task: &Task,
+		groups: &'a mut HashMap<String, GroupPublisher>,
+		refused: &mut Vec<String>,
+		key: &str,
+	) -> Option<&'a mut GroupPublisher> {
+		if !groups.contains_key(key) {
+			if refused.iter().any(|name| name == key) {
+				return None;
 			}
-
-			for group in &active {
-				if !groups.contains_key(group) {
-					let Some(publisher) = GroupPublisher::create(&self.origin, &self.prefix, group, node) else {
-						continue;
-					};
-					groups.insert(group.clone(), publisher);
+			match GroupPublisher::create(&task.origin, &task.prefix, &Path::new(key), task.node()) {
+				Some(group) => {
+					groups.insert(key.to_string(), group);
 				}
-				let publisher = groups.get_mut(group).expect("just inserted");
-
-				let mut frames: HashMap<String, TrafficFrame> = HashMap::new();
-				if let Some(group_entries) = entries_by_group.get(group) {
-					for entry in group_entries {
-						let slots = publisher
-							.local
-							.entry(entry.path.clone())
-							.or_default()
-							.entry(entry.tier.clone())
-							.or_default();
-						process_slot(entry.publisher, &mut slots.publisher, |snap| {
-							frames
-								.entry(traffic_track(&entry.tier, Role::Publisher, false))
-								.or_default()
-								.insert(entry.path.as_str().to_string(), snap);
-						});
-						process_slot(entry.subscriber, &mut slots.subscriber, |snap| {
-							frames
-								.entry(traffic_track(&entry.tier, Role::Subscriber, false))
-								.or_default()
-								.insert(entry.path.as_str().to_string(), snap);
-						});
-					}
+				None => {
+					refused.push(key.to_string());
+					return None;
 				}
-
-				let mut session_frames: HashMap<String, SessionsFrame> = HashMap::new();
-				if let Some(group_sessions) = sessions_by_group.get(group) {
-					for entry in group_sessions {
-						let state = publisher
-							.session_local
-							.entry(entry.tier.clone())
-							.or_default()
-							.entry(entry.root.clone())
-							.or_default();
-						process_session_slot(entry.presence, state, |snap| {
-							session_frames
-								.entry(sessions_track(&entry.tier, false))
-								.or_default()
-								.insert(entry.root.as_str().to_string(), snap);
-						});
-					}
-				}
-
-				// A requested pair whose tier just recorded becomes an ordinary
-				// tier pair: kept for the broadcast's life, no longer counting
-				// against the requested quota.
-				for name in frames.keys().chain(session_frames.keys()) {
-					publisher.requested.remove(name);
-				}
-
-				publisher.traffic.flush(&mut publisher.broadcast, &frames);
-				publisher.sessions.flush(&mut publisher.broadcast, &session_frames);
 			}
+		}
+		groups.get_mut(key)
+	}
+
+	/// Write every group's pending frames, serve consumer track requests, and
+	/// unpublish groups with nothing left to report.
+	fn publish(&mut self) {
+		// At depth 0 the single broadcast stays for the producer's life; a
+		// group broadcast lives while its group has entries.
+		let depth = self.task.depth;
+		for (_, group) in self
+			.groups
+			.extract_if(|_, group| depth > 0 && group.traffic_rows.is_empty() && group.session_rows.is_empty())
+		{
+			// Deliberate unpublish: finish (tracks included) rather than drop,
+			// so there is no dropped-without-finish warning.
+			group.finish();
+		}
+
+		for group in self.groups.values_mut() {
+			group.flush(self.tick);
 
 			// Serve consumer requests for tracks no drain has created yet: a
 			// tier's tracks appear lazily on its first traffic, so a subscriber
 			// arriving first would otherwise be rejected and forced into a
 			// retry loop (fleet-wide, that rejection churn is a log and CPU
 			// storm). Held open with zeros instead; see `serve_requests`.
-			for publisher in groups.values_mut() {
-				publisher.serve_requests();
-			}
-
-			// Drop change-detection state for entries the report no longer
-			// carries (they were pruned on a previous drain).
-			let reported: HashSet<(&PathOwned, &Tier)> =
-				report.traffic.iter().map(|entry| (&entry.path, &entry.tier)).collect();
-			let reported_sessions: HashSet<(&Tier, &PathOwned)> =
-				report.sessions.iter().map(|entry| (&entry.tier, &entry.root)).collect();
-			for publisher in groups.values_mut() {
-				publisher.local.retain(|path, tiers| {
-					tiers.retain(|tier, _| reported.contains(&(path, tier)));
-					!tiers.is_empty()
-				});
-				publisher.session_local.retain(|tier, roots| {
-					roots.retain(|root, _| reported_sessions.contains(&(tier, root)));
-					!roots.is_empty()
-				});
-			}
-
-			// Deliberate unpublish: finish evicted publishers (tracks included)
-			// rather than dropping them, so there is no dropped-without-finish
-			// warning.
-			let evicted: Vec<PathOwned> = groups
-				.keys()
-				.filter(|group| !active.contains(*group))
-				.cloned()
-				.collect();
-			for group in evicted {
-				if let Some(publisher) = groups.remove(&group) {
-					publisher.finish();
-				}
-			}
+			group.serve_requests();
 		}
+	}
+
+	fn finish(self) {
+		for (_, group) in self.groups {
+			group.finish();
+		}
+	}
+}
+
+/// One track's frame, rebuilt every drain in a buffer kept across drains.
+/// Serializes as a JSON object keyed by path, byte-identical to
+/// [`TrafficFrame`](crate::TrafficFrame) / [`SessionsFrame`](crate::SessionsFrame) once sorted.
+struct Frame<V> {
+	entries: Vec<(PathOwned, V)>,
+}
+
+impl<V> Default for Frame<V> {
+	fn default() -> Self {
+		Self { entries: Vec::new() }
+	}
+}
+
+impl<V: Serialize> Serialize for Frame<V> {
+	fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+		serializer.collect_map(self.entries.iter().map(|(path, value)| (path.as_str(), value)))
 	}
 }
 
@@ -368,13 +383,15 @@ impl Task {
 /// moq-json with deltas and compression off, which is wire-identical to
 /// writing each frame as its own single-frame group; the compressed side uses
 /// merge-patch deltas inside a shared DEFLATE window.
-struct TrackPair<T> {
-	plain: moq_json::snapshot::Producer<T>,
-	compressed: moq_json::snapshot::Producer<T>,
+struct TrackPair<V> {
+	plain: moq_json::snapshot::Producer<Frame<V>>,
+	compressed: moq_json::snapshot::Producer<Frame<V>>,
+	/// This drain's entries, published and cleared by [`Self::publish`].
+	frame: Frame<V>,
 }
 
-impl<T: Serialize> TrackPair<T> {
-	fn create(broadcast: &mut broadcast::Producer, name: &str) -> Result<Self, moq_net::Error> {
+impl<V: Serialize> TrackPair<V> {
+	fn create(broadcast: &broadcast::Producer, name: &str) -> Result<Self, moq_net::Error> {
 		let plain_track = broadcast.create_track(name, None)?;
 		let compressed_track = broadcast.create_track(format!("{name}{COMPRESSED_SUFFIX}").as_str(), None)?;
 		Ok(Self::from_tracks(plain_track, compressed_track))
@@ -385,7 +402,7 @@ impl<T: Serialize> TrackPair<T> {
 	/// queued-request fulfillment cannot reach it; the caller collects both
 	/// flavors' popped requests and this serves each through its actual
 	/// request where one exists.
-	fn adopt(broadcast: &mut broadcast::Producer, name: &str, pending: PendingPair) -> Result<Self, moq_net::Error> {
+	fn adopt(broadcast: &broadcast::Producer, name: &str, pending: PendingPair) -> Result<Self, moq_net::Error> {
 		let PendingPair { plain, compressed } = pending;
 		let plain_track = match plain {
 			Some(request) => request.accept(None),
@@ -399,12 +416,14 @@ impl<T: Serialize> TrackPair<T> {
 	}
 
 	fn from_tracks(plain_track: track::Producer, compressed_track: track::Producer) -> Self {
-		let plain_config = moq_json::snapshot::ProducerConfig::default().with_delta_ratio(0);
-		let compressed_config = moq_json::snapshot::ProducerConfig::default().with_compression(true);
+		let plain_config = moq_json::snapshot::Config::default().with_delta_ratio(0);
+		let mut compressed_config = moq_json::snapshot::Config::default();
+		compressed_config.compression = moq_json::Compression::Deflate;
 
 		Self {
 			plain: moq_json::snapshot::Producer::new(plain_track, plain_config),
 			compressed: moq_json::snapshot::Producer::new(compressed_track, compressed_config),
+			frame: Frame::default(),
 		}
 	}
 
@@ -413,14 +432,17 @@ impl<T: Serialize> TrackPair<T> {
 		self.plain.is_used() || self.compressed.is_used()
 	}
 
-	/// Publish `frame` on both flavors; moq-json skips unchanged values.
-	fn update(&mut self, name: &str, frame: &T) {
-		if let Err(err) = self.plain.update(frame) {
+	/// Publish this drain's entries on both flavors (`{}` when there are none)
+	/// and clear them for the next drain; moq-json skips unchanged values.
+	fn publish(&mut self, name: &str) {
+		self.frame.entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+		if let Err(err) = self.plain.update(&self.frame) {
 			tracing::debug!(?err, name, "stats: failed to write frame");
 		}
-		if let Err(err) = self.compressed.update(frame) {
+		if let Err(err) = self.compressed.update(&self.frame) {
 			tracing::debug!(?err, name, "stats: failed to write compressed frame");
 		}
+		self.frame.entries.clear();
 	}
 
 	/// Finish both flavors, so dropping the pair is a deliberate end instead of
@@ -464,15 +486,15 @@ impl PendingPair {
 
 /// One frame type's live pairs and the requests parked for them; the traffic
 /// tracks and the sessions tracks each form one family.
-struct TrackFamily<T> {
-	tracks: HashMap<String, TrackPair<T>>,
+struct TrackFamily<V> {
+	tracks: HashMap<String, TrackPair<V>>,
 	/// Valid-shaped requests awaiting quota, keyed by plain name and bounded by
 	/// [`MAX_PARKED_REQUESTS`] across both families. Adopted as the quota
 	/// frees, or dropped once every requester leaves.
 	parked: HashMap<String, PendingPair>,
 }
 
-impl<T: Serialize + Default> TrackFamily<T> {
+impl<V: Serialize> TrackFamily<V> {
 	fn new() -> Self {
 		Self {
 			tracks: HashMap::new(),
@@ -480,33 +502,51 @@ impl<T: Serialize + Default> TrackFamily<T> {
 		}
 	}
 
-	/// Ensure a track pair exists for every frame this drain produced, then push
-	/// each pair its frame (an empty one when the drain had nothing for it, so a
-	/// track whose last entry closed transitions to `{}` exactly once).
+	/// Add one entry to track `name`'s pending frame, creating the pair on the
+	/// track's first entry.
 	///
 	/// A pair created here serves any parked requests for its name: a parked
 	/// request was already popped off the broadcast queue, so `create_track`'s
 	/// queued-request fulfillment cannot reach it, and creating the pair blind
-	/// would strand its requesters on a name that now exists.
-	fn flush(&mut self, broadcast: &mut broadcast::Producer, frames: &HashMap<String, T>) {
-		for name in frames.keys() {
-			if !self.tracks.contains_key(name) {
-				let result = match self.parked.remove(name) {
-					Some(pending) => TrackPair::adopt(broadcast, name, pending),
-					None => TrackPair::create(broadcast, name),
-				};
-				match result {
-					Ok(pair) => {
-						self.tracks.insert(name.clone(), pair);
-					}
-					Err(err) => tracing::warn!(?err, name, "stats: failed to create track"),
+	/// would strand its requesters on a name that now exists. A requested pair
+	/// whose tier records becomes an ordinary tier pair: kept for the
+	/// broadcast's life, no longer counting against the requested quota.
+	fn push(
+		&mut self,
+		broadcast: &broadcast::Producer,
+		requested: &mut HashSet<String>,
+		name: &str,
+		path: PathOwned,
+		value: V,
+	) {
+		if !self.tracks.contains_key(name) {
+			let result = match self.parked.remove(name) {
+				Some(pending) => TrackPair::adopt(broadcast, name, pending),
+				None => TrackPair::create(broadcast, name),
+			};
+			match result {
+				Ok(pair) => {
+					self.tracks.insert(name.to_string(), pair);
+				}
+				Err(err) => {
+					tracing::warn!(?err, name, "stats: failed to create track");
+					return;
 				}
 			}
 		}
+		if !requested.is_empty() {
+			requested.remove(name);
+		}
+		let pair = self.tracks.get_mut(name).expect("just ensured");
+		pair.frame.entries.push((path, value));
+	}
 
-		let empty = T::default();
+	/// Publish every pair's pending frame, an empty one when the drain had
+	/// nothing for it, so a track whose last entry closed transitions to `{}`
+	/// exactly once.
+	fn flush(&mut self) {
 		for (name, pair) in self.tracks.iter_mut() {
-			pair.update(name, frames.get(name).unwrap_or(&empty));
+			pair.publish(name);
 		}
 	}
 
@@ -559,7 +599,7 @@ impl<T: Serialize + Default> TrackFamily<T> {
 	/// later drain, so a valid-shaped request is never terminally rejected
 	/// merely for arriving while the quota was full. Entries whose every
 	/// requester left are dropped instead of adopted.
-	fn adopt_parked(&mut self, broadcast: &mut broadcast::Producer, requested: &mut HashSet<String>) {
+	fn adopt_parked(&mut self, broadcast: &broadcast::Producer, requested: &mut HashSet<String>) {
 		let noop = kio::Waiter::noop();
 		let mut parked = std::mem::take(&mut self.parked);
 		parked.retain(|plain, pending| {
@@ -580,7 +620,7 @@ impl<T: Serialize + Default> TrackFamily<T> {
 	/// caller owns the quota decision; this only mints the pair.
 	fn adopt_pair(
 		&mut self,
-		broadcast: &mut broadcast::Producer,
+		broadcast: &broadcast::Producer,
 		requested: &mut HashSet<String>,
 		plain: String,
 		pending: PendingPair,
@@ -596,7 +636,7 @@ impl<T: Serialize + Default> TrackFamily<T> {
 		match TrackPair::adopt(broadcast, &plain, pending) {
 			Ok(mut pair) => {
 				// Hold the subscription open with zeros until the tier records.
-				pair.update(&plain, &T::default());
+				pair.publish(&plain);
 				self.tracks.insert(plain.clone(), pair);
 				requested.insert(plain);
 			}
@@ -624,16 +664,38 @@ struct GroupPublisher {
 	/// recording real traffic (now an ordinary tier pair, kept forever) or by
 	/// losing its last consumer (reclaimed, quota refunded).
 	requested: HashSet<String>,
-	traffic: TrackFamily<TrafficFrame>,
-	sessions: TrackFamily<SessionsFrame>,
+	traffic: TrackFamily<Traffic>,
+	sessions: TrackFamily<Presence>,
 	local: HashMap<PathOwned, HashMap<Tier, SideSlots>>,
 	session_local: HashMap<Tier, HashMap<PathOwned, SessionSlotState>>,
+	/// Track names per tier, built once so a drain never formats a name.
+	names: HashMap<Tier, TierNames>,
+	/// This drain's entries for the group, as indices into the report.
+	traffic_rows: Vec<usize>,
+	session_rows: Vec<usize>,
+}
+
+/// The plain track names one tier's entries land on.
+struct TierNames {
+	publisher: String,
+	subscriber: String,
+	sessions: String,
+}
+
+impl TierNames {
+	fn new(tier: &Tier) -> Self {
+		Self {
+			publisher: traffic_track(tier, Role::Publisher, false),
+			subscriber: traffic_track(tier, Role::Subscriber, false),
+			sessions: sessions_track(tier, false),
+		}
+	}
 }
 
 impl GroupPublisher {
 	fn create(origin: &origin::Producer, prefix: &Path, group: &Path, node: Option<&str>) -> Option<Self> {
 		let advertised = advertised_path(prefix, group, node);
-		let mut broadcast = match origin.create_broadcast(&advertised, broadcast::Route::new().with_announce(true)) {
+		let broadcast = match origin.publish(&advertised, origin::Route::default()) {
 			Ok(broadcast) => broadcast,
 			Err(err) => {
 				tracing::warn!(advertised = %advertised, ?err, "stats: origin rejected stats broadcast");
@@ -649,7 +711,7 @@ impl GroupPublisher {
 		let tier = Tier::default();
 		for role in [Role::Publisher, Role::Subscriber] {
 			let name = traffic_track(&tier, role, false);
-			match TrackPair::create(&mut broadcast, &name) {
+			match TrackPair::create(&broadcast, &name) {
 				Ok(pair) => {
 					traffic.tracks.insert(name, pair);
 				}
@@ -660,7 +722,7 @@ impl GroupPublisher {
 			}
 		}
 		let name = sessions_track(&tier, false);
-		match TrackPair::create(&mut broadcast, &name) {
+		match TrackPair::create(&broadcast, &name) {
 			Ok(pair) => {
 				sessions.tracks.insert(name, pair);
 			}
@@ -680,7 +742,77 @@ impl GroupPublisher {
 			sessions,
 			local: HashMap::new(),
 			session_local: HashMap::new(),
+			names: HashMap::new(),
+			traffic_rows: Vec::new(),
+			session_rows: Vec::new(),
 		})
+	}
+
+	/// Run this drain's rows through change detection into the pending frames.
+	fn collect(&mut self, report: &Report, tick: u64) {
+		let Self {
+			broadcast,
+			requested,
+			traffic,
+			sessions,
+			local,
+			session_local,
+			names,
+			traffic_rows,
+			session_rows,
+			..
+		} = self;
+
+		for &i in traffic_rows.iter() {
+			let entry = &report.traffic[i];
+			let names = names
+				.entry(entry.tier.clone())
+				.or_insert_with(|| TierNames::new(&entry.tier));
+			let slots = local
+				.entry(entry.path.clone())
+				.or_default()
+				.entry(entry.tier.clone())
+				.or_default();
+			slots.seen = tick;
+			process_slot(entry.publisher, &mut slots.publisher, |snap| {
+				traffic.push(broadcast, requested, &names.publisher, entry.path.clone(), snap);
+			});
+			process_slot(entry.subscriber, &mut slots.subscriber, |snap| {
+				traffic.push(broadcast, requested, &names.subscriber, entry.path.clone(), snap);
+			});
+		}
+
+		for &i in session_rows.iter() {
+			let entry = &report.sessions[i];
+			let names = names
+				.entry(entry.tier.clone())
+				.or_insert_with(|| TierNames::new(&entry.tier));
+			let state = session_local
+				.entry(entry.tier.clone())
+				.or_default()
+				.entry(entry.root.clone())
+				.or_default();
+			state.seen = tick;
+			process_session_slot(entry.presence, state, |snap| {
+				sessions.push(broadcast, requested, &names.sessions, entry.root.clone(), snap);
+			});
+		}
+	}
+
+	/// Publish the pending frames, then drop change-detection state for
+	/// entries this drain did not carry (the registry pruned them).
+	fn flush(&mut self, tick: u64) {
+		self.traffic.flush();
+		self.sessions.flush();
+
+		self.local.retain(|_, tiers| {
+			tiers.retain(|_, slots| slots.seen == tick);
+			!tiers.is_empty()
+		});
+		self.session_local.retain(|_, roots| {
+			roots.retain(|_, state| state.seen == tick);
+			!roots.is_empty()
+		});
 	}
 
 	/// Serve consumer requests for tracks no drain has created yet.
@@ -716,8 +848,8 @@ impl GroupPublisher {
 			}
 		}
 
-		self.traffic.adopt_parked(&mut self.broadcast, &mut self.requested);
-		self.sessions.adopt_parked(&mut self.broadcast, &mut self.requested);
+		self.traffic.adopt_parked(&self.broadcast, &mut self.requested);
+		self.sessions.adopt_parked(&self.broadcast, &mut self.requested);
 	}
 
 	/// Deliberately end the broadcast: finish every pair, then the broadcast
@@ -784,19 +916,23 @@ struct SlotState {
 struct SideSlots {
 	publisher: SlotState,
 	subscriber: SlotState,
+	/// The last drain that reported this `(path, tier)`.
+	seen: u64,
 }
 
 /// Change-detection state for one session-track root, mirroring [`SlotState`].
 #[derive(Default)]
 struct SessionSlotState {
 	prev_emitted: Option<Presence>,
+	/// The last drain that reported this root.
+	seen: u64,
 }
 
 /// Per-drain work for a single `(side, tier)` slot: update the slot's
 /// `prev_emitted` and hand `snap` to `emit` iff the slot is live or changed
 /// this drain.
 fn process_slot(snap: Traffic, slot_state: &mut SlotState, emit: impl FnOnce(Traffic)) {
-	// A slot is live while any open counter still exceeds its `*_closed`
+	// A slot is live while any started counter still exceeds its `*_ended`
 	// counterpart: a guard is held, so a subscription could begin at any
 	// moment. Live slots are emitted every drain so a downstream "currently
 	// active" view always sees the full set. Once every pair is equal no
@@ -838,23 +974,15 @@ fn process_session_slot(snap: Presence, slot_state: &mut SessionSlotState, emit:
 	}
 }
 
-fn group_key(path: &str, depth: usize) -> PathOwned {
+/// The leading `depth` segments of `path`, the group it publishes under.
+fn group_key(path: &str, depth: usize) -> &str {
 	if depth == 0 {
-		return Path::empty().to_owned();
+		return "";
 	}
-
-	let mut seen = 0;
-	let mut end = path.len();
-	for (i, b) in path.bytes().enumerate() {
-		if b == b'/' {
-			seen += 1;
-			if seen == depth {
-				end = i;
-				break;
-			}
-		}
+	match path.match_indices('/').nth(depth - 1) {
+		Some((end, _)) => &path[..end],
+		None => path,
 	}
-	Path::new(&path[..end]).to_owned()
 }
 
 fn advertised_path(prefix: &Path, group: &Path, node: Option<&str>) -> PathOwned {
@@ -876,17 +1004,30 @@ fn advertised_path(prefix: &Path, group: &Path, node: Option<&str>) -> PathOwned
 
 #[cfg(test)]
 mod tests {
+	/// Build an origin producer, spawning its driver on the ambient runtime.
+	fn produce_origin() -> moq_net::origin::Producer {
+		let (producer, driver) = moq_net::origin::Producer::new(moq_net::origin::Config::default());
+		if tokio::runtime::Handle::try_current().is_ok() {
+			tokio::spawn(moq_net::time::run(driver));
+		} else {
+			// A sync test: nothing polls the driver, and dropping it would tear
+			// the origin down, so leak it and rely on the synchronous half.
+			std::mem::forget(driver);
+		}
+		producer
+	}
+
 	use std::collections::BTreeMap;
 
 	use moq_net::stats::{Registry, Tier};
-	use moq_net::{Origin, Timestamp, announce, broadcast, track};
+	use moq_net::{Timestamp, announce, broadcast, track};
 
 	use super::*;
 
 	fn test_producer(node: Option<&str>) -> (Producer, origin::Producer) {
-		let origin = Origin::random().produce();
+		let origin = produce_origin();
 		let producer = Producer::new(
-			ProducerConfig::new()
+			Config::new()
 				.with_origin(origin.clone())
 				.with_node(node.map(|s| PathOwned::from(s.to_string()))),
 		);
@@ -918,23 +1059,18 @@ mod tests {
 		frame_size: usize,
 	) -> Feed {
 		let ctx = registry.tier(tier).session("feed");
-		let origin = Origin::random().produce();
+		let origin = produce_origin();
 		// Egress (publisher side) is tagged; the local publisher stays untagged.
 		let egress = origin.consume().with_stats(ctx);
 
 		let mut announced = egress.announced();
-		let mut source = origin
-			.create_broadcast(path, broadcast::Route::announced())
-			.expect("create_broadcast");
-		let mut producer = source.create_track("video", None).expect("create_track");
+		let source = origin.create_broadcast(path).expect("create_broadcast");
+		source.announce(origin::Route::default()).expect("announce");
+		let producer = source.create_track("video", None).expect("create_track");
 
-		// Let the origin's source watcher attach and announce (paused time advances
-		// instantly and yields to the spawned tasks).
-		tokio::time::sleep(Duration::from_millis(1)).await;
-		tokio::time::sleep(Duration::from_millis(1)).await;
-
-		let announce::Update { broadcast, .. } = announced.next().await.expect("announce");
-		let consumer = broadcast.expect("active");
+		let update = announced.next().await.expect("announce");
+		assert!(update.kind.is_active());
+		let consumer = egress.request_broadcast(path).await.expect("resolve");
 
 		let sub = if subscribe {
 			let mut sub = consumer
@@ -973,8 +1109,14 @@ mod tests {
 	async fn announced(origin: &origin::Producer) -> (String, moq_net::broadcast::Consumer) {
 		let mut consumer = origin.consume().announced();
 		tokio::time::advance(Duration::from_millis(1)).await;
-		let announce::Update { path, broadcast } = consumer.next().await.expect("expected announce");
-		(path.as_str().to_string(), broadcast.expect("active"))
+		let update = consumer.next().await.expect("expected announce");
+		assert!(update.kind.is_active());
+		let broadcast = origin
+			.consume()
+			.request_broadcast(moq_net::Path::new(update.prefix.as_str()))
+			.await
+			.expect("resolve");
+		(update.prefix.as_str().to_string(), broadcast)
 	}
 
 	/// Advance past one publish interval so the task drains and writes frames.
@@ -991,7 +1133,7 @@ mod tests {
 	/// wire format (a full JSON object per frame, no compression).
 	async fn read_frame(broadcast: &moq_net::broadcast::Consumer, name: &str) -> BTreeMap<String, Traffic> {
 		let mut track = subscribe(broadcast, name).await;
-		let frame = track.read_frame().await.expect("ok").expect("frame");
+		let frame = next_frame(&mut track).await;
 		serde_json::from_slice(&frame.payload).expect("json parse")
 	}
 
@@ -999,10 +1141,9 @@ mod tests {
 	/// immediate first (often empty) frame at time zero, so a test that records
 	/// traffic asynchronously reads the accumulated state rather than that stale one.
 	async fn read_last_frame(broadcast: &moq_net::broadcast::Consumer, name: &str) -> BTreeMap<String, Traffic> {
-		use futures::FutureExt;
 		let mut track = subscribe(broadcast, name).await;
-		let mut last = track.read_frame().await.expect("ok").expect("frame");
-		while let Some(Ok(Some(frame))) = track.read_frame().now_or_never() {
+		let mut last = next_frame(&mut track).await;
+		while let Some(frame) = try_next_frame(&mut track) {
 			last = frame;
 		}
 		serde_json::from_slice(&last.payload).expect("json parse")
@@ -1010,17 +1151,32 @@ mod tests {
 
 	async fn read_session_frame(broadcast: &moq_net::broadcast::Consumer, name: &str) -> BTreeMap<String, Presence> {
 		let mut track = subscribe(broadcast, name).await;
-		let frame = track.read_frame().await.expect("ok").expect("frame");
+		let frame = next_frame(&mut track).await;
 		serde_json::from_slice(&frame.payload).expect("json parse")
 	}
 
-	async fn subscribe(broadcast: &moq_net::broadcast::Consumer, name: &str) -> track::Subscriber {
+	async fn subscribe(broadcast: &moq_net::broadcast::Consumer, name: &str) -> track::Ordered {
 		broadcast
 			.track(name)
 			.expect("track")
 			.subscribe(None)
 			.await
 			.expect("subscribe")
+			.ordered()
+	}
+
+	/// The next group's first frame. Stats tracks are one frame per group, so this is
+	/// one published sample.
+	async fn next_frame(track: &mut track::Ordered) -> moq_net::frame::Frame {
+		let mut group = track.next_group().await.expect("ok").expect("group");
+		group.read_frame().await.expect("ok").expect("frame")
+	}
+
+	/// The same, without blocking: `None` once nothing more is buffered.
+	fn try_next_frame(track: &mut track::Ordered) -> Option<moq_net::frame::Frame> {
+		use futures::FutureExt;
+		let mut group = track.next_group().now_or_never()?.expect("ok")?;
+		group.read_frame().now_or_never()?.expect("ok")
 	}
 
 	/// The advertised path normalizes a messy node suffix and drops an
@@ -1065,9 +1221,12 @@ mod tests {
 		let (_, broadcast) = announced(&origin).await;
 		let frame = read_last_frame(&broadcast, "publisher.json").await;
 		let snap = frame.get("foo/bar").expect("foo/bar entry");
-		assert_eq!(snap.announced, 1, "egress announce stream bumps announced");
-		assert_eq!(snap.broadcasts, 1, "one session subscribed");
-		assert_eq!(snap.subscriptions, 1);
+		assert_eq!(
+			snap.announces_started, 1,
+			"egress announce stream bumps announces_started"
+		);
+		assert_eq!(snap.broadcasts_started, 1, "one session subscribed");
+		assert_eq!(snap.subscriptions_started, 1);
 		assert_eq!(snap.bytes, 42);
 		assert_eq!(snap.frames, 1);
 	}
@@ -1083,7 +1242,7 @@ mod tests {
 		let (_, broadcast) = announced(&origin).await;
 		let frame = read_last_frame(&broadcast, "publisher.json").await;
 		let snap = frame.get("foo/bar").expect("foo/bar entry");
-		assert_eq!(snap.announced, 1);
+		assert_eq!(snap.announces_started, 1);
 		assert_eq!(
 			snap.announced_bytes,
 			"foo/bar".len() as u64,
@@ -1093,7 +1252,7 @@ mod tests {
 
 	#[tokio::test(start_paused = true)]
 	async fn announced_decouples_from_broadcasts() {
-		// An announce with no subscription should bump announced but NOT broadcasts
+		// An announce with no subscription should bump announces_started but NOT broadcasts_started
 		// (which only counts sessions with an active sub).
 		let (producer, origin) = test_producer(Some("sjc"));
 		let _f = feed(producer.registry(), Tier::default(), "foo/bar", false, 0, 0).await;
@@ -1103,16 +1262,16 @@ mod tests {
 		let (_, broadcast) = announced(&origin).await;
 		let frame = read_last_frame(&broadcast, "publisher.json").await;
 		let snap = frame.get("foo/bar").expect("foo/bar entry");
-		assert_eq!(snap.announced, 1);
-		assert_eq!(snap.broadcasts, 0, "no subscription, no broadcasts sentinel");
-		assert_eq!(snap.subscriptions, 0);
+		assert_eq!(snap.announces_started, 1);
+		assert_eq!(snap.broadcasts_started, 0, "no subscription, no broadcasts sentinel");
+		assert_eq!(snap.subscriptions_started, 0);
 	}
 
 	#[tokio::test(start_paused = true)]
 	async fn short_lived_sub_is_surfaced() {
 		// A subscription that opens AND closes within a single drain window
-		// must still surface as a complete broadcasts open/close cycle. The
-		// cumulative counters retain broadcasts=1/broadcasts_closed=1, and the
+		// must still surface as a complete broadcasts start/end cycle. The
+		// cumulative counters retain broadcasts_started=1/broadcasts_ended=1, and the
 		// change-driven inclusion surfaces the entry even though it's net-idle
 		// by drain time.
 		let (producer, origin) = test_producer(Some("sjc"));
@@ -1128,10 +1287,10 @@ mod tests {
 		let frame = read_last_frame(&broadcast, "publisher.json").await;
 		let snap = frame.get("foo/bar").expect("foo/bar entry");
 		// One session opened then closed a subscription within the drain.
-		assert_eq!(snap.subscriptions, 1);
-		assert_eq!(snap.subscriptions_closed, 1);
-		assert_eq!(snap.broadcasts, 1, "one session subscribed");
-		assert_eq!(snap.broadcasts_closed, 1);
+		assert_eq!(snap.subscriptions_started, 1);
+		assert_eq!(snap.subscriptions_ended, 1);
+		assert_eq!(snap.broadcasts_started, 1, "one session subscribed");
+		assert_eq!(snap.broadcasts_ended, 1);
 		assert_eq!(snap.bytes, 123);
 		assert_eq!(snap.frames, 1);
 	}
@@ -1148,8 +1307,8 @@ mod tests {
 		let (_, broadcast) = announced(&origin).await;
 		let frame = read_session_frame(&broadcast, "sessions.json").await;
 		let snap = frame.get("acme").expect("root entry");
-		assert_eq!(snap.sessions, 2);
-		assert_eq!(snap.sessions_closed, 0);
+		assert_eq!(snap.sessions_started, 2);
+		assert_eq!(snap.sessions_ended, 0);
 		assert!(
 			!frame.contains_key("peer"),
 			"regional session must not appear on the default track"
@@ -1159,7 +1318,7 @@ mod tests {
 			.await
 			.get("peer")
 			.expect("regional entry");
-		assert_eq!(snap.sessions, 1);
+		assert_eq!(snap.sessions_started, 1);
 	}
 
 	#[tokio::test(start_paused = true)]
@@ -1204,8 +1363,8 @@ mod tests {
 			.expect("logical track")
 			.subscribe(None);
 		drive_tick().await;
-		let mut sub = subscribing.await.expect("an idle tier's track is held open");
-		let frame = sub.read_frame().await.expect("ok").expect("frame");
+		let mut sub = subscribing.await.expect("an idle tier's track is held open").ordered();
+		let frame = next_frame(&mut sub).await;
 		let parsed: BTreeMap<String, Traffic> = serde_json::from_slice(&frame.payload).expect("json");
 		assert!(parsed.is_empty(), "an idle tier serves zeros, got {parsed:?}");
 	}
@@ -1237,10 +1396,10 @@ mod tests {
 
 	#[test]
 	fn group_key_uses_leading_segments() {
-		assert_eq!(group_key("acme/room/cam", 0), Path::empty().to_owned());
-		assert_eq!(group_key("acme/room/cam", 1), Path::new("acme").to_owned());
-		assert_eq!(group_key("acme/room/cam", 2), Path::new("acme/room").to_owned());
-		assert_eq!(group_key("acme/room", 3), Path::new("acme/room").to_owned());
+		assert_eq!(group_key("acme/room/cam", 0), "");
+		assert_eq!(group_key("acme/room/cam", 1), "acme");
+		assert_eq!(group_key("acme/room/cam", 2), "acme/room");
+		assert_eq!(group_key("acme/room", 3), "acme/room");
 	}
 
 	#[test]
@@ -1280,15 +1439,15 @@ mod tests {
 		// Nothing has recorded on the rtmp tier: the track does not exist yet.
 		let subscribing = broadcast.track("rtmp/publisher.json").expect("track").subscribe(None);
 		drive_tick().await;
-		let mut sub = subscribing.await.expect("held open, not rejected");
-		let frame = sub.read_frame().await.expect("ok").expect("frame");
+		let mut sub = subscribing.await.expect("held open, not rejected").ordered();
+		let frame = next_frame(&mut sub).await;
 		let parsed: BTreeMap<String, Traffic> = serde_json::from_slice(&frame.payload).expect("json");
 		assert!(parsed.is_empty(), "an idle tier serves zeros");
 
 		// The tier records: the same subscription carries the data.
 		let _rtmp = feed(producer.registry(), Tier::new("rtmp"), "foo/live", true, 1, 7).await;
 		drive_tick().await;
-		let frame = sub.read_frame().await.expect("ok").expect("frame");
+		let frame = next_frame(&mut sub).await;
 		let parsed: BTreeMap<String, Traffic> = serde_json::from_slice(&frame.payload).expect("json");
 		assert_eq!(parsed.get("foo/live").expect("entry").bytes, 7);
 	}
@@ -1320,8 +1479,8 @@ mod tests {
 
 		let subscribing = broadcast.track("webrtc/sessions.json").expect("track").subscribe(None);
 		drive_tick().await;
-		let mut sub = subscribing.await.expect("held open, not rejected");
-		let frame = sub.read_frame().await.expect("ok").expect("frame");
+		let mut sub = subscribing.await.expect("held open, not rejected").ordered();
+		let frame = next_frame(&mut sub).await;
 		let parsed: BTreeMap<String, Presence> = serde_json::from_slice(&frame.payload).expect("json");
 		assert!(parsed.is_empty());
 	}
@@ -1363,8 +1522,11 @@ mod tests {
 		drive_tick().await;
 
 		// The queued subscription resolves and carries the tier's first data.
-		let mut sub = subscribing.await.expect("fulfilled by the tick's own creation");
-		let frame = sub.read_frame().await.expect("ok").expect("frame");
+		let mut sub = subscribing
+			.await
+			.expect("fulfilled by the tick's own creation")
+			.ordered();
+		let frame = next_frame(&mut sub).await;
 		let parsed: BTreeMap<String, Traffic> = serde_json::from_slice(&frame.payload).expect("json");
 		assert_eq!(parsed.get("foo/live").expect("entry").bytes, 7);
 	}
@@ -1446,9 +1608,116 @@ mod tests {
 		// The tier records while the request is parked: the flush adopts it.
 		let _rt = feed(producer.registry(), Tier::new("rt"), "foo/live", true, 1, 9).await;
 		drive_tick().await;
-		let mut sub = subscribing.await.expect("adopted by the flush");
-		let frame = sub.read_frame().await.expect("ok").expect("frame");
+		let mut sub = subscribing.await.expect("adopted by the flush").ordered();
+		let frame = next_frame(&mut sub).await;
 		let parsed: BTreeMap<String, Traffic> = serde_json::from_slice(&frame.payload).expect("json");
 		assert_eq!(parsed.get("foo/live").expect("entry").bytes, 9);
+	}
+
+	#[test]
+	fn frame_serializes_like_a_btreemap() {
+		// The producer's reused frame must stay byte-identical to the
+		// `TrafficFrame` consumers parse, including key order.
+		let traffic = |bytes| {
+			let mut traffic = Traffic::default();
+			traffic.bytes = bytes;
+			traffic
+		};
+		let mut frame = Frame::default();
+		let mut map = BTreeMap::new();
+		for (path, bytes) in [("room/b", 2), ("room/a", 1), ("other", 3), ("room/a/cam", 4)] {
+			frame.entries.push((PathOwned::from(path), traffic(bytes)));
+			map.insert(path.to_string(), traffic(bytes));
+		}
+		frame.entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+		assert_eq!(serde_json::to_vec(&frame).unwrap(), serde_json::to_vec(&map).unwrap());
+		assert_eq!(serde_json::to_vec(&Frame::<Traffic>::default()).unwrap(), b"{}");
+	}
+
+	/// Counts this thread's allocations, so the test below measures only its
+	/// own drain while other tests run in parallel.
+	mod counting {
+		use std::alloc::{GlobalAlloc, Layout, System};
+		use std::cell::Cell;
+
+		thread_local! {
+			static ALLOCS: Cell<usize> = const { Cell::new(0) };
+		}
+
+		struct Counting;
+
+		unsafe impl GlobalAlloc for Counting {
+			unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+				let _ = ALLOCS.try_with(|n| n.set(n.get() + 1));
+				unsafe { System.alloc(layout) }
+			}
+
+			unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+				unsafe { System.dealloc(ptr, layout) }
+			}
+
+			unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+				let _ = ALLOCS.try_with(|n| n.set(n.get() + 1));
+				unsafe { System.realloc(ptr, layout, new_size) }
+			}
+		}
+
+		#[global_allocator]
+		static GLOBAL: Counting = Counting;
+
+		pub fn allocs() -> usize {
+			ALLOCS.with(Cell::get)
+		}
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn steady_drain_collects_without_allocating() {
+		// Once every group, track, and buffer exists, draining the registry
+		// into the pending frames allocates nothing, however many broadcasts
+		// and tiers there are. Encoding the frames (moq-json) is out of scope.
+		for depth in [0, 1] {
+			for (broadcasts, tiers) in [(1, 1), (16, 1), (1, 4), (16, 4)] {
+				let registry = Registry::new(moq_net::stats::Config::new());
+				let mut feeds = Vec::new();
+				for t in 0..tiers {
+					let tier = match t {
+						0 => Tier::default(),
+						t => Tier::new(format!("tier{t}")),
+					};
+					for b in 0..broadcasts {
+						feeds.push(feed(&registry, tier.clone(), &format!("room{b}/cam"), true, 1, 8).await);
+					}
+				}
+
+				let mut drain = Drain::new(Task {
+					registry,
+					origin: produce_origin(),
+					prefix: PathOwned::from(".stats"),
+					node: None,
+					depth,
+					interval: Duration::from_secs(1),
+				})
+				.expect("drain");
+
+				// Warm up: create the groups and tracks and grow every buffer.
+				for _ in 0..3 {
+					drain.collect();
+					drain.publish();
+				}
+
+				let before = counting::allocs();
+				drain.collect();
+				let allocs = counting::allocs() - before;
+				drain.publish();
+
+				let pending: usize = drain
+					.groups
+					.values()
+					.map(|group| group.traffic_rows.len() + group.session_rows.len())
+					.sum();
+				assert!(pending > 0, "the drain carried entries");
+				assert_eq!(allocs, 0, "depth {depth}, {broadcasts} broadcasts x {tiers} tiers");
+			}
+		}
 	}
 }

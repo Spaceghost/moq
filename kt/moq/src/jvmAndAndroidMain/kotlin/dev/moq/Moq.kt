@@ -1,14 +1,6 @@
 package dev.moq
 
 import kotlinx.coroutines.flow.Flow
-import uniffi.moq.MoqAnnounced
-import uniffi.moq.MoqAnnouncedBroadcast
-import uniffi.moq.MoqAnnouncement
-import uniffi.moq.MoqBroadcastConsumer
-import uniffi.moq.MoqClient
-import uniffi.moq.MoqOriginOptions
-import uniffi.moq.MoqOriginProducer
-import uniffi.moq.MoqSession
 
 /**
  * A connected MoQ session with publish/subscribe conveniences.
@@ -16,51 +8,69 @@ import uniffi.moq.MoqSession
  * Build one with [Moq.connect]. The underlying [session] always exposes a
  * publisher and a subscriber (wired from the origins you pass to [connect], or
  * auto-created), so you can [createBroadcast] and iterate [announcements]
- * without touching the raw [MoqClient] handle.
+ * without touching the raw [Client] handle.
  *
  * [Moq] is [AutoCloseable]; `use { ... }` (or [close]) gracefully shuts down
  * the session and cancels the client.
  */
 class Moq internal constructor(
     /** The established session. Use it for [Session.closed]/[Session.shutdown]. */
-    val session: MoqSession,
-    private val client: MoqClient,
+    val session: Session,
+    private val client: Client,
 ) : AutoCloseable {
     /**
-     * Create a live broadcast at [path] so subscribers can discover it.
+     * Create a locally announced broadcast at [path].
      *
-     * The origin announces the path, becoming visible shortly after this returns.
-     * Toggle discoverability with `setAnnounce`; `finish()` unpublishes immediately.
+     * Advertise it with `announce` after populating tracks. `finish()` unpublishes immediately.
      */
-    fun createBroadcast(path: String): BroadcastProducer = session.publisher().createBroadcast(path)
+    fun createBroadcast(path: String): BroadcastProducer = session.publish().createBroadcast(path)
 
     /**
-     * Discover broadcasts whose path starts with [prefix] as a [Flow]. The
-     * subscription is acquired on collection and cancelled when collection
-     * ends. Use [announced] for the raw handle.
+     * Discover routes matching [config] as a [Flow]. Each update stays relative
+     * to the origin. The subscription is acquired on
+     * collection and cancelled when collection ends. Use [announced] for the raw handle.
      */
-    fun announcements(prefix: String = ""): Flow<MoqAnnouncement> = session.consumer().announcements(prefix)
+    fun announcements(config: AnnounceConfig = AnnounceConfig()): Flow<AnnounceUpdate> =
+        session.consume().announcements(config)
 
-    /** Raw announcement handle under [prefix]. */
-    fun announced(prefix: String = ""): MoqAnnounced = session.consumer().announced(prefix)
+    /** Raw announcement handle for [config]; update prefixes stay relative to the origin. */
+    fun announced(config: AnnounceConfig = AnnounceConfig()): AnnounceConsumer =
+        session.consume().announced(config)
 
     /**
-     * Await the broadcast announced at exactly [path].
+     * Await a route covering exactly [path], then resolve the broadcast there.
      *
      * Unlike [requestBroadcast] this waits indefinitely for a future
      * announcement. Cancel the returned handle to stop waiting.
      */
-    fun announcedBroadcast(path: String): MoqAnnouncedBroadcast = session.consumer().announcedBroadcast(path)
+    fun announcedBroadcast(path: String): AnnouncedBroadcast = session.consume().announcedBroadcast(path)
 
     /**
-     * Resolve the broadcast at [path] as soon as it can be served: an existing
-     * exact-path broadcast whether announced or not, otherwise a dynamic fallback
-     * on the origin.
+     * Resolve the broadcast at [path] as soon as it can be served: a local
+     * broadcast at the exact path, the best announced route covering it, or a
+     * dynamic fallback on the origin.
      *
      * Unlike [announcedBroadcast] this does not wait for a future announcement;
      * it throws when neither can serve the path.
      */
-    suspend fun requestBroadcast(path: String): MoqBroadcastConsumer = session.consumer().requestBroadcast(path)
+    suspend fun requestBroadcast(path: String): BroadcastConsumer = session.consume().requestBroadcast(path)
+
+    /**
+     * The connection epoch: 1 for the connect that built this session, one more on
+     * each reconnect. A server-accepted session stays at 1.
+     *
+     * Pair it with [Session.status] to log each reconnect by number.
+     */
+    fun epoch(): ULong = session.epoch()
+
+    /**
+     * The session's bandwidth allocator.
+     *
+     * Every call returns a handle to the same registry. [Bandwidth.reserve] a
+     * share for an app-owned encoder, or pass the handle to `encodeVideo` /
+     * `encodeAudio`.
+     */
+    fun bandwidth(): Bandwidth = session.bandwidth()
 
     /** Gracefully shut down the session and cancel the client, releasing the native handles. */
     override fun close() {
@@ -79,6 +89,13 @@ class Moq internal constructor(
          * @param tlsCert path to a PEM certificate chain to present for mTLS.
          * @param tlsKey path to a PEM private key to present for mTLS.
          * @param bind local socket address to bind, e.g. "0.0.0.0:0".
+         * @param maxStreams cap on the concurrent QUIC streams the peer may open toward
+         *   this connection; MoQ opens one stream per group, and for a subscriber those
+         *   arrive from the relay, so subscribing to many tracks may want this raised.
+         * @param reconnect set false for a one-shot dial. By default the session redials
+         *   with backoff whenever the transport drops; watch [Session.status] for the
+         *   transitions.
+         * @param backoff retry pacing for the automatic reconnect.
          * @param publish origin to announce broadcasts through; auto-created when null.
          * @param subscribe origin to discover broadcasts through; auto-created when null.
          *
@@ -95,18 +112,24 @@ class Moq internal constructor(
             tlsCert: String? = null,
             tlsKey: String? = null,
             bind: String? = null,
-            publish: MoqOriginProducer? = null,
-            subscribe: MoqOriginProducer? = null,
+            reconnect: Boolean? = null,
+            backoff: Backoff? = null,
+            publish: OriginProducer? = null,
+            subscribe: OriginProducer? = null,
+            maxStreams: ULong? = null,
         ): Moq {
-            val client = MoqClient()
+            val client = Client()
             try {
-                if (!tlsVerify) client.setTlsDisableVerify(true)
+				if (!tlsVerify) client.setTlsVerify(false)
                 if (tlsRoots != null) client.setTlsRoots(tlsRoots)
                 if (tlsSystemRoots != null) client.setTlsSystemRoots(tlsSystemRoots)
                 if (tlsFingerprints != null) client.setTlsFingerprints(tlsFingerprints)
                 if (tlsCert != null) client.setTlsCert(tlsCert)
                 if (tlsKey != null) client.setTlsKey(tlsKey)
                 if (bind != null) client.setBind(bind)
+                if (maxStreams != null) client.setQuicMaxStreams(maxStreams)
+                if (reconnect != null) client.setReconnect(reconnect)
+                if (backoff != null) client.setBackoff(backoff)
                 if (publish != null) client.setPublish(publish)
                 if (subscribe != null) client.setConsume(subscribe)
 

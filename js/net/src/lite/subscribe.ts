@@ -1,27 +1,175 @@
 import * as Path from "../path.ts";
 import type { Reader, Writer } from "../stream.ts";
 import * as Message from "./message.ts";
-import { Version } from "./version.ts";
+import { hasFrameBounds, hasGroupOrder, resolvesStart, Version } from "./version.ts";
+
+/**
+ * Encode the `Group Start` field shared by SUBSCRIBE and SUBSCRIBE_UPDATE.
+ *
+ * Lite-06 writes the raw floor (`undefined` and 0 are the same absence of a constraint),
+ * while a pre-06 wire encodes the sequence + 1 and gets a vacuous floor folded back to
+ * absent: an explicit group 0 there means "replay from the beginning", which is not what
+ * a floor of 0 asks for.
+ */
+async function encodeStartGroup(w: Writer, version: Version, startGroup?: number) {
+	if (resolvesStart(version)) {
+		await w.u53(startGroup ?? 0);
+		return;
+	}
+	await w.u53(startGroup !== undefined && startGroup > 0 ? startGroup + 1 : 0);
+}
+
+/**
+ * Decode the `Group Start` field shared by SUBSCRIBE and SUBSCRIBE_UPDATE.
+ *
+ * The inverse of {@link encodeStartGroup}. Callers canonicalize with
+ * {@link canonicalStartGroup} once the frame bounds are known.
+ */
+async function decodeStartGroup(r: Reader, version: Version): Promise<number | undefined> {
+	const value = await r.u53();
+	if (resolvesStart(version)) return value;
+	return value > 0 ? value - 1 : undefined;
+}
+
+/**
+ * Canonicalize a decoded floor: a lite-06 `Group Start` of 0 with no frame offset is the
+ * same absence of a constraint as no floor at all, so it decodes as undefined. Group 0
+ * stays named only when a `Frame Start` actually qualifies it (a subscription can resume
+ * partway through group 0: a catalog never leaves it).
+ */
+function canonicalStartGroup(version: Version, startGroup: number | undefined, startFrame: number): number | undefined {
+	if (resolvesStart(version) && startGroup === 0 && startFrame === 0) return undefined;
+	return startGroup;
+}
+
+/**
+ * Encode the trailing `Frame Start` / `Frame End` pair shared by SUBSCRIBE and
+ * SUBSCRIBE_UPDATE. A no-op before lite-06, which has nowhere to put them.
+ */
+async function encodeFrameBounds(
+	w: Writer,
+	version: Version,
+	{
+		startGroup,
+		startFrame,
+		endGroup,
+		endFrame,
+	}: { startGroup?: number; startFrame: number; endGroup?: number; endFrame?: number },
+) {
+	if ((startFrame !== 0 && startGroup === undefined) || (endFrame !== undefined && endGroup === undefined)) {
+		throw new Error("frame bound without a group bound");
+	}
+
+	if (!hasFrameBounds(version)) {
+		// Silently widening to the whole group would deliver frames we excluded.
+		if (startFrame !== 0 || endFrame !== undefined) {
+			throw new Error("frame bounds not supported for this version");
+		}
+		return;
+	}
+
+	await w.u53(startFrame);
+	await w.u53(endFrame !== undefined ? endFrame + 1 : 0);
+}
+
+/**
+ * Decode the trailing `Frame Start` / `Frame End` pair, defaulting to the whole group.
+ *
+ * A frame bound without the group bound it qualifies is a protocol violation: frames
+ * are numbered per group, so there is nothing to count from.
+ */
+async function decodeFrameBounds(
+	r: Reader,
+	version: Version,
+	startGroup?: number,
+	endGroup?: number,
+): Promise<{ startFrame: number; endFrame?: number }> {
+	if (!hasFrameBounds(version)) {
+		return { startFrame: 0 };
+	}
+
+	const startFrame = await r.u53();
+	const endFrame = await r.u53();
+
+	if ((startFrame !== 0 && startGroup === undefined) || (endFrame !== 0 && endGroup === undefined)) {
+		throw new Error("frame bound without a group bound");
+	}
+
+	return { startFrame, endFrame: endFrame > 0 ? endFrame - 1 : undefined };
+}
+
+/** Step over the retired `Ordered` byte on a version whose layout still has it. */
+async function skipGroupOrder(r: Reader, version: Version) {
+	if (hasGroupOrder(version)) await r.bool();
+}
+
+/** Write the retired `Ordered` byte as 0, keeping a deployed version's field offsets. */
+async function padGroupOrder(w: Writer, version: Version) {
+	if (hasGroupOrder(version)) await w.bool(false);
+}
+
+/**
+ * Exclusive model/local cap from a decoded inclusive last group.
+ *
+ * The wire's `Group End` is inclusive once decoded; the track model and `setGroups` are
+ * exclusive. `undefined` stays unbounded.
+ */
+export function exclusiveGroupEnd(inclusive?: number): number | undefined {
+	return inclusive === undefined ? undefined : inclusive + 1;
+}
+
+/** The error for a requested range the wire cannot carry; see {@link emptyRange}. */
+export const EMPTY_RANGE = "empty subscription range cannot be encoded";
+
+/**
+ * Inclusive last group a Subscribe message carries, from an exclusive model end.
+ *
+ * Empty (`0`) cannot be encoded: the wire's 0 means unbounded. Callers refuse an empty
+ * requested range with {@link emptyRange} before reaching here.
+ */
+export function inclusiveGroupEnd(exclusive?: number): number | undefined {
+	if (exclusive === undefined) return undefined;
+	if (exclusive === 0) throw new Error(EMPTY_RANGE);
+	return exclusive - 1;
+}
+
+/**
+ * Whether a requested range asks for nothing.
+ *
+ * The wire has no encoding for one: its bounds are inclusive, so flooring the end would
+ * either hand back the group the caller excluded (0 means unbounded) or invert the
+ * range once the two bounds meet. An absent start is the live edge, so it only empties
+ * the range when the end is 0.
+ */
+export function emptyRange({ startGroup, endGroup }: { startGroup?: number; endGroup?: number }): boolean {
+	return endGroup !== undefined && (startGroup ?? 0) >= endGroup;
+}
 
 export class SubscribeUpdate {
 	priority: number;
-	ordered: boolean;
-	maxLatency: number;
+	/** Subscriber max latency in milliseconds; zero skips once a newer group is available. */
+	maxAge: number;
 	startGroup?: number;
 	endGroup?: number;
+	/** See {@link Subscribe.startFrame}. */
+	startFrame: number;
+	/** See {@link Subscribe.endFrame}. */
+	endFrame?: number;
 
 	constructor(props: {
 		priority: number;
-		ordered?: boolean;
-		maxLatency?: number;
+		maxAge?: number;
 		startGroup?: number;
 		endGroup?: number;
+		startFrame?: number;
+		endFrame?: number;
 	}) {
 		this.priority = props.priority;
-		this.ordered = props.ordered ?? false;
-		this.maxLatency = props.maxLatency ?? 0;
+		this.maxAge = props.maxAge ?? 0;
 		this.startGroup = props.startGroup;
 		this.endGroup = props.endGroup;
+		this.startFrame = props.startFrame ?? 0;
+		this.endFrame = props.endFrame;
 	}
 
 	async #encode(w: Writer, version: Version) {
@@ -32,10 +180,11 @@ export class SubscribeUpdate {
 				break;
 			default:
 				await w.u8(this.priority);
-				await w.bool(this.ordered);
-				await w.u53(this.maxLatency);
-				await w.u53(this.startGroup !== undefined ? this.startGroup + 1 : 0);
+				await padGroupOrder(w, version);
+				await w.u53(this.maxAge);
+				await encodeStartGroup(w, version, this.startGroup);
 				await w.u53(this.endGroup !== undefined ? this.endGroup + 1 : 0);
+				await encodeFrameBounds(w, version, this);
 				break;
 		}
 	}
@@ -47,16 +196,18 @@ export class SubscribeUpdate {
 				return new SubscribeUpdate({ priority: await r.u8() });
 			default: {
 				const priority = await r.u8();
-				const ordered = await r.bool();
-				const maxLatency = await r.u53();
-				const startGroup = await r.u53();
-				const endGroup = await r.u53();
+				await skipGroupOrder(r, version);
+				const maxAge = await r.u53();
+				const startGroup = await decodeStartGroup(r, version);
+				const endGroup = (await r.u53()) || undefined;
+				const end = endGroup !== undefined ? endGroup - 1 : undefined;
+				const frames = await decodeFrameBounds(r, version, startGroup, end);
 				return new SubscribeUpdate({
 					priority,
-					ordered,
-					maxLatency,
-					startGroup: startGroup > 0 ? startGroup - 1 : undefined,
-					endGroup: endGroup > 0 ? endGroup - 1 : undefined,
+					maxAge,
+					startGroup: canonicalStartGroup(version, startGroup, frames.startFrame),
+					endGroup: end,
+					...frames,
 				});
 			}
 		}
@@ -80,30 +231,45 @@ export class Subscribe {
 	broadcast: Path.Valid;
 	track: string;
 	priority: number;
-	ordered: boolean;
-	maxLatency: number;
+	/** Subscriber max latency in milliseconds; zero skips once a newer group is available. */
+	maxAge: number;
 
 	startGroup?: number;
 	endGroup?: number;
+
+	/**
+	 * First frame to deliver within `startGroup`'s group; 0 is the whole group.
+	 * Lite-06+. It qualifies the named group, so it needs `startGroup` to name one
+	 * (defined, including 0: group 0 can host a mid-group resume).
+	 */
+	startFrame: number;
+
+	/**
+	 * Last frame to deliver (inclusive) within `endGroup`'s group, or undefined for the
+	 * whole group. Lite-06+, and meaningless without an explicit `endGroup`.
+	 */
+	endFrame?: number;
 
 	constructor(props: {
 		id: bigint;
 		broadcast: Path.Valid;
 		track: string;
 		priority: number;
-		ordered?: boolean;
-		maxLatency?: number;
+		maxAge?: number;
 		startGroup?: number;
 		endGroup?: number;
+		startFrame?: number;
+		endFrame?: number;
 	}) {
 		this.id = props.id;
 		this.broadcast = props.broadcast;
 		this.track = props.track;
 		this.priority = props.priority;
-		this.ordered = props.ordered ?? false;
-		this.maxLatency = props.maxLatency ?? 0;
+		this.maxAge = props.maxAge ?? 0;
 		this.startGroup = props.startGroup;
 		this.endGroup = props.endGroup;
+		this.startFrame = props.startFrame ?? 0;
+		this.endFrame = props.endFrame;
 	}
 
 	async #encode(w: Writer, version: Version) {
@@ -117,10 +283,11 @@ export class Subscribe {
 			case Version.DRAFT_02:
 				break;
 			default:
-				await w.bool(this.ordered);
-				await w.u53(this.maxLatency);
-				await w.u53(this.startGroup !== undefined ? this.startGroup + 1 : 0);
+				await padGroupOrder(w, version);
+				await w.u53(this.maxAge);
+				await encodeStartGroup(w, version, this.startGroup);
 				await w.u53(this.endGroup !== undefined ? this.endGroup + 1 : 0);
+				await encodeFrameBounds(w, version, this);
 				break;
 		}
 	}
@@ -136,19 +303,21 @@ export class Subscribe {
 			case Version.DRAFT_02:
 				return new Subscribe({ id, broadcast, track, priority });
 			default: {
-				const ordered = await r.bool();
-				const maxLatency = await r.u53();
-				const startGroup = await r.u53();
-				const endGroup = await r.u53();
+				await skipGroupOrder(r, version);
+				const maxAge = await r.u53();
+				const startGroup = await decodeStartGroup(r, version);
+				const endGroup = (await r.u53()) || undefined;
+				const end = endGroup !== undefined ? endGroup - 1 : undefined;
+				const frames = await decodeFrameBounds(r, version, startGroup, end);
 				return new Subscribe({
 					id,
 					broadcast,
 					track,
 					priority,
-					ordered,
-					maxLatency,
-					startGroup: startGroup > 0 ? startGroup - 1 : undefined,
-					endGroup: endGroup > 0 ? endGroup - 1 : undefined,
+					maxAge,
+					startGroup: canonicalStartGroup(version, startGroup, frames.startFrame),
+					endGroup: end,
+					...frames,
 				});
 			}
 		}
@@ -171,27 +340,24 @@ export class Subscribe {
  */
 export class SubscribeOk {
 	priority: number;
-	ordered: boolean;
-	maxLatency: number;
+	/** Accepted subscriber max latency in milliseconds. */
+	maxAge: number;
 	startGroup?: number;
 	endGroup?: number;
 
 	constructor({
 		priority = 0,
-		ordered = false,
-		maxLatency = 0,
+		maxAge = 0,
 		startGroup = undefined,
 		endGroup = undefined,
 	}: {
 		priority?: number;
-		ordered?: boolean;
-		maxLatency?: number;
+		maxAge?: number;
 		startGroup?: number;
 		endGroup?: number;
 	}) {
 		this.priority = priority;
-		this.ordered = ordered;
-		this.maxLatency = maxLatency;
+		this.maxAge = maxAge;
 		this.startGroup = startGroup;
 		this.endGroup = endGroup;
 	}
@@ -208,8 +374,8 @@ export class SubscribeOk {
 			// Draft-03/04 so a stray future use stays well-formed.
 			default:
 				await w.u8(this.priority);
-				await w.bool(this.ordered);
-				await w.u53(this.maxLatency);
+				await padGroupOrder(w, version);
+				await w.u53(this.maxAge);
 				await w.u53(this.startGroup !== undefined ? this.startGroup + 1 : 0);
 				await w.u53(this.endGroup !== undefined ? this.endGroup + 1 : 0);
 				break;
@@ -218,8 +384,7 @@ export class SubscribeOk {
 
 	static async #decode(version: Version, r: Reader): Promise<SubscribeOk> {
 		let priority: number | undefined;
-		let ordered: boolean | undefined;
-		let maxLatency: number | undefined;
+		let maxAge: number | undefined;
 		let startGroup: number | undefined;
 		let endGroup: number | undefined;
 
@@ -232,8 +397,8 @@ export class SubscribeOk {
 				break;
 			default:
 				priority = await r.u8();
-				ordered = await r.bool();
-				maxLatency = await r.u53();
+				await skipGroupOrder(r, version);
+				maxAge = await r.u53();
 				startGroup = await r.u53();
 				endGroup = await r.u53();
 				break;
@@ -241,8 +406,7 @@ export class SubscribeOk {
 
 		return new SubscribeOk({
 			priority,
-			ordered,
-			maxLatency,
+			maxAge,
 			startGroup: startGroup !== undefined && startGroup > 0 ? startGroup - 1 : undefined,
 			endGroup: endGroup !== undefined && endGroup > 0 ? endGroup - 1 : undefined,
 		});
@@ -261,6 +425,10 @@ export class SubscribeOk {
  * Resolves the absolute start group of a Draft-05+ subscription. The first message
  * the publisher sends, once the start group is known. A value greater than the
  * requested start implicitly drops the leading range.
+ *
+ * There is no start frame: a partial group is only served to a subscriber that asked
+ * for one, so delivery begins either at the requested `startFrame` (when this is the
+ * requested group) or at frame 0 (when the publisher resolved to a later one).
  */
 export class SubscribeStart {
 	group: number;

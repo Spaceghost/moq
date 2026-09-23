@@ -44,7 +44,7 @@ const tilesEl = $("tiles");
 const emptyEl = $("tiles-empty");
 
 let session: Signals.Effect | undefined;
-let connection: Net.Connection.Reload | undefined;
+let connection: Net.Connection | undefined;
 let local: Local | undefined;
 let room: Room | undefined;
 let localPreview: Publish.Preview.Renderer | undefined;
@@ -122,12 +122,12 @@ function join(): void {
 	}
 
 	const identity = Net.Path.from(name);
-	connection = new Net.Connection.Reload({
+	connection = new Net.Connection({
 		url: roomUrl(relay.toString(), roomName),
 		enabled: true,
 	});
 	local = new Local({
-		connection: connection.established,
+		connection,
 		identity,
 		enabled: true,
 		user: { id: name, name },
@@ -140,7 +140,7 @@ function join(): void {
 	tile("local", name, localCanvas, true);
 	localPreview = new Publish.Preview.Renderer({
 		canvas: localCanvas,
-		frame: local.cameraCapture.out.frame,
+		frames: local.cameraCapture.out.frames,
 		display: local.cameraCapture.out.display,
 		flip: true,
 	});

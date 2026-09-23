@@ -6,7 +6,11 @@ use std::{
 
 use url::Url;
 
-use crate::{Error, Id};
+use crate::{Error, Id, moq_protocol_error};
+
+/// A callback receiving a positive handle/value, zero on clean completion, or a negative error.
+#[allow(non_camel_case_types)]
+pub type moq_status_callback = Option<extern "C" fn(user_data: *mut c_void, code: i32)>;
 
 pub static RUNTIME: LazyLock<tokio::runtime::Handle> = LazyLock::new(|| {
 	let runtime = tokio::runtime::Builder::new_current_thread()
@@ -54,7 +58,7 @@ pub fn enter<C: ReturnCode, F: FnOnce() -> C>(f: F) -> i32 {
 #[derive(Clone, Copy)]
 pub struct OnStatus {
 	user_data: *mut c_void,
-	on_status: Option<extern "C" fn(user_data: *mut c_void, code: i32)>,
+	on_status: extern "C" fn(user_data: *mut c_void, code: i32),
 }
 
 impl OnStatus {
@@ -63,11 +67,11 @@ impl OnStatus {
 	/// # Safety
 	/// - The caller must ensure user_data remains valid for the callback's lifetime.
 	/// - The callback function pointer must be valid if provided.
-	pub unsafe fn new(
-		user_data: *mut c_void,
-		on_status: Option<extern "C" fn(user_data: *mut c_void, code: i32)>,
-	) -> Self {
-		Self { user_data, on_status }
+	pub unsafe fn new(user_data: *mut c_void, on_status: moq_status_callback) -> Result<Self, Error> {
+		Ok(Self {
+			user_data,
+			on_status: on_status.ok_or(Error::InvalidPointer)?,
+		})
 	}
 
 	/// Invoke the callback with a result code.
@@ -77,9 +81,7 @@ impl OnStatus {
 	pub fn call<C: ReturnCode>(&self, ret: C) {
 		record_error(&ret);
 		let code = ret.code();
-		if let Some(on_status) = &self.on_status {
-			on_status(self.user_data, code);
-		}
+		(self.on_status)(self.user_data, code);
 	}
 }
 
@@ -174,11 +176,17 @@ impl ReturnCode for Id {
 	}
 }
 
+struct LastError {
+	message: CString,
+	protocol: Option<moq_protocol_error>,
+}
+
 thread_local! {
 	/// Reason for the most recent error returned on this thread. FFI functions
 	/// hand back only a numeric code, so we stash the human-readable message
-	/// here for `moq_error` to retrieve.
-	static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
+	/// (and protocol details, when the failure is a session or stream code)
+	/// here for `moq_error` / `moq_error_protocol` to retrieve.
+	static LAST_ERROR: RefCell<Option<LastError>> = const { RefCell::new(None) };
 }
 
 /// Record the reason for an error return into this thread's `moq_error` slot.
@@ -190,7 +198,12 @@ fn record_error<C: ReturnCode>(ret: &C) {
 	// CString::new fails only on an interior NUL, which our messages never
 	// contain; skip storing rather than truncating if it ever happens.
 	if let Ok(msg) = CString::new(err.to_string()) {
-		LAST_ERROR.with(|cell| *cell.borrow_mut() = Some(msg));
+		LAST_ERROR.with(|cell| {
+			*cell.borrow_mut() = Some(LastError {
+				message: msg,
+				protocol: err.protocol(),
+			});
+		});
 	}
 }
 
@@ -198,7 +211,24 @@ fn record_error<C: ReturnCode>(ret: &C) {
 ///
 /// The pointer is valid until the next libmoq call on the same thread.
 pub fn last_error_ptr() -> *const c_char {
-	LAST_ERROR.with(|cell| cell.borrow().as_ref().map_or(std::ptr::null(), |msg| msg.as_ptr()))
+	LAST_ERROR.with(|cell| {
+		cell.borrow()
+			.as_ref()
+			.map_or(std::ptr::null(), |err| err.message.as_ptr())
+	})
+}
+
+/// Copy this thread's last protocol error into `out`.
+///
+/// Returns true when the last error was a protocol failure and `out` was written.
+pub fn last_protocol(out: &mut moq_protocol_error) -> bool {
+	LAST_ERROR.with(|cell| match cell.borrow().as_ref().and_then(|err| err.protocol) {
+		Some(protocol) => {
+			*out = protocol;
+			true
+		}
+		None => false,
+	})
 }
 
 /// Parse an i32 handle into an Id.

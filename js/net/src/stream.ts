@@ -1,9 +1,17 @@
-import { fromTransport } from "./error.ts";
+import { fromTransport, StreamCode, StreamError, toStreamCode, toTransport } from "./error.ts";
 import type { IetfVersion } from "./ietf/version.ts";
 import { Version } from "./ietf/version.ts";
 import { TimeoutError, withTimeout } from "./util/timeout.ts";
 import { decodeUtf8 } from "./util/utf8.ts";
 import * as Varint from "./varint.ts";
+
+// Decode raw transport errors before mapping so they cannot bypass the negotiated
+// registry. Ordinary errors already send 0 and retain their local identity.
+function withCode(reason: unknown, version?: IetfVersion): unknown {
+	const decoded = fromTransport(reason, { version });
+	const code = toStreamCode(decoded, { version });
+	return code === StreamCode.Internal && decoded === reason ? reason : toTransport(code, decoded.message);
+}
 
 const MAX_U31 = 2 ** 31 - 1;
 const MAX_READ_SIZE = 1024 * 1024 * 64; // don't allocate more than 64MB for a message
@@ -156,7 +164,10 @@ export class Stream {
 
 	close() {
 		this.writer.close();
-		this.reader.stop(new Error("cancel"));
+		// A routine unsubscribe, so send CANCELLED. A bare Error would put 0 on the wire,
+		// which the stream registry reads as INTERNAL_ERROR: the peer would log a failure
+		// for every subscription we walk away from.
+		this.reader.stop(new StreamError(StreamCode.Cancel, { message: "cancel" }));
 	}
 
 	abort(reason: Error) {
@@ -193,7 +204,7 @@ export class Reader {
 		// Every read of this stream funnels through here, so decoding the peer's reset code
 		// once is enough to keep the raw transport error out of every caller (and every app).
 		const result = await this.#reader.read().catch((err: unknown) => {
-			throw fromTransport(err);
+			throw fromTransport(err, { version: this.version });
 		});
 
 		if (result.done) {
@@ -366,14 +377,14 @@ export class Reader {
 	}
 
 	stop(reason: unknown) {
-		this.#reader?.cancel(reason).catch(() => void 0);
+		this.#reader?.cancel(withCode(reason, this.version)).catch(() => void 0);
 	}
 
 	// Decoded like #fill: a caller racing this against a read must not get a different error
 	// shape depending on which one won. Derived once, so racing it per frame doesn't allocate.
 	get closed(): Promise<void> {
 		this.#closed ??= (this.#reader?.closed ?? Promise.resolve()).catch((err: unknown) => {
-			throw fromTransport(err);
+			throw fromTransport(err, { version: this.version });
 		});
 		return this.#closed;
 	}
@@ -417,6 +428,9 @@ export class Writer {
 	}
 
 	async u8(v: number) {
+		if (!Number.isInteger(v) || v < 0 || v > 255) {
+			throw new RangeError(`invalid u8: ${v}`);
+		}
 		await this.write(setUint8(this.#scratch, v));
 	}
 
@@ -435,12 +449,8 @@ export class Writer {
 	}
 
 	async u53(v: number) {
-		if (v > Varint.MAX_U53) {
-			// Number values above 2^53-1 have already lost precision before reaching
-			// the wire, but downgrade overflow to warn so an upstream miscount
-			// doesn't tear down the whole stream. The encoded varint will reflect
-			// the truncated Number value.
-			console.warn(`value larger than 53-bits; use u62 instead (precision lost): ${v.toString()}`);
+		if (!Number.isSafeInteger(v) || v < 0) {
+			throw new RangeError(`invalid u53: ${v}`);
 		}
 		if (isLeadingOnes(this.version)) {
 			await this.write(Varint.encodeLeadingOnesTo(this.#scratch, v));
@@ -461,7 +471,7 @@ export class Writer {
 		// Mirrors Reader.#fill: every write funnels through here, so a STOP_SENDING from the
 		// peer surfaces as a typed code rather than the transport's own error shape.
 		await this.#writer.write(v).catch((err: unknown) => {
-			throw fromTransport(err);
+			throw fromTransport(err, { version: this.version });
 		});
 	}
 
@@ -479,13 +489,13 @@ export class Writer {
 	// typed code it would get from a write.
 	get closed(): Promise<void> {
 		this.#closed ??= this.#writer.closed.catch((err: unknown) => {
-			throw fromTransport(err);
+			throw fromTransport(err, { version: this.version });
 		});
 		return this.#closed;
 	}
 
 	reset(reason: unknown) {
-		this.#writer.abort(reason).catch(() => void 0);
+		this.#writer.abort(withCode(reason, this.version)).catch(() => void 0);
 	}
 
 	/**

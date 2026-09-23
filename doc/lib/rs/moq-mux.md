@@ -21,9 +21,28 @@ Turns existing container formats into hang broadcasts and back. This is what
 
 Importers parse the bitstream to fill the catalog (resolution, codec string,
 `description`), split groups at keyframes, and stamp timestamps. Exporters do
-the inverse and skip stalled groups past a latency budget. Per-codec
+the inverse and skip stalled groups past a max age. Per-codec
 producers (`import::Opus`, H.264, and so on) are available for feeding frames
 you already have.
+
+fMP4 export emits one fragment per publisher group by default, including audio.
+A closed group flushes even if the live publisher pauses before its next frame.
+`fmp4::Export::with_fragment_duration` adds an explicit duration cap. A zero cap
+emits one fragment per frame; video with unknown duration waits for the next
+timestamp or endpoint marker. Audio and samples with explicit durations remain
+immediate. CMAF audio
+samples are always encoded as sync samples; the decoded `Frame::keyframe` marks
+only the first audio sample of a MoQ group.
+
+Each catalog track constructor returns one `container::Producer` that owns the
+media stream and its catalog entry. `set` publishes or replaces its config,
+`modify` edits the published config through a guard, and dropping the producer
+retires the entry. Calling `modify` before the first `set` returns
+`Error::NotPublished`. Container writes measure bitrate and jitter and publish
+the estimate automatically when groups are cut or finished. Invalid jitter is
+rejected before the edit is retained, including while the initial catalog is
+reserved. Codec importers propagate catalog and media errors through their
+configuration and frame-writing methods.
 
 ```bash
 cargo add moq-mux
@@ -31,3 +50,14 @@ cargo add moq-mux
 
 API: [docs.rs/moq-mux](https://docs.rs/moq-mux). Real-world usage:
 [`rs/moq-cli`](https://github.com/moq-dev/moq/tree/main/rs/moq-cli).
+
+Container producers and consumers take a format configured from the track's audio
+or video catalog entry (`catalog::hang::Container::try_from(&config)`). For a raw
+track, supply `container::Kind` explicitly. `cut(Some(end))` flushes and closes the
+group immediately. Legacy video writes an empty timestamped frame at that end;
+audio and CMAF do not. With no explicit end, the producer uses a known sample
+duration or observed cadence, independently of batching and reorder jitter.
+Streaming consumers deliver frames immediately. The live fMP4 exporter receives
+duration endpoints as metadata and uses them to time samples still buffered when
+the group closes. Fetched groups retain their trailing frame until the marker or
+group completion arrives.

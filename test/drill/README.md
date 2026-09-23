@@ -34,12 +34,11 @@ and infallible, and a reader that falls behind is shed rather than waited for.
 So "backpressure" in the first drill is measured as an unread backlog sitting
 behind a live subscription, which is the state the cancel has to unwind.
 
-That drill deliberately does not wait for the publisher to go idle. A relay
-holds its upstream subscription for `TRACK_IDLE_LINGER` (30s in moq-net) after
-its last local reader leaves, so a viewer who comes back does not pay for a
-fresh upstream subscribe. Waiting that out would make this the slowest test in
-the workspace in order to watch a deliberate delay elapse; the rejoin the drill
-does assert is the half of that behavior worth grading.
+That drill deliberately does not wait for the publisher to go idle. That
+edge is the origin front's: it drops the source track when the last local
+reader leaves, and is covered by moq-net's origin tests. Waiting out a
+linger would make this the slowest test in the workspace; the rejoin the
+drill does assert is the half of that behavior worth grading here.
 
 The negative control is what keeps the rest honest. Three drills prove things by
 reading a frame; if the harness could report success without data moving, they
@@ -48,7 +47,7 @@ would all pass for free.
 ### Killing the relay
 
 The relay runs on its own tokio runtime and is killed by dropping it. Aborting
-the `run` task is not enough, because `moq_relay::serve` spawns a task per
+the `run` task is not enough, because the relay accept loop spawns a task per
 connection and those keep serving a relay whose accept loop is gone.
 
 A dropped runtime sends no `CONNECTION_CLOSE`, exactly like a killed process, so
@@ -106,8 +105,6 @@ corpus nobody replays.
 ## Not covered here
 
 - An impaired path (delay, loss, rate limits). Loopback is the only path these
-  drills see; `quest/m0/transport-impairment-profile.md` adds the seeded UDP
+  drills see; `quest/next/transport-impairment-profile.md` adds the seeded UDP
   shaper they run under.
 - CI lane scheduling.
-- Failure bundles beyond what the test harness prints, which belongs to
-  `quest/m0/qa-failure-artifacts.md`.

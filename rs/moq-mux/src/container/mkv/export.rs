@@ -47,7 +47,7 @@ const TIMESTAMP_SCALE_NS: u64 = 1_000_000;
 pub struct Export<S: Stream> {
 	source: crate::Source,
 	catalog: Option<S>,
-	latency: Duration,
+	max_age: Duration,
 	fragment_duration: Option<Duration>,
 
 	tracks: HashMap<String, MkvTrack>,
@@ -162,7 +162,7 @@ impl<S: Stream> Export<S> {
 		Self {
 			source,
 			catalog: Some(catalog),
-			latency: Duration::ZERO,
+			max_age: Duration::ZERO,
 			fragment_duration: None,
 			tracks: HashMap::new(),
 			catalog_snapshot: None,
@@ -171,9 +171,13 @@ impl<S: Stream> Export<S> {
 		}
 	}
 
-	/// Set the maximum buffering latency for each per-track source.
-	pub fn with_latency(mut self, latency: Duration) -> Self {
-		self.latency = latency;
+	/// Set the max age for each per-track source.
+	///
+	/// See [`Consumer`](crate::container::Consumer) for the per-track skip behavior.
+	/// Defaults to
+	/// [`Duration::ZERO`] (skip aggressively).
+	pub fn with_max_age(mut self, max_age: Duration) -> Self {
+		self.max_age = max_age;
 		self
 	}
 
@@ -336,7 +340,7 @@ impl<S: Stream> Export<S> {
 				continue;
 			}
 			ensure_legacy(&config.container, "video", name)?;
-			let Some(source) = ExportSource::for_video(&self.source, name, config, self.latency)? else {
+			let Some(source) = ExportSource::for_video(&self.source, name, config, self.max_age)? else {
 				continue;
 			};
 			self.tracks.insert(
@@ -357,7 +361,7 @@ impl<S: Stream> Export<S> {
 				continue;
 			}
 			ensure_legacy(&config.container, "audio", name)?;
-			let Some(source) = ExportSource::for_audio(&self.source, name, config, self.latency)? else {
+			let Some(source) = ExportSource::for_audio(&self.source, name, config, self.max_age)? else {
 				continue;
 			};
 			self.tracks.insert(

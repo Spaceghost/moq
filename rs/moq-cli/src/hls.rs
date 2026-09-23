@@ -1,60 +1,68 @@
-//! HLS endpoints: pull a remote playlist into MoQ (import), or serve HLS over
-//! HTTP from MoQ broadcasts (export), fetching media groups on demand.
+//! HLS endpoints: pull a remote playlist into MoQ (import), or serve HLS and
+//! DASH over HTTP from MoQ broadcasts (export), fetching media groups on demand.
 
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::path::PathBuf;
 
 use anyhow::Context;
 use axum::http::Method;
 use hang::moq_net;
-use hang::moq_net::AsPath;
+use url::Url;
 
-use crate::moq::notify_ready;
+use crate::moq::{ImportTarget, notify_ready};
 
 /// HLS import (pull a remote playlist) args.
-#[derive(clap::Args, Clone)]
+#[derive(usage::Args, Clone)]
+#[usage(unknown_flags = "error", args_override_self = false)]
 pub struct ImportArgs {
 	/// Playlist URL (http/https) or local file path.
+	#[usage(value_hint = usage::ValueHint::AnyPath, extensions("m3u8", "m3u"))]
 	pub playlist: String,
 }
 
 /// HLS export (serve over HTTP) args.
-#[derive(clap::Args, Clone)]
+#[derive(usage::Args, Clone)]
+#[usage(unknown_flags = "error", args_override_self = false)]
 pub struct ExportArgs {
 	/// HTTP listener for the HLS endpoints.
-	#[arg(long, default_value = "[::]:8089")]
+	#[usage(long, default = "[::]:8089")]
 	pub listen: SocketAddr,
 
 	/// TLS certificates, keys, self-signed generation, and optional mTLS roots.
-	#[command(flatten)]
-	pub tls: moq_native::tls::Server,
+	#[usage(flatten)]
+	pub tls: moq_tokio::tls::Listen,
 
 	/// Minimum media listed in each rendition's playlist window. Keep it within the
 	/// relay's group-cache retention, since segments are fetched from there on request.
-	#[arg(long, default_value = "16s", value_parser = humantime::parse_duration)]
-	pub window: Duration,
+	#[usage(long, default = "16s")]
+	pub window: crate::duration::Duration,
 
 	/// Browser CORS policy for the HLS listener.
-	#[command(flatten)]
+	#[usage(flatten)]
 	pub cors: crate::web::Cors,
 }
 
-/// Pull a remote HLS/LL-HLS playlist (URL or file path) into the Origin under `name`.
-pub async fn import(
-	origin: &moq_net::origin::Producer,
-	name: String,
-	playlist: String,
-	latency_max: Option<std::time::Duration>,
-) -> anyhow::Result<()> {
-	let mut producer = origin
-		.create_broadcast(&name, moq_net::broadcast::Route::new().with_announce(true))
-		.context("failed to create broadcast")?;
+/// Pull a remote HLS/LL-HLS playlist (URL or file path) into the Origin under `target.name`.
+pub async fn import(target: ImportTarget, playlist: String) -> anyhow::Result<()> {
+	let ImportTarget {
+		origin,
+		name,
+		max_age,
+		bandwidth,
+	} = target;
+	let mut producer = origin.create_broadcast(&name).context("failed to create broadcast")?;
 
-	// Create catalog tracks before the broadcast becomes visible so a subscriber
-	// can consume the catalog as soon as it observes the announcement.
-	let config = moq_mux::catalog::Config::default().with_latency_max(latency_max);
-	let catalog = moq_mux::catalog::Producer::with_config(&mut producer, config)?;
+	// Create catalog tracks before announcing so a subscriber can consume the
+	// catalog as soon as it observes the announcement.
+	let config = moq_mux::catalog::Config::default()
+		.with_max_age(max_age)
+		.with_bandwidth(bandwidth);
+	let catalog = moq_mux::catalog::Producer::new(&mut producer, config)?;
+	producer
+		.announce(Default::default())
+		.context("failed to announce broadcast")?;
 
+	let playlist = playlist_url(&playlist)?;
 	let mut importer = moq_hls::import::Import::new(producer, catalog, moq_hls::import::Config::new(playlist))?;
 
 	tracing::info!(%name, "importing HLS");
@@ -64,15 +72,33 @@ pub async fn import(
 	Ok(importer.run().await?)
 }
 
-/// Serve HLS over HTTP for the single broadcast `name` (reached at
-/// `/<name>/master.m3u8`); other broadcasts in the Origin are not served.
+fn playlist_url(playlist: &str) -> anyhow::Result<Url> {
+	if playlist.starts_with("http://") || playlist.starts_with("https://") {
+		return Url::parse(playlist).context("invalid HLS playlist URL");
+	}
+
+	let path = PathBuf::from(playlist);
+	let absolute = if path.is_absolute() {
+		path
+	} else {
+		std::env::current_dir()?.join(path)
+	};
+	Url::from_file_path(&absolute).map_err(|_| anyhow::anyhow!("invalid HLS playlist path: {}", absolute.display()))
+}
+
+/// Serve HLS and DASH over HTTP for the single broadcast `name` (reached at
+/// `/<name>/master.m3u8` and `/<name>/manifest.mpd`); other broadcasts in the
+/// Origin are not served.
 pub async fn export(origin: moq_net::origin::Consumer, args: ExportArgs, name: String) -> anyhow::Result<()> {
+	let scope = moq_net::Patterns::from(
+		moq_net::Pattern::subtree(&name).with_context(|| format!("invalid broadcast name `{name}`"))?,
+	);
 	let scoped = origin
-		.scope(&[name.as_path()])
+		.scope("", &scope)
 		.with_context(|| format!("failed to scope origin to broadcast `{name}`"))?;
 
 	let mut config = moq_hls::export::Config::default();
-	config.window = args.window;
+	config.window = args.window.into_std();
 	let server = moq_hls::Server::new(scoped, config);
 	let app = server.router().layer(args.cors.layer([Method::GET])?);
 
@@ -83,7 +109,7 @@ pub async fn export(origin: moq_net::origin::Consumer, args: ExportArgs, name: S
 		Some(args.tls.server_config(alpn)?)
 	};
 
-	let listener = moq_native::bind::tcp(args.listen)?;
+	let listener = moq_tokio::bind::tcp(args.listen)?;
 
 	tracing::info!(listen = %args.listen, "serving HLS");
 	notify_ready();

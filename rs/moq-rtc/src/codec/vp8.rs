@@ -21,9 +21,13 @@ impl Bridge {
 
 impl codec::Bridge for Bridge {
 	fn push(&mut self, frame: codec::Frame) -> Result<()> {
-		let pts = moq_net::Timestamp::from_micros(frame.timestamp_us)
-			.map_err(|err| crate::Error::Other(anyhow::anyhow!("invalid timestamp: {err}")))?;
+		let pts = moq_net::Timestamp::from_micros(frame.timestamp_us).map_err(moq_mux::Error::from)?;
 		self.import.decode(frame.payload, pts)
+	}
+
+	fn tick(&mut self) -> Result<()> {
+		self.import.tick()?;
+		Ok(())
 	}
 
 	fn abort(self: Box<Self>, err: moq_net::Error) {
@@ -40,7 +44,7 @@ mod tests {
 	#[test]
 	fn keyframe_publishes_catalog_dimensions() {
 		let mut broadcast = moq_net::broadcast::Info::new().produce();
-		let catalog = moq_mux::catalog::Producer::new(&mut broadcast).unwrap();
+		let catalog = moq_mux::catalog::Producer::new(&mut broadcast, moq_mux::catalog::Config::default()).unwrap();
 		let mut bridge = super::Bridge::new(broadcast, catalog.clone()).unwrap();
 
 		assert!(catalog.snapshot().video.renditions.is_empty());
@@ -62,8 +66,8 @@ mod tests {
 	#[tokio::test]
 	async fn importer_creation_failure_preserves_abort_error() {
 		let mut broadcast = moq_net::broadcast::Info::new().produce();
-		let catalog = moq_mux::catalog::Producer::new(&mut broadcast).unwrap();
-		let _collision = broadcast.create_track("0.vp8.timeline.z", None).unwrap();
+		let catalog = moq_mux::catalog::Producer::new(&mut broadcast, moq_mux::catalog::Config::default()).unwrap();
+		let _collision = broadcast.create_track(hang::timeline::DEFAULT_NAME, None).unwrap();
 		let consumer = broadcast.consume();
 		let mut bridge = super::Bridge::new(broadcast, catalog).unwrap();
 		let mut track = consumer.track("0.vp8").unwrap().subscribe(None).await.unwrap();

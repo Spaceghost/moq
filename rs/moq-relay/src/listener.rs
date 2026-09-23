@@ -1,4 +1,4 @@
-//! The TCP listener under [`Web`](crate::Web) and [`Internal`](crate::Internal).
+//! The TCP listener under [`Web`](crate::web::Web) and [`Internal`](crate::internal::Internal).
 //!
 //! `axum_server` owns the serve loop (TLS, HTTP version negotiation, WebSocket
 //! upgrades, graceful shutdown), and its loop reacts to a failed `accept(2)` by
@@ -9,7 +9,7 @@
 //!
 //! `axum_server`'s listener abstraction is the seam. Wrapping the socket in
 //! [`Listener`] puts the `accept(2)` call back under our own policy
-//! ([`moq_native::accept`]): a dead connection retries at once, an exhausted process
+//! ([`moq_tokio::accept`]): a dead connection retries at once, an exhausted process
 //! backs off and warns, and either way it is counted where an embedder can read it
 //! back. Because the wrapper never yields an error upward, `axum_server`'s flat
 //! sleep is unreachable.
@@ -18,7 +18,7 @@ use std::io;
 use std::net::SocketAddr;
 
 use axum_server::{AddrListener, Address};
-use moq_native::accept::Health;
+use moq_tokio::accept::Health;
 use tokio::net::{TcpListener, TcpStream};
 
 /// The peer address of an accepted connection.
@@ -34,6 +34,14 @@ impl Address for Peer {
 	type Listener = Listener;
 }
 
+/// Lets a handler extract the peer address as `ConnectInfo<Peer>`, so the auth
+/// request can report where a WebSocket or HTTP session came from.
+impl axum::extract::connect_info::Connected<Peer> for Peer {
+	fn connect_info(target: Peer) -> Self {
+		target
+	}
+}
+
 /// A TCP listener that classifies, counts, paces, and logs its own `accept(2)`
 /// failures instead of leaving them to `axum_server`.
 pub(crate) struct Listener {
@@ -42,7 +50,7 @@ pub(crate) struct Listener {
 }
 
 impl Listener {
-	/// Adopt an already-bound listener (from [`moq_native::bind::tcp`], which sets
+	/// Adopt an already-bound listener (from [`moq_tokio::bind::tcp`], which sets
 	/// the dual-stack and keepalive options), reporting into `health`.
 	pub(crate) fn new(listener: std::net::TcpListener, health: Health) -> io::Result<Self> {
 		Ok(Self {
@@ -52,12 +60,21 @@ impl Listener {
 	}
 }
 
-/// An `axum_server` bound to [`Listener`], ready for `.acceptor(..)`/`.serve(..)`.
+/// An `axum_server` bound to [`Listener`] with `acceptor` installed, ready for
+/// `.serve(..)`.
+///
+/// The acceptor is a parameter rather than the builder step `axum_server` offers,
+/// so what a listener does at accept time is something each call site states rather
+/// than something it can leave out.
 ///
 /// The address type is spelled here rather than at each call site: `A::Listener`
 /// doesn't pin `A` down, so inference cannot get there from the listener alone.
-pub(crate) fn server(listener: std::net::TcpListener, health: Health) -> io::Result<axum_server::Server<Peer>> {
-	Ok(axum_server::Server::from_listener(Listener::new(listener, health)?))
+pub(crate) fn server<A>(
+	listener: std::net::TcpListener,
+	health: Health,
+	acceptor: A,
+) -> io::Result<axum_server::Server<Peer, A>> {
+	Ok(axum_server::Server::from_listener(Listener::new(listener, health)?).acceptor(acceptor))
 }
 
 impl AddrListener<TcpStream, Peer> for Listener {
@@ -100,13 +117,13 @@ impl AddrListener<TcpStream, Peer> for Listener {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use moq_native::accept::Failure;
+	use moq_tokio::accept::Failure;
 
 	/// The wrapper has to survive a real accept, since everything above it is
 	/// generic over `Address` and a mismatch only shows up at the serve call.
 	#[tokio::test]
 	async fn accepts_a_connection_and_reports_health() {
-		let bound = moq_native::bind::tcp("127.0.0.1:0".parse().unwrap()).unwrap();
+		let bound = moq_tokio::bind::tcp("127.0.0.1:0".parse().unwrap()).unwrap();
 		let addr = bound.local_addr().unwrap();
 		let health = Health::new("test");
 		let listener = Listener::new(bound, health.clone()).unwrap();

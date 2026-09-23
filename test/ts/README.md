@@ -40,7 +40,7 @@ enough behind to pass every check: a broken round-trip reported as a good one.
 subscriber output:
 
 ```bash
-moq --client-connect http://localhost:4443 --broadcast live.hang export ts > sub.ts
+moq --connect http://localhost:4443 --broadcast live.hang export ts > sub.ts
 ./run.sh --analyze-only sub.ts
 ```
 
@@ -107,7 +107,7 @@ over is invisible to any harness that does not stamp arrivals.
 
 ```bash
 # live: all three domains, reading the exporter directly
-moq --client-connect http://localhost:4443 --broadcast live.hang export ts \
+moq --connect http://localhost:4443 --broadcast live.hang export ts \
   | ./pcr-timing.py --live --seconds 45
 
 # offline: value and position only (a file has no release timing left in it)
@@ -135,7 +135,7 @@ the total and reports the rate over the tail of the sample beside it. A sender
 that buffers builds a standing lag once and then runs at the media rate: the lag
 is a constant offset no receiver can see, and it cannot grow past the latency
 budget the sender is allowed to hold, so set `--drift-ms` to that budget
-(`export ts --latency-max`, 500 ms by default). A pipe that is not running at the
+(`export ts --max-age`, 500 ms by default). A pipe that is not running at the
 media rate never stops accumulating and so breaches any fixed bound given a long
 enough sample. The tail rate is what tells the two apart, and it needs a sample
 longer than the lag takes to build: measured against the grid-sliced exporter,
@@ -182,29 +182,82 @@ does not define one.
 `--report-json <path>` writes the full report, and `--strict` promotes the shape
 check to hard.
 
-## EIT fixture
+## EIT fixtures
 
-`make-eit-fixture.sh` adds a synthetic DVB EPG to any transport stream, so the
-import path's EIT handling can be exercised without a broadcast capture that
-carries one. No capture in this repository does.
+No capture in this repository carries EIT (PID 0x0012), so nothing exercises the
+import path's handling of it. `make-eit-fixture.sh` synthesises an EPG onto any
+transport stream, and `make-pending-eit.py` produces the one case a generator
+cannot.
 
 ```bash
 ./make-eit-fixture.sh in.ts out.ts             # EIT p/f + schedule on PID 0x0012
 ./make-eit-fixture.sh --pf-only in.ts out.ts   # p/f only
+./make-eit-fixture.sh --days 8 in.ts out.ts    # a guide at the DVB planning horizon
+./make-pending-eit.py out.ts pending.ts        # ... whose tail is not yet in force
 ```
 
-Everything is derived from the input, so the EIT describes the service the
-stream actually carries: the triplet (`original_network_id`,
-`transport_stream_id`, `service_id`) comes from its PAT and SDT, and the EPG is
-anchored to the stream's own TDT where it has one. Without a TDT (the
-ffmpeg-generated clip has none), it falls back to a fixed date, so the output is
-byte-reproducible for a given input. The SDT's `EIT_present_following_flag` and
-`EIT_schedule_flag` are set to match, since a stream carrying an EIT while
-advertising none is internally inconsistent.
+Everything is derived from the input, so the EIT describes the service the stream
+actually carries: the triplet (`original_network_id`, `transport_stream_id`,
+`service_id`) comes from its PAT and SDT, and the EPG is anchored to the stream's
+own TDT where it has one. Without a TDT (the ffmpeg-generated clip has none) it
+falls back to a fixed date, so the output is byte-reproducible for a given input
+either way. The SDT's `EIT_present_following_flag` and `EIT_schedule_flag` are set
+to match, since a stream carrying an EIT while advertising none is internally
+inconsistent.
 
 `tsp` replaces packets rather than creating them, so the EIT has to come out of
 existing stuffing. A broadcast capture has plenty and keeps its exact mux rate; a
 clip with none is padded to a constant bitrate first, and the script says so.
+
+### Why `--days` matters
+
+EIT schedule is sparse by construction, and that is the property most worth
+testing against. A sub-table declares a `last_section_number` covering its whole
+range and transmits only the segment-boundary sections that hold events, so
+**completeness cannot be decided by counting sections**. `--days 8` reaches that
+shape; the default twelve events does not. Censused with `--all-sections`:
+
+| table\_id | distinct sections | declared `last_section_number` |
+|---|---:|---:|
+| 0x4E p/f | 2 | 1 |
+| 0x50 schedule, days 0-3 | 32 | 248 |
+| 0x51 schedule, days 4-7 | 32 | 248 |
+| 0x52 schedule, days 8-11 | 3 | 16 |
+
+An implementation that waits for section 248 to arrive before treating a schedule
+sub-table as complete waits forever.
+
+### Pending versions
+
+`current_next_indicator` distinguishes the version in force from a revision that
+applies later, and anything relaying SI must keep serving the current one until
+its successor becomes current. `tsp -P eitinject` cannot generate that case: it
+re-derives present/following from the event list and stamps its own version,
+ignoring `version` and `current` in the input XML. `make-pending-eit.py` patches
+the generated stream instead, bumping the version and clearing the indicator over
+a trailing window with the section CRC recomputed, so a rejection downstream means
+the guard fired rather than the section being malformed.
+
+### Traps
+
+Four ways to conclude the wrong thing here, each of which has cost time at least
+once:
+
+- **A table census hides sparse sub-tables.** `tsp -P tables` and `tstables` will
+  not report a sub-table whose sections do not complete, which is every EIT
+  schedule sub-table. Pass `--all-sections`, or schedule looks absent when it is
+  present.
+- **`--all-sections` cannot be combined with `--json-output` or `--xml-output`**
+  (TSDuck rejects it), so a census built on structured output structurally cannot
+  see those sub-tables. Parse the text form for that question.
+- **Pending sections are excluded by default.** Add `--include-next`, or the
+  fixture above looks like it did nothing.
+- **A single TS packet never routes.** The import path's sync lock needs a
+  successor before it will emit anything, so a Rust-level test that feeds one
+  packet passes whatever the code does. Feed at least a pair, and include a
+  positive control that would fail if the assertion were vacuous.
+
+### Round-tripping a fixture
 
 `--with-eit` wires this into the round-trip and prints which SI PIDs came back:
 
@@ -226,10 +279,14 @@ exporter re-emits SI on its own repetition cadence rather than the source's.
 
 ## CI
 
-`.github/workflows/smoke.yml` runs `just test ts` after the interop
-matrix (nightly, on demand, and on PRs touching `test/ts/`). TSDuck
-comes from the `nix develop` shell, so the run uses the same `tsp`/`tsanalyze` a
-local developer would.
+`.github/workflows/smoke.yml` runs `just test ts` and then `just test ts-eit`
+after the interop matrix (nightly, on demand, and on PRs touching `test/ts/`).
+The second recipe is `eit-roundtrip.sh`: it builds the sparse-schedule and
+pending-version fixtures from a generated clip, round-trips them through a
+relay, and censuses the capture, so a break in the generators or in the SI
+carriage they pin fails a PR instead of landing silently. TSDuck comes from the
+`nix develop` shell, so the run uses the same `tsp`/`tsanalyze` a local
+developer would.
 
 `.github/workflows/nightly.yml` runs `just test ts --live --duration 120` as
 well. It stays off the PR path because release timing needs a real-time window to

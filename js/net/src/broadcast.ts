@@ -5,8 +5,20 @@
  */
 import { type GetPromise, Once, Signal } from "@moq/signals";
 import type { Consumer as GroupConsumer } from "./group.ts";
+import { Route } from "./hop.ts";
 import { hooks, type TrackSequence } from "./internal.ts";
 import * as track from "./track.ts";
+import { registerWire, trackOf, type Broadcast as Wire } from "./wire.ts";
+
+/** The origin callback a created broadcast uses to advertise its exact path. @internal */
+export interface Announcer {
+	/** Advertise or re-price this broadcast's path. */
+	announce(route: Route): void;
+	/** Retract the advertisement, leaving the broadcast reachable by exact path. */
+	unannounce(): void;
+}
+
+let attachAnnouncer: (producer: Producer, announcer: Announcer) => void;
 
 /** Reactive backing state shared by broadcast producers and consumers. */
 class BroadcastState {
@@ -115,6 +127,7 @@ async function fetchGroup(
 	options: track.FetchGroupOptions = {},
 ): Promise<GroupConsumer> {
 	const subscriber = subscribe(state, name, { priority: options.priority });
+	hooks.exemptFetch(subscriber);
 	try {
 		for (;;) {
 			const group = await subscriber.recvGroup();
@@ -141,8 +154,20 @@ async function fetchGroup(
  *
  * @public
  */
-export class Producer implements track.Broadcast {
+export class Producer {
 	#state = new BroadcastState();
+	#announcer?: Announcer;
+
+	constructor() {
+		registerWire(this, this.#wire(false));
+	}
+
+	static {
+		attachAnnouncer = (producer, announcer) => {
+			producer.#announcer = announcer;
+		};
+		hooks.attachAnnouncer = attachAnnouncer;
+	}
 
 	/**
 	 * Settles once the broadcast closes: `null` on a clean close, or the abort {@link Error}.
@@ -157,8 +182,7 @@ export class Producer implements track.Broadcast {
 		return makeConsumer(this.#state);
 	}
 
-	/** Return the next track requested by a peer. */
-	async requested(): Promise<track.Request | undefined> {
+	async #requested(): Promise<track.Request | undefined> {
 		for (;;) {
 			const request = dequeueRequest(this.#state);
 			if (request) return request;
@@ -203,28 +227,45 @@ export class Producer implements track.Broadcast {
 		this.#state.tracks.delete(name);
 	}
 
-	/** Open a live subscription to a track. Used by the publishing wire layer. */
-	subscribe(name: string, options?: track.Subscription): track.Subscriber {
-		return subscribe(this.#state, name, options);
-	}
-
-	/** Resolve a track's immutable info. Used by the publishing wire layer. */
-	resolveTrackInfo(name: string): Promise<track.Info> {
-		return resolveTrackInfo(this.#state, name);
-	}
-
-	/** Fetch a single group from the local retained window. Used by track handles. */
-	fetchGroup(name: string, sequence: number, options?: track.FetchGroupOptions): Promise<GroupConsumer> {
-		return fetchGroup(this.#state, name, sequence, options);
-	}
-
 	/** A lazy read handle for a track on this broadcast. */
 	track(name: string): track.Consumer {
-		return new track.Consumer(name, this);
+		return trackOf(name, this);
+	}
+
+	#wire(register: boolean): Wire {
+		return {
+			subscribe: (name, options) => subscribe(this.#state, name, options, register),
+			resolveTrackInfo: (name) => resolveTrackInfo(this.#state, name),
+			fetchGroup: (name, sequence, options) => fetchGroup(this.#state, name, sequence, options),
+			requested: () => this.#requested(),
+		};
+	}
+
+	/**
+	 * Advertise this broadcast's exact path, or re-price a standing advertisement in place.
+	 *
+	 * Call it once the tracks a subscriber needs first (a catalog) exist. The broadcast is
+	 * discoverable on the local origin from creation; announcing advertises it to peers. Retracts on
+	 * {@link unannounce} or {@link close}. Throws if this producer was not created through an
+	 * origin, or if the broadcast is already closed.
+	 */
+	announce(route: Route | { hops?: Route["hops"]; cost?: Route["cost"] | bigint } = Route.default): void {
+		if (this.#state.closed.peek() !== undefined) {
+			throw new Error(`broadcast is closed: ${this.#state.closed.peek()}`);
+		}
+		if (!this.#announcer) throw new Error("broadcast is not attached to an origin");
+		this.#announcer.announce(Route.normalize(route));
+	}
+
+	/** Retract the advertisement of this broadcast's path, if any. */
+	unannounce(): void {
+		this.#announcer?.unannounce();
 	}
 
 	/** Close the broadcast, optionally with an error to abort waiters. Idempotent. */
 	close(abort?: Error) {
+		this.#announcer?.unannounce();
+		this.#announcer = undefined;
 		closeState(this.#state, abort);
 	}
 }
@@ -236,12 +277,12 @@ let makeConsumer: (state: BroadcastState) => Consumer;
 /**
  * The read side of a broadcast.
  *
- * Created internally: obtain one from {@link Producer.consume} or the connection's
- * `consume(path)`. The wire layers subclass it to resolve tracks over the network.
+ * Created internally: obtain one from {@link Producer.consume} or an origin request.
+ * The wire layers subclass it to resolve tracks over the network.
  *
  * @public
  */
-export class Consumer implements track.Broadcast {
+export class Consumer {
 	#state: BroadcastState;
 
 	// Guards against a double close() on this handle over-decrementing the consumer count.
@@ -251,6 +292,12 @@ export class Consumer implements track.Broadcast {
 	protected constructor(state?: BroadcastState) {
 		this.#state = state ?? new BroadcastState();
 		this.#state.consumers++;
+		registerWire(this, {
+			subscribe: (name, options) => subscribe(this.#state, name, options, true),
+			resolveTrackInfo: (name) => resolveTrackInfo(this.#state, name),
+			fetchGroup: (name, sequence, options) => fetchGroup(this.#state, name, sequence, options),
+			requested: () => this.#requested(),
+		});
 	}
 
 	static {
@@ -288,16 +335,10 @@ export class Consumer implements track.Broadcast {
 
 	/** Get a lazy handle for a track on this broadcast. Repeat subscriptions dedupe onto one upstream subscription. */
 	track(name: string): track.Consumer {
-		return new track.Consumer(name, this);
+		return trackOf(name, this);
 	}
 
-	/** Open a live subscription to a track. Used by the subscribing wire layer. Repeat subscriptions to the same track share one upstream subscription. */
-	subscribe(name: string, options?: track.Subscription): track.Subscriber {
-		return subscribe(this.#state, name, options, true);
-	}
-
-	/** Return the next track requested by the local consumer. Used by the subscribing wire layer. */
-	async requested(): Promise<track.Request | undefined> {
+	async #requested(): Promise<track.Request | undefined> {
 		for (;;) {
 			const request = dequeueRequest(this.#state);
 			if (request) return request;
@@ -308,23 +349,6 @@ export class Consumer implements track.Broadcast {
 
 			await Signal.race(this.#state.requested, this.#state.closed);
 		}
-	}
-
-	/**
-	 * Resolve a track's immutable info. Used by track handles. This base resolves it from
-	 * the local producers; the consuming wire layer overrides it to fetch over the wire.
-	 */
-	resolveTrackInfo(name: string): Promise<track.Info> {
-		return resolveTrackInfo(this.#state, name);
-	}
-
-	/**
-	 * Fetch a single group by sequence. Used by track handles. This base serves from the
-	 * local retained window; the consuming wire layer overrides it to fetch over the wire
-	 * (or to reject when the transport has no FETCH).
-	 */
-	fetchGroup(name: string, sequence: number, options?: track.FetchGroupOptions): Promise<GroupConsumer> {
-		return fetchGroup(this.#state, name, sequence, options);
 	}
 
 	/**

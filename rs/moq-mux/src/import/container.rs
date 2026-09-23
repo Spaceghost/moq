@@ -5,26 +5,8 @@
 //! track, so neither exposes a single-track demand/name handle. Today every
 //! container supports both; both wrap the same [`ContainerImpl`] dispatch.
 
+use super::{ContainerFormat, ContainerInit};
 use crate::Result;
-
-enum Format {
-	Fmp4,
-	Mkv,
-	Ts,
-	Flv,
-}
-
-impl Format {
-	fn parse(format: &str) -> Result<Self> {
-		match format {
-			"fmp4" | "cmaf" => Ok(Self::Fmp4),
-			"mkv" | "webm" | "matroska" => Ok(Self::Mkv),
-			"ts" | "mpegts" | "mpeg2ts" | "m2ts" => Ok(Self::Ts),
-			"flv" => Ok(Self::Flv),
-			_ => Err(crate::Error::UnknownFormat(format.to_string())),
-		}
-	}
-}
 
 /// The concrete container importers, shared by [`Container`] and
 /// [`ContainerStream`]. Containers parse their own internal framing, so a whole
@@ -38,12 +20,16 @@ enum ContainerImpl<E: crate::container::ts::Catalog = ()> {
 }
 
 impl<E: crate::container::ts::Catalog> ContainerImpl<E> {
-	fn new(broadcast: moq_net::broadcast::Producer, reserved: crate::catalog::Reserved<E>, format: Format) -> Self {
+	fn new(
+		broadcast: moq_net::broadcast::Producer,
+		reserved: crate::catalog::Reserved<E>,
+		format: ContainerFormat,
+	) -> Self {
 		match format {
-			Format::Fmp4 => Self::fmp4(broadcast, reserved),
-			Format::Mkv => Self::mkv(broadcast, reserved),
-			Format::Ts => Self::ts(broadcast, reserved),
-			Format::Flv => Self::flv(broadcast, reserved),
+			ContainerFormat::Fmp4 => Self::fmp4(broadcast, reserved),
+			ContainerFormat::Mkv => Self::mkv(broadcast, reserved),
+			ContainerFormat::Ts => Self::ts(broadcast, reserved),
+			ContainerFormat::Flv => Self::flv(broadcast, reserved),
 		}
 	}
 
@@ -90,6 +76,14 @@ impl<E: crate::container::ts::Catalog> ContainerImpl<E> {
 		}
 	}
 
+	fn cut(&mut self) {
+		// Only fMP4 has a segment concept to declare. The others recover their own framing and
+		// group on what they find in it, so there is nothing for a caller to draw.
+		if let ContainerImpl::Fmp4(decoder) = self {
+			decoder.cut();
+		}
+	}
+
 	fn seek(&mut self, sequence: u64) -> Result<()> {
 		match self {
 			ContainerImpl::Fmp4(decoder) => decoder.seek(sequence),
@@ -109,20 +103,15 @@ pub struct Container<E: crate::container::ts::Catalog = ()> {
 }
 
 impl<E: crate::container::ts::Catalog> Container<E> {
-	/// True when `format` is a container name this importer recognizes.
-	pub fn known_format(format: &str) -> bool {
-		Format::parse(format).is_ok()
-	}
-
-	/// Create a new container importer, decoding the initial chunk.
+	/// Create a new container importer, decoding [`ContainerInit::data`] as the initial chunk.
+	///
 	pub fn new(
 		broadcast: moq_net::broadcast::Producer,
 		reserved: crate::catalog::Reserved<E>,
-		format: &str,
-		init: &[u8],
+		init: &ContainerInit,
 	) -> Result<Self> {
-		let mut inner = ContainerImpl::new(broadcast, reserved, Format::parse(format)?);
-		inner.decode(init)?;
+		let mut inner = ContainerImpl::new(broadcast, reserved, init.format);
+		inner.decode(&init.data)?;
 		Ok(Self { inner })
 	}
 
@@ -142,6 +131,15 @@ impl<E: crate::container::ts::Catalog> Container<E> {
 		self.inner.abort(err)
 	}
 
+	/// Declare that the next fragment starts a new segment, rolling a group on every track.
+	///
+	/// For a caller that knows the source's segmentation out of band (an HLS import following its
+	/// playlist). An fMP4 source that carries `styp` atoms declares its own, so this is only
+	/// needed when it doesn't. Ignored by container formats with no segment concept (MKV, TS, FLV).
+	pub fn cut(&mut self) {
+		self.inner.cut()
+	}
+
 	/// Close the current group and open the next one at `sequence`.
 	pub fn seek(&mut self, sequence: u64) -> Result<()> {
 		self.inner.seek(sequence)
@@ -158,12 +156,19 @@ pub struct ContainerStream<E: crate::container::ts::Catalog = ()> {
 
 impl<E: crate::container::ts::Catalog> ContainerStream<E> {
 	/// Create a new container stream importer.
+	///
+	/// Takes a bare format rather than a [`ContainerInit`]: a stream recovers its own framing, so
+	/// there are no leading bytes to seed it with. Push everything through [`Self::decode`].
 	pub fn new(
 		broadcast: moq_net::broadcast::Producer,
 		reserved: crate::catalog::Reserved<E>,
-		format: &str,
+		format: ContainerFormat,
 	) -> Result<Self> {
-		let inner = ContainerImpl::new(broadcast, reserved, Format::parse(format)?);
+		// A separate list from [`Container::new`]: only containers that can be
+		// recovered from a raw byte stream belong here. Today that's all of them,
+		// but a non-streamable container (e.g. RTP) would be added to `Container`
+		// alone.
+		let inner = ContainerImpl::new(broadcast, reserved, format);
 		Ok(Self { inner })
 	}
 
@@ -183,8 +188,53 @@ impl<E: crate::container::ts::Catalog> ContainerStream<E> {
 		self.inner.abort(err)
 	}
 
+	/// Declare that the next fragment starts a new segment, rolling a group on every track.
+	///
+	/// For a caller that knows the source's segmentation out of band (an HLS import following its
+	/// playlist). An fMP4 source that carries `styp` atoms declares its own, so this is only
+	/// needed when it doesn't. Ignored by container formats with no segment concept (MKV, TS, FLV).
+	pub fn cut(&mut self) {
+		self.inner.cut()
+	}
+
 	/// Close the current group and open the next one at `sequence`.
 	pub fn seek(&mut self, sequence: u64) -> Result<()> {
 		self.inner.seek(sequence)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// A stream recovers its own framing, which is why [`ContainerStream::new`] takes a bare format
+	/// with no leading bytes to seed it. Prove it: hand the whole file to `decode` in two chunks
+	/// split mid-header, and the tracks still land.
+	#[test]
+	fn a_split_stream_publishes_its_tracks() {
+		let data = include_bytes!("../container/fmp4/test_data/bbb.mp4");
+		let (head, tail) = data.split_at(100);
+
+		let mut broadcast = moq_net::broadcast::Info::new().produce();
+		let catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
+
+		let mut stream: ContainerStream =
+			ContainerStream::new(broadcast, catalog.reserve(), ContainerFormat::Fmp4).unwrap();
+
+		stream.decode(head).unwrap();
+		// The test file ends on a malformed fragment, so a trailing decode error is expected.
+		let _ = stream.decode(tail);
+
+		let snapshot = catalog.snapshot();
+		assert_eq!(
+			snapshot.video.renditions.len(),
+			1,
+			"video rendition missing from a split stream"
+		);
+		assert_eq!(
+			snapshot.audio.renditions.len(),
+			1,
+			"audio rendition missing from a split stream"
+		);
 	}
 }

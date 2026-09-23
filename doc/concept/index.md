@@ -13,7 +13,7 @@ what lets it forward media it can't parse.
 | Application | Your product: rooms, auth, custom tracks. | You |
 | [hang](/concept/hang) | Media: a catalog of tracks, codec config, timestamped frames. | `hang`, `@moq/hang` |
 | [moq-lite](/concept/moq-lite) | Generic live pub/sub: broadcasts, tracks, groups, frames. | `moq-net`, `@moq/net`, relays, CDNs |
-| [Transport](/concept/transport) | QUIC streams, via WebTransport in browsers, with a WebSocket fallback. | The browser, `moq-native` |
+| [Transport](/concept/transport) | QUIC streams, via WebTransport in browsers, with a WebSocket fallback. | The browser, `moq-tokio` |
 
 ## The model in one paragraph
 
@@ -34,7 +34,8 @@ watched at 100 ms by one viewer and 10 s by another.
 ## Sections
 
 - [Transport](/concept/transport): why QUIC, and the WebTransport, WebSocket, raw QUIC, and iroh paths onto it.
-- [moq-lite](/concept/moq-lite): the pub/sub protocol, discovery, subscriptions, and congestion behavior.
+- [moq-lite](/concept/moq-lite): the pub/sub protocol, discovery, path patterns, subscriptions, and congestion behavior.
 - [hang](/concept/hang): the media catalog, containers, and how to extend both.
-- [Standards](/concept/standard): how this relates to the IETF moq-transport, MSF, and LOC drafts.
+- [Audio jitter](/concept/audio-jitter): how a receiver sizes its audio playout target from arrival timing.
+- [Standards](/concept/standard): how this relates to the IETF moq-transport, MSF, LOC, and this project's own drafts, including [e2ee](/draft/moq-e2ee).
 - [Use cases](/concept/use-case/): MoQ compared with HLS/DASH, RTMP/SRT, WebRTC, and used for AI.

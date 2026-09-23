@@ -16,7 +16,6 @@
 //! this only for a player that advertised the `Multitrack` capability).
 
 use std::task::Poll;
-use std::time::Duration;
 
 use anyhow::Context;
 use bytes::{BufMut, Bytes, BytesMut};
@@ -104,7 +103,7 @@ impl Flavor {
 pub struct Export {
 	source: crate::Source,
 	catalog: Option<crate::catalog::Consumer>,
-	latency: Duration,
+	max_age: std::time::Duration,
 	/// Emit every rendition as an enhanced-RTMP multitrack track, rather than only
 	/// the first video + first audio rendition.
 	multitrack: bool,
@@ -176,12 +175,11 @@ impl Export {
 		source: crate::Source,
 		catalog_format: CatalogFormat,
 	) -> Result<Self, crate::Error> {
-		let broadcast = source.broadcast().await?;
-		let catalog = crate::catalog::Consumer::new(&broadcast, catalog_format).await?;
+		let catalog = source.catalog(catalog_format).await?;
 		Ok(Self {
 			source,
 			catalog: Some(catalog),
-			latency: Duration::ZERO,
+			max_age: std::time::Duration::ZERO,
 			multitrack: false,
 			video: Vec::new(),
 			audio: Vec::new(),
@@ -189,9 +187,13 @@ impl Export {
 		})
 	}
 
-	/// Set the maximum buffering latency for each per-track source.
-	pub fn with_latency(mut self, latency: Duration) -> Self {
-		self.latency = latency;
+	/// Set the max age for each per-track source.
+	///
+	/// See [`Consumer`](crate::container::Consumer) for the per-track skip behavior.
+	/// Defaults to
+	/// [`std::time::Duration::ZERO`](std::time::Duration::ZERO) (skip aggressively).
+	pub fn with_max_age(mut self, max_age: std::time::Duration) -> Self {
+		self.max_age = max_age;
 		self
 	}
 
@@ -350,7 +352,7 @@ impl Export {
 				(VideoCodec::AV1(av1), None) => Some(Bytes::copy_from_slice(&av1c_bytes(av1))),
 				_ => None,
 			};
-			let Some(source) = ExportSource::for_video(&self.source, name, config, self.latency)? else {
+			let Some(source) = ExportSource::for_video(&self.source, name, config, self.max_age)? else {
 				continue;
 			};
 			let track_id = u8::try_from(self.video.len()).context("too many FLV video tracks")?;
@@ -380,7 +382,7 @@ impl Export {
 			}
 			let flavor = audio_flavor(config)?;
 			ensure_legacy(&config.container, "audio", name)?;
-			let Some(source) = ExportSource::for_audio(&self.source, name, config, self.latency)? else {
+			let Some(source) = ExportSource::for_audio(&self.source, name, config, self.max_age)? else {
 				continue;
 			};
 			let track_id = u8::try_from(self.audio.len()).context("too many FLV audio tracks")?;

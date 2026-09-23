@@ -16,10 +16,31 @@ pub struct Subscribe<'a> {
 	pub broadcast: Path<'a>,
 	pub track: Cow<'a, str>,
 	pub priority: u8,
-	pub ordered: bool,
-	pub max_latency: std::time::Duration,
+	pub max_age: std::time::Duration,
+	/// The minimum group to deliver (a floor). On lite-06 the wire carries the raw
+	/// sequence and `None` is interchangeable with `Some(0)`: a floor of 0 constrains
+	/// nothing, and the start resolves from `max_age`. Pre-06 wires encode the
+	/// sequence + 1 and an absent start means the latest group.
 	pub start_group: Option<u64>,
 	pub end_group: Option<u64>,
+	/// First frame to deliver within `start_group`'s group; 0 is the whole group.
+	/// Lite06+ only. It qualifies the named group, so it needs `start_group` to name one
+	/// (`Some`, including `Some(0)`: group 0 can host a mid-group resume).
+	pub start_frame: u64,
+	/// Last frame to deliver (inclusive) within `end_group`'s group, or `None` for the
+	/// whole group. Lite06+ only, and meaningless without an explicit `end_group`.
+	pub end_frame: Option<u64>,
+}
+
+impl Version {
+	/// Whether this version's SUBSCRIBE carries the subscriber's max age preference.
+	///
+	/// Lite01/02 have no field for it, so a decoded `std::time::Duration::ZERO` there means
+	/// "not stated", not "real time". Callers that act on the budget must tell the
+	/// two apart or they will hold every legacy peer to the live edge.
+	pub(crate) fn carries_max_age(self) -> bool {
+		!matches!(self, Version::Lite01 | Version::Lite02)
+	}
 }
 
 impl Message for Subscribe<'_> {
@@ -29,26 +50,30 @@ impl Message for Subscribe<'_> {
 		let track = Cow::<str>::decode(r, version)?;
 		let priority = u8::decode(r, version)?;
 
-		let (ordered, max_latency, start_group, end_group) = match version {
-			Version::Lite01 | Version::Lite02 => (false, std::time::Duration::ZERO, None, None),
+		let (max_age, start_group, end_group) = match version {
+			Version::Lite01 | Version::Lite02 => (std::time::Duration::ZERO, None, None),
 			_ => {
-				let ordered = u8::decode(r, version)? != 0;
-				let max_latency = std::time::Duration::decode(r, version)?;
-				let start_group = Option::<u64>::decode(r, version)?;
+				skip_group_order(r, version)?;
+				let max_age = std::time::Duration::decode(r, version)?;
+				let start_group = decode_start_group(r, version)?;
 				let end_group = Option::<u64>::decode(r, version)?;
-				(ordered, max_latency, start_group, end_group)
+				(max_age, start_group, end_group)
 			}
 		};
+
+		let (start_frame, end_frame) = decode_frame_bounds(r, version, start_group, end_group)?;
+		let start_group = canonical_start_group(version, start_group, start_frame);
 
 		Ok(Self {
 			id,
 			broadcast,
 			track,
 			priority,
-			ordered,
-			max_latency,
+			max_age,
 			start_group,
 			end_group,
+			start_frame,
+			end_frame,
 		})
 	}
 
@@ -61,15 +86,136 @@ impl Message for Subscribe<'_> {
 		match version {
 			Version::Lite01 | Version::Lite02 => {}
 			_ => {
-				(self.ordered as u8).encode(w, version)?;
-				self.max_latency.encode(w, version)?;
-				self.start_group.encode(w, version)?;
+				pad_group_order(w, version)?;
+				self.max_age.encode(w, version)?;
+				encode_start_group(w, version, self.start_group)?;
 				self.end_group.encode(w, version)?;
 			}
 		}
 
+		encode_frame_bounds(
+			w,
+			version,
+			self.start_group,
+			self.start_frame,
+			self.end_group,
+			self.end_frame,
+		)?;
+
 		Ok(())
 	}
+}
+
+/// Step over the retired `Ordered` byte on a version whose layout still has it.
+///
+/// The value is ignored: group order is fixed, so a peer that still sets it gets the
+/// same newest-first delivery as one that doesn't.
+pub(super) fn skip_group_order<R: bytes::Buf>(r: &mut R, version: Version) -> Result<(), DecodeError> {
+	if version.has_group_order() {
+		u8::decode(r, version)?;
+	}
+	Ok(())
+}
+
+/// Write the retired `Ordered` byte as 0, keeping a deployed version's field offsets.
+pub(super) fn pad_group_order<W: bytes::BufMut>(w: &mut W, version: Version) -> Result<(), EncodeError> {
+	if version.has_group_order() {
+		0u8.encode(w, version)?;
+	}
+	Ok(())
+}
+
+/// Decode the `Group Start` field shared by SUBSCRIBE and SUBSCRIBE_UPDATE.
+///
+/// Lite-06 carries the raw floor, so every value names a concrete group and 0 decodes as
+/// `Some(0)`. Pre-06 wires encode the sequence + 1, with 0 meaning the latest group
+/// (`None`). Callers canonicalize with [`canonical_start_group`] once the frame bounds
+/// are known.
+fn decode_start_group<R: bytes::Buf>(r: &mut R, version: Version) -> Result<Option<u64>, DecodeError> {
+	if version.resolves_start() {
+		return Ok(Some(u64::decode(r, version)?));
+	}
+	Option::<u64>::decode(r, version)
+}
+
+/// Canonicalize a decoded floor: a lite-06 `Group Start` of 0 with no frame offset is the
+/// same absence of a constraint as no floor at all, so it decodes as `None`. Group 0 stays
+/// named only when a `Frame Start` actually qualifies it (a subscription can resume
+/// partway through group 0, e.g. a catalog that never leaves it).
+fn canonical_start_group(version: Version, start_group: Option<u64>, start_frame: u64) -> Option<u64> {
+	match (start_group, start_frame) {
+		(Some(0), 0) if version.resolves_start() => None,
+		(start_group, _) => start_group,
+	}
+}
+
+/// Encode the `Group Start` field shared by SUBSCRIBE and SUBSCRIBE_UPDATE.
+///
+/// The inverse of [`decode_start_group`]: lite-06 writes the raw floor (`None` and
+/// `Some(0)` are the same absence of a constraint), while a pre-06 wire gets `Some(0)`
+/// folded back to absent. On those wires an explicit group 0 means "replay from the
+/// beginning", which is not what a vacuous floor asks for.
+fn encode_start_group<W: bytes::BufMut>(
+	w: &mut W,
+	version: Version,
+	start_group: Option<u64>,
+) -> Result<(), EncodeError> {
+	if version.resolves_start() {
+		return start_group.unwrap_or(0).encode(w, version);
+	}
+	start_group.filter(|&group| group > 0).encode(w, version)
+}
+
+/// Decode the trailing `Frame Start` / `Frame End` pair shared by SUBSCRIBE,
+/// SUBSCRIBE_UPDATE, and FETCH.
+///
+/// Older versions carry no such fields, so they decode as the whole group. A frame bound
+/// without the group bound it qualifies is a protocol violation: frames are numbered per
+/// group, so there is nothing to count from.
+fn decode_frame_bounds<R: bytes::Buf>(
+	r: &mut R,
+	version: Version,
+	start_group: Option<u64>,
+	end_group: Option<u64>,
+) -> Result<(u64, Option<u64>), DecodeError> {
+	if !version.has_frame_bounds() {
+		return Ok((0, None));
+	}
+
+	let start_frame = u64::decode(r, version)?;
+	let end_frame = Option::<u64>::decode(r, version)?;
+
+	if (start_frame != 0 && start_group.is_none()) || (end_frame.is_some() && end_group.is_none()) {
+		return Err(DecodeError::InvalidSubscribeLocation);
+	}
+
+	Ok((start_frame, end_frame))
+}
+
+/// Encode the trailing `Frame Start` / `Frame End` pair, a no-op before lite-06.
+fn encode_frame_bounds<W: bytes::BufMut>(
+	w: &mut W,
+	version: Version,
+	start_group: Option<u64>,
+	start_frame: u64,
+	end_group: Option<u64>,
+	end_frame: Option<u64>,
+) -> Result<(), EncodeError> {
+	if (start_frame != 0 && start_group.is_none()) || (end_frame.is_some() && end_group.is_none()) {
+		return Err(EncodeError::InvalidState);
+	}
+
+	if !version.has_frame_bounds() {
+		// Nothing carries the bounds, so silently widening to the whole group would
+		// deliver frames the caller excluded. Refuse instead.
+		if start_frame != 0 || end_frame.is_some() {
+			return Err(EncodeError::Version);
+		}
+		return Ok(());
+	}
+
+	start_frame.encode(w, version)?;
+	end_frame.encode(w, version)
 }
 
 /// Publisher's acknowledgement on the Subscribe Stream for drafts 01-04.
@@ -80,8 +226,7 @@ impl Message for Subscribe<'_> {
 #[derive(Clone, Debug)]
 pub struct SubscribeOk {
 	pub priority: u8,
-	pub ordered: bool,
-	pub max_latency: std::time::Duration,
+	pub max_age: std::time::Duration,
 	pub start_group: Option<u64>,
 	pub end_group: Option<u64>,
 }
@@ -97,8 +242,8 @@ impl Message for SubscribeOk {
 			// Lite03/04 so a stray future use stays well-formed.
 			_ => {
 				self.priority.encode(w, version)?;
-				(self.ordered as u8).encode(w, version)?;
-				self.max_latency.encode(w, version)?;
+				pad_group_order(w, version)?;
+				self.max_age.encode(w, version)?;
 				self.start_group.encode(w, version)?;
 				self.end_group.encode(w, version)?;
 			}
@@ -111,29 +256,26 @@ impl Message for SubscribeOk {
 		match version {
 			Version::Lite01 => Ok(Self {
 				priority: u8::decode(r, version)?,
-				ordered: false,
-				max_latency: std::time::Duration::ZERO,
+				max_age: std::time::Duration::ZERO,
 				start_group: None,
 				end_group: None,
 			}),
 			Version::Lite02 => Ok(Self {
 				priority: 0,
-				ordered: false,
-				max_latency: std::time::Duration::ZERO,
+				max_age: std::time::Duration::ZERO,
 				start_group: None,
 				end_group: None,
 			}),
 			_ => {
 				let priority = u8::decode(r, version)?;
-				let ordered = u8::decode(r, version)? != 0;
-				let max_latency = std::time::Duration::decode(r, version)?;
+				skip_group_order(r, version)?;
+				let max_age = std::time::Duration::decode(r, version)?;
 				let start_group = Option::<u64>::decode(r, version)?;
 				let end_group = Option::<u64>::decode(r, version)?;
 
 				Ok(Self {
 					priority,
-					ordered,
-					max_latency,
+					max_age,
 					start_group,
 					end_group,
 				})
@@ -145,6 +287,11 @@ impl Message for SubscribeOk {
 /// Resolves the absolute start group of a Lite05+ subscription. The first message
 /// the publisher sends, once the start group is known. A value greater than the
 /// requested start implicitly drops the leading range.
+///
+/// There is no start *frame*: a partial group is only served to a subscriber that asked
+/// for one, so delivery begins either at the requested `Frame Start` (when this is the
+/// requested group) or at frame 0 (when the publisher resolved to a later one). A
+/// subscriber that asked for group 5 frame 15 and receives group 6 starts at frame 0.
 #[derive(Clone, Debug)]
 pub struct SubscribeStart {
 	pub group: u64,
@@ -202,10 +349,13 @@ impl Message for SubscribeEnd {
 #[derive(Clone, Debug)]
 pub struct SubscribeUpdate {
 	pub priority: u8,
-	pub ordered: bool,
-	pub max_latency: std::time::Duration,
+	pub max_age: std::time::Duration,
 	pub start_group: Option<u64>,
 	pub end_group: Option<u64>,
+	/// See [`Subscribe::start_frame`].
+	pub start_frame: u64,
+	/// See [`Subscribe::end_frame`].
+	pub end_frame: Option<u64>,
 }
 
 impl Message for SubscribeUpdate {
@@ -218,23 +368,24 @@ impl Message for SubscribeUpdate {
 		}
 
 		let priority = u8::decode(r, version)?;
-		let ordered = u8::decode(r, version)? != 0;
-		let max_latency = std::time::Duration::decode(r, version)?;
-		let start_group = match u64::decode(r, version)? {
-			0 => None,
-			group => Some(group - 1),
-		};
+		skip_group_order(r, version)?;
+		let max_age = std::time::Duration::decode(r, version)?;
+		let start_group = decode_start_group(r, version)?;
 		let end_group = match u64::decode(r, version)? {
 			0 => None,
 			group => Some(group - 1),
 		};
 
+		let (start_frame, end_frame) = decode_frame_bounds(r, version, start_group, end_group)?;
+		let start_group = canonical_start_group(version, start_group, start_frame);
+
 		Ok(Self {
 			priority,
-			ordered,
-			max_latency,
+			max_age,
 			start_group,
 			end_group,
+			start_frame,
+			end_frame,
 		})
 	}
 
@@ -247,16 +398,10 @@ impl Message for SubscribeUpdate {
 		}
 
 		self.priority.encode(w, version)?;
-		(self.ordered as u8).encode(w, version)?;
-		self.max_latency.encode(w, version)?;
+		pad_group_order(w, version)?;
+		self.max_age.encode(w, version)?;
 
-		match self.start_group {
-			Some(start_group) => start_group
-				.checked_add(1)
-				.ok_or(EncodeError::TooLarge)?
-				.encode(w, version)?,
-			None => 0u64.encode(w, version)?,
-		}
+		encode_start_group(w, version, self.start_group)?;
 
 		match self.end_group {
 			Some(end_group) => end_group
@@ -265,6 +410,15 @@ impl Message for SubscribeUpdate {
 				.encode(w, version)?,
 			None => 0u64.encode(w, version)?,
 		}
+
+		encode_frame_bounds(
+			w,
+			version,
+			self.start_group,
+			self.start_frame,
+			self.end_group,
+			self.end_frame,
+		)?;
 
 		Ok(())
 	}
@@ -464,12 +618,154 @@ mod test {
 		assert_eq!(buf[0], 1);
 	}
 
+	fn subscribe_sample() -> Subscribe<'static> {
+		Subscribe {
+			id: 1,
+			broadcast: Path::new("room").to_owned(),
+			track: Cow::Borrowed("video"),
+			priority: 3,
+			max_age: std::time::Duration::from_millis(250),
+			start_group: Some(7),
+			end_group: Some(9),
+			start_frame: 4,
+			end_frame: Some(2),
+		}
+	}
+
+	#[test]
+	fn subscribe_frame_bounds_roundtrip() {
+		let msg = subscribe_sample();
+		let mut buf = Vec::new();
+		msg.encode_msg(&mut buf, Version::Lite06Wip).unwrap();
+		let got = Subscribe::decode_msg(&mut buf.as_slice(), Version::Lite06Wip).unwrap();
+		assert_eq!((got.start_group, got.start_frame), (Some(7), 4));
+		assert_eq!((got.end_group, got.end_frame), (Some(9), Some(2)));
+	}
+
+	/// The whole-group defaults are what a version without the fields decodes to, so
+	/// lite-05 stays byte-identical. Compared without a floor, since `Group Start` itself
+	/// encodes differently across the two (see `group_start_is_absolute_on_lite06`).
+	#[test]
+	fn subscribe_drops_the_retired_ordered_byte_on_lite06() {
+		let mut msg = subscribe_sample();
+		msg.start_group = None;
+		msg.start_frame = 0;
+		msg.end_frame = None;
+
+		let mut lite05 = Vec::new();
+		msg.encode_msg(&mut lite05, Version::Lite05).unwrap();
+		let mut lite06 = Vec::new();
+		msg.encode_msg(&mut lite06, Version::Lite06Wip).unwrap();
+
+		// The two layouts diverge in exactly one place: the retired byte lite-05 still
+		// reserves. A deployed peer's field offsets depend on it being there and zero.
+		let ordered_at = lite05
+			.iter()
+			.zip(&lite06)
+			.position(|(a, b)| a != b)
+			.expect("the layouts must diverge at the retired byte");
+		assert_eq!(lite05[ordered_at], 0, "the retired byte is written as zero");
+
+		// Remove it and lite-06 is the same message plus the two defaulted frame varints.
+		let mut spliced = lite05.clone();
+		spliced.remove(ordered_at);
+		assert_eq!(&lite06[..spliced.len()], &spliced[..]);
+		assert_eq!(&lite06[spliced.len()..], &[0, 0]);
+
+		let got = Subscribe::decode_msg(&mut lite05.as_slice(), Version::Lite05).unwrap();
+		assert_eq!((got.start_frame, got.end_frame), (0, None));
+	}
+
+	/// Lite06 carries the raw floor; pre-06 wires encode the sequence + 1 with 0 meaning
+	/// the latest group. A vacuous floor folds to absent on the old wire, where an
+	/// explicit group 0 would mean "replay from the beginning" instead.
+	#[test]
+	fn group_start_is_absolute_on_lite06() {
+		let mut msg = subscribe_sample();
+		msg.start_frame = 0;
+		msg.end_frame = None;
+
+		let mut lite05 = Vec::new();
+		msg.encode_msg(&mut lite05, Version::Lite05).unwrap();
+		let mut lite06 = Vec::new();
+		msg.encode_msg(&mut lite06, Version::Lite06Wip).unwrap();
+
+		let on05 = Subscribe::decode_msg(&mut lite05.as_slice(), Version::Lite05).unwrap();
+		let on06 = Subscribe::decode_msg(&mut lite06.as_slice(), Version::Lite06Wip).unwrap();
+		assert_eq!(on05.start_group, Some(7));
+		assert_eq!(on06.start_group, Some(7));
+		// The raw byte differs: 7 on the wire, not 7 + 1.
+		assert_ne!(lite05, lite06);
+
+		// No floor and a floor of 0 are the same absence of a constraint on lite-06:
+		// byte-identical on the wire, and canonicalized to absent on decode.
+		msg.start_group = None;
+		let mut absent = Vec::new();
+		msg.encode_msg(&mut absent, Version::Lite06Wip).unwrap();
+		msg.start_group = Some(0);
+		let mut zero = Vec::new();
+		msg.encode_msg(&mut zero, Version::Lite06Wip).unwrap();
+		assert_eq!(absent, zero);
+		let got = Subscribe::decode_msg(&mut zero.as_slice(), Version::Lite06Wip).unwrap();
+		assert_eq!(got.start_group, None);
+
+		// On the pre-06 wire the vacuous floor folds to absent (the latest group).
+		let mut folded = Vec::new();
+		msg.encode_msg(&mut folded, Version::Lite05).unwrap();
+		let got = Subscribe::decode_msg(&mut folded.as_slice(), Version::Lite05).unwrap();
+		assert_eq!(got.start_group, None);
+	}
+
+	/// A subscription can resume partway through group 0 (a catalog never leaves it), so
+	/// a `Frame Start` qualifying the zero floor must survive the round trip.
+	#[test]
+	fn frame_start_may_qualify_group_zero_on_lite06() {
+		let mut msg = subscribe_sample();
+		msg.start_group = Some(0);
+		msg.start_frame = 4;
+
+		let mut buf = Vec::new();
+		msg.encode_msg(&mut buf, Version::Lite06Wip).unwrap();
+		let got = Subscribe::decode_msg(&mut buf.as_slice(), Version::Lite06Wip).unwrap();
+		assert_eq!((got.start_group, got.start_frame), (Some(0), 4));
+	}
+
+	/// Silently widening to the whole group would deliver frames the caller excluded.
+	#[test]
+	fn subscribe_frame_bounds_rejected_before_lite06() {
+		let mut buf = Vec::new();
+		assert!(subscribe_sample().encode_msg(&mut buf, Version::Lite05).is_err());
+	}
+
+	/// Frames are numbered per group, so a frame bound without its group bound has
+	/// nothing to count from.
+	#[test]
+	fn subscribe_frame_bound_without_group_bound_is_invalid() {
+		let mut msg = subscribe_sample();
+		msg.start_group = None;
+		msg.start_frame = 4;
+		msg.end_group = None;
+		msg.end_frame = None;
+
+		let mut buf = Vec::new();
+		assert!(matches!(
+			msg.encode_msg(&mut buf, Version::Lite06Wip),
+			Err(EncodeError::InvalidState)
+		));
+
+		msg.start_frame = 0;
+		msg.end_frame = Some(7);
+		assert!(matches!(
+			msg.encode_msg(&mut buf, Version::Lite06Wip),
+			Err(EncodeError::InvalidState)
+		));
+	}
+
 	#[test]
 	fn subscribe_ok_rejected_on_lite05() {
 		let resp = SubscribeResponse::Ok(SubscribeOk {
 			priority: 1,
-			ordered: true,
-			max_latency: std::time::Duration::ZERO,
+			max_age: std::time::Duration::ZERO,
 			start_group: None,
 			end_group: None,
 		});

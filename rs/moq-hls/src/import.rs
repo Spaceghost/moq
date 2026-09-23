@@ -8,7 +8,6 @@
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::io::SeekFrom;
-use std::path::PathBuf;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -47,43 +46,31 @@ const STEP_RETRY_BUDGET: Duration = Duration::from_secs(10);
 /// instead: enough to prime a player's buffer, without the lag.
 const ANCHOR_SEGMENTS: usize = 3;
 
+/// How many consecutive failed steps retire a rendition (see [`TrackState::evict`]).
+///
+/// Enough to ride out a transient fetch error or a stale playlist, short enough that a
+/// genuinely dead variant stops holding the broadcast's timeline back within a few seconds.
+const MAX_RENDITION_FAILURES: usize = 3;
+
 /// Configuration for the HLS import loop.
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct Config {
-	/// The master or media playlist URL or file path to import.
-	pub playlist: String,
+	/// The master or media playlist URL to import. Local files use a `file://` URL.
+	pub playlist: Url,
 
 	/// HTTP client used to fetch the playlist and segments, for example one carrying
 	/// credentials for an authenticated origin. Defaults to a plain client with a 30
 	/// second per-request timeout.
 	///
-	/// This is a [`reqwest::Client`], re-exported as [`crate::reqwest`]; a major version
-	/// bump of that dependency is a breaking change for this field.
+	/// This is a [`reqwest::Client`].
 	pub client: Option<Client>,
 }
 
 impl Config {
 	/// Create an import configuration for `playlist` using the default HTTP client.
-	pub fn new(playlist: String) -> Self {
+	pub fn new(playlist: Url) -> Self {
 		Self { playlist, client: None }
-	}
-
-	/// Parse the playlist string into a URL.
-	/// If it starts with http:// or https://, parse as URL.
-	/// Otherwise, treat as a file path and convert to file:// URL.
-	fn parse_playlist(&self) -> Result<Url> {
-		if self.playlist.starts_with("http://") || self.playlist.starts_with("https://") {
-			Url::parse(&self.playlist).map_err(|_| Error::InvalidPlaylistUrl)
-		} else {
-			let path = PathBuf::from(&self.playlist);
-			let absolute = if path.is_absolute() {
-				path
-			} else {
-				std::env::current_dir()?.join(path)
-			};
-			Url::from_file_path(&absolute).map_err(|_| Error::InvalidFilePath)
-		}
 	}
 }
 
@@ -327,6 +314,7 @@ struct Sink {
 
 impl Sink {
 	/// Mint an fMP4 importer that publishes only the roles in `select`.
+	///
 	fn importer(&self, select: &select::Broadcast) -> Fmp4 {
 		// `reserve()` (not `clone()`) so the catalog isn't published until every
 		// importer's tracks resolve, keeping one-shot muxers from seeing a partial
@@ -353,6 +341,9 @@ struct TrackState {
 	/// The `EXT-X-MAP` resource the current `importer` was initialized from.
 	map: Option<Resource>,
 	media_range: RangeCursor,
+	/// Consecutive failed ingest attempts, reset by any successful one. See
+	/// [`MAX_RENDITION_FAILURES`].
+	failures: usize,
 }
 
 impl TrackState {
@@ -367,7 +358,21 @@ impl TrackState {
 			next_discontinuity: None,
 			map: None,
 			media_range: RangeCursor::default(),
+			failures: 0,
 		}
+	}
+
+	/// Give up on this rendition's current importer generation after repeated failures.
+	///
+	/// An enrolled track gates *every* segment record until it reports past the boundary, so a
+	/// rendition that stopped making progress freezes the whole broadcast's timeline rather
+	/// than just its own playlist. Dropping the importer closes its recorders (and retires its
+	/// catalog entries), letting the healthy renditions publish again; a later successful step
+	/// rebuilds it from the init segment.
+	fn evict(&mut self) {
+		self.importer = None;
+		self.map = None;
+		self.reanchor();
 	}
 
 	/// Fetch this track's current media playlist and consume any fresh segments,
@@ -377,6 +382,7 @@ impl TrackState {
 		if target_duration.is_none() {
 			*target_duration = Some(playlist.target_duration);
 		}
+
 		self.consume_segments(fetcher, &playlist).await
 	}
 
@@ -553,6 +559,10 @@ impl TrackState {
 		if reanchored {
 			importer.seek(group_sequence)?;
 		}
+		// Every playlist entry is a source segment boundary, so declare it even when the media
+		// carries no styp. Every rendition declares the same ones; the timeline drops a cut
+		// that would land inside its minimum segment duration, so the duplicates cost nothing.
+		importer.cut();
 		importer.decode(&bytes)?;
 
 		self.media_range = range;
@@ -582,7 +592,7 @@ pub struct Import {
 impl Import {
 	/// Create a new HLS import that will write into the given broadcast.
 	pub fn new(broadcast: moq_net::broadcast::Producer, catalog: CatalogProducer, cfg: Config) -> Result<Self> {
-		let base_url = cfg.parse_playlist()?;
+		let base_url = cfg.playlist;
 		Ok(Self {
 			sink: Sink { broadcast, catalog },
 			fetcher: Fetcher::new(cfg.client)?,
@@ -707,6 +717,13 @@ impl Import {
 	async fn step(&mut self, on_error: OnError) -> Result<StepOutcome> {
 		self.ensure_tracks().await?;
 
+		// Reserve the timeline for the whole pass, the way each importer reserves the catalog.
+		// Renditions are ingested one at a time, and a record is immutable once published
+		// against the tracks enrolled at that moment, so a record flushed mid-pass would omit
+		// every rendition that hasn't loaded its init segment yet (a permanent EXT-X-GAP) and
+		// fold that rendition's first groups into whichever segment flushes next.
+		let _reserved = self.sink.catalog.timeline().reserve();
+
 		let mut wrote_segments = 0;
 		let mut target_duration = None;
 		let mut failed = None;
@@ -715,6 +732,7 @@ impl Import {
 		for track in self.video.iter_mut().chain(self.audio.iter_mut()) {
 			match track.ingest(&self.fetcher, &mut target_duration).await {
 				Ok(count) => {
+					track.failures = 0;
 					wrote_segments += count;
 					ok += 1;
 				}
@@ -723,7 +741,13 @@ impl Import {
 					// Keep the other renditions going: one bad variant or segment shouldn't
 					// drop the rest or abort the whole step.
 					OnError::Warn => {
-						warn!(label = %track.label, %err, "rendition import step failed, will retry");
+						track.failures += 1;
+						if track.failures >= MAX_RENDITION_FAILURES && track.importer.is_some() {
+							warn!(label = %track.label, %err, failures = track.failures, "rendition import keeps failing, dropping it until it recovers");
+							track.evict();
+						} else {
+							warn!(label = %track.label, %err, "rendition import step failed, will retry");
+						}
 						// Prefer a failure another pass could still clear, so a single
 						// permanently-dead variant doesn't end an import the others could still
 						// serve. Keeping whichever error came last instead would make the outcome
@@ -775,6 +799,7 @@ impl Import {
 			if let Some(audio_tag) = select_audio(&master, group_id) {
 				if let Some(uri) = &audio_tag.uri {
 					let audio_url = resolve_uri(&self.base_url, uri)?;
+					// Boundaries follow the video variant; audio only reports its groups.
 					self.audio = Some(self.track("audio", audio_url, select_audio_only()));
 				} else {
 					warn!(%group_id, "audio rendition missing URI");
@@ -989,7 +1014,7 @@ fn moq_sequence(discontinuity_sequence: u64, media_sequence: u64) -> Result<u64>
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use std::path::Path;
+	use std::path::{Path, PathBuf};
 	use std::sync::atomic::{AtomicUsize, Ordering};
 	use tokio::io::AsyncWriteExt as _;
 	use tokio::net::TcpListener;
@@ -1009,8 +1034,8 @@ mod tests {
 		std::fs::write(&playlist_path, playlist).unwrap();
 
 		let mut broadcast = moq_net::broadcast::Info::new().produce();
-		let catalog = CatalogProducer::new(&mut broadcast).unwrap();
-		let cfg = Config::new(playlist_path.to_string_lossy().into_owned());
+		let catalog = CatalogProducer::new(&mut broadcast, moq_mux::catalog::Config::default()).unwrap();
+		let cfg = Config::new(Url::from_file_path(&playlist_path).unwrap());
 		let import = Import::new(broadcast, catalog.clone(), cfg).unwrap();
 		(import, catalog)
 	}
@@ -1082,7 +1107,7 @@ mod tests {
 
 	fn sink() -> Sink {
 		let mut broadcast = moq_net::broadcast::Info::new().produce();
-		let catalog = CatalogProducer::new(&mut broadcast).unwrap();
+		let catalog = CatalogProducer::new(&mut broadcast, moq_mux::catalog::Config::default()).unwrap();
 		Sink { broadcast, catalog }
 	}
 
@@ -1108,7 +1133,7 @@ mod tests {
 
 	#[test]
 	fn hls_config_new_sets_fields() {
-		let url = "https://example.com/stream.m3u8".to_string();
+		let url = Url::parse("https://example.com/stream.m3u8").unwrap();
 		let cfg = Config::new(url.clone());
 		assert_eq!(cfg.playlist, url);
 	}
@@ -1149,8 +1174,8 @@ mod tests {
 	#[test]
 	fn hls_import_starts_without_tracks() {
 		let mut broadcast = moq_net::broadcast::Info::new().produce();
-		let catalog = CatalogProducer::new(&mut broadcast).unwrap();
-		let url = "https://example.com/master.m3u8".to_string();
+		let catalog = CatalogProducer::new(&mut broadcast, moq_mux::catalog::Config::default()).unwrap();
+		let url = Url::parse("https://example.com/master.m3u8").unwrap();
 		let cfg = Config::new(url);
 		let hls = Import::new(broadcast, catalog, cfg).unwrap();
 
@@ -1211,8 +1236,8 @@ mod tests {
 		.unwrap();
 
 		let mut broadcast = moq_net::broadcast::Info::new().produce();
-		let catalog = CatalogProducer::new(&mut broadcast).unwrap();
-		let cfg = Config::new(path.to_string_lossy().into_owned());
+		let catalog = CatalogProducer::new(&mut broadcast, moq_mux::catalog::Config::default()).unwrap();
+		let cfg = Config::new(Url::from_file_path(&path).unwrap());
 		let mut import = Import::new(broadcast, catalog, cfg).unwrap();
 
 		assert!(matches!(import.ensure_tracks().await, Err(Error::NoVariants)));
@@ -1373,6 +1398,47 @@ mod tests {
 		assert_eq!(import.video[0].next_sequence, Some(2));
 	}
 
+	/// An enrolled track gates every timeline record until it reports past the boundary, so a
+	/// rendition that has stopped making progress would otherwise freeze the whole broadcast's
+	/// timeline (and every healthy rendition's playlist with it). After a few consecutive
+	/// failures its importer is dropped, which closes its recorders.
+	#[tokio::test]
+	async fn a_persistently_failing_rendition_is_evicted() {
+		let (init, fragments) = fmp4_parts(2);
+		let mut resource = init.clone();
+		resource.extend_from_slice(&fragments[0]);
+		resource.extend_from_slice(&fragments[1]);
+		let playlist = format!(
+			"#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:2\n#EXT-X-MAP:URI=\"media.mp4\",BYTERANGE=\"{}@0\"\n#EXTINF:1,\n#EXT-X-BYTERANGE:{}@{}\nmedia.mp4\n#EXTINF:1,\n#EXT-X-BYTERANGE:{}\nmedia.mp4\n",
+			init.len(),
+			fragments[0].len(),
+			init.len(),
+			fragments[1].len()
+		);
+		let dir = temp_dir();
+		let (mut import, _catalog) = write_import(&dir, &resource, &playlist);
+
+		import.init().await.unwrap();
+		assert!(import.video[0].importer.is_some(), "the rendition imported once");
+
+		// The source goes away underneath us.
+		std::fs::remove_file(dir.join("media.m3u8")).unwrap();
+
+		for _ in 0..MAX_RENDITION_FAILURES - 1 {
+			import.step(OnError::Warn).await.unwrap();
+			assert!(
+				import.video[0].importer.is_some(),
+				"a transient failure keeps the rendition"
+			);
+		}
+
+		import.step(OnError::Warn).await.unwrap();
+		assert!(
+			import.video[0].importer.is_none(),
+			"the dead rendition stops gating the broadcast's timeline"
+		);
+	}
+
 	/// A live window longer than `ANCHOR_SEGMENTS` is joined mid-playlist, which means the
 	/// state HLS carries across the whole playlist has to be replayed from the skipped
 	/// prefix. m3u8-rs attaches `EXT-X-MAP` only to the segment right after the tag, so
@@ -1457,9 +1523,8 @@ mod tests {
 		std::fs::write(&path, master_body).unwrap();
 
 		let mut broadcast = moq_net::broadcast::Info::new().produce();
-		let catalog = CatalogProducer::new(&mut broadcast).unwrap();
-		// `Config` takes a filesystem path for non-http inputs.
-		let cfg = Config::new(path.to_str().unwrap().to_string());
+		let catalog = CatalogProducer::new(&mut broadcast, moq_mux::catalog::Config::default()).unwrap();
+		let cfg = Config::new(Url::from_file_path(&path).unwrap());
 		let mut hls = Import::new(broadcast, catalog, cfg).unwrap();
 		hls.ensure_tracks().await.unwrap();
 		hls

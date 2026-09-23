@@ -59,10 +59,12 @@
 
         # Pinned build toolchain (not latest stable) so `nix develop` and CI
         # compile against a fixed rustc and the relay's MSRV can't creep up
-        # unnoticed. Set to moq-relay's 1.95 (the highest crate MSRV in the
-        # workspace) so the whole workspace, including the relay, builds; the
-        # library crates declare a lower 1.91 floor (Cargo.toml rust-version).
-        rust-toolchain = pkgs.rust-bin.stable."1.95.0".default.override {
+        # unnoticed. The floor is 1.98, not the 1.95 relay MSRV: earlier rustc
+        # strips Mach-O debuginfo with an llvm-objcopy that leaves the LINKEDIT
+        # string pool 4-byte aligned, which macOS 27's dyld refuses to load, so
+        # release-profile proc macros and cdylibs are a coin flip there. The
+        # crates still declare their own lower floors (Cargo.toml rust-version).
+        rust-toolchain = pkgs.rust-bin.stable."1.98.1".default.override {
           extensions = [
             "rust-src"
             "rust-analyzer"
@@ -115,6 +117,9 @@
             cargo-edit
             cargo-semver-checks
             cargo-deny
+            # Per-crate feature matrices (`just rs features`), where workspace
+            # unification would otherwise hide a broken single-crate build.
+            cargo-hack
             cargo-nextest
             # Browser/WASM bindings (rs/moq-wasm -> @moq/wasm via `just wasm`).
             # wasm-bindgen-cli must match the `wasm-bindgen` crate version (the
@@ -253,13 +258,13 @@
         # check` skips itself, which reads as a pass in CI.
         #
         # The tag pairs the generator's own version with the uniffi release it
-        # targets (v0.8.0+v0.32.0 -> uniffi 0.32), and it only understands
+        # targets (v0.9.0+v0.32.0 -> uniffi 0.32), and it only understands
         # metadata emitted by that uniffi, so it moves with the `uniffi`
         # dependency in rs/moq-ffi/Cargo.toml. Five other places name the same
         # generator version and must be bumped together: the repo and revision
         # in release-go-ffi.yml, and the `cargo install` line in
         # rs/moq-ffi/build.sh, go/ffi/README.md, go/scripts/check.sh, and
-        # doc/lib/go/index.md.
+        # go/scripts/stage.sh.
         #
         # This points at a fork rather than NordSecurity because upstream has no
         # uniffi 0.32 generator: the metadata encoding changed in 0.32 even
@@ -269,16 +274,16 @@
         # they tag a 0.32 release.
         uniffi-bindgen-go = pkgs.rustPlatform.buildRustPackage rec {
           pname = "uniffi-bindgen-go";
-          version = "0.8.0+v0.32.0";
+          version = "0.9.0+v0.32.0";
 
           src = pkgs.fetchFromGitHub {
             owner = "kixelated";
             repo = "uniffi-bindgen-go";
             rev = "v${version}";
-            hash = "sha256-BBa47Ib8dQb8GSSqaQv3xxR0RYjiseM3L7ND1HhQcVI=";
+            hash = "sha256-7Hli9SmLknZe5p7iGYsRNxmUL6ovKL2jhX62Z/79K4o=";
           };
 
-          cargoHash = "sha256-U7JLPB83CknoIf5nHoXBzqY6O2YveZ6HNOkYVKukY0Q=";
+          cargoHash = "sha256-ecpo/Z9hc3oPt/pF9Y+EB6SZANR8TDOJR6f/xSzJ9Uw=";
 
           # The tag is a virtual workspace whose other members are uniffi test
           # fixtures. Building from the root would compile all of them, and CI
@@ -315,6 +320,8 @@
           # The upstream repository ignores Cargo.lock so cargo installs test
           # the unlocked resolver. Nix still consumes committed lock data.
           cargoLock.lockFile = ./nix/uniffi-dart-Cargo.lock;
+          # Enum fields must use the record's converter name without renaming it.
+          patches = [ ./nix/uniffi-dart-record-error.patch ];
           postPatch = ''
             cp ${./nix/uniffi-dart-Cargo.lock} Cargo.lock
           '';
@@ -413,7 +420,6 @@
             paths = [
               moq-relay
               moq-cli
-              moq-token
             ];
           };
 
@@ -422,8 +428,6 @@
             moq-relay
             moq-cli
             moq-bench
-            moq-token
-            moq-token-cli
             moq-boy
             libmoq
             moq-gst

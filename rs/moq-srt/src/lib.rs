@@ -22,11 +22,11 @@
 //!   into an origin, or accept a [`Subscribe`] out of one, at a path of your
 //!   choosing (or reject it). This is how an embedder (e.g. a relay verifying a
 //!   JWT and scoping the origin per token) plugs its policy in. It mirrors
-//!   `moq-native`'s `Server` / `Request`.
+//!   `moq-tokio`'s `Server` / `Request`.
 //!
-//! Beyond the listener, the [`dial`] module is the *dial-out* (client) role:
-//! connect to a remote SRT listener as a caller and either [`dial::publish`] a MoQ
-//! broadcast to it (restream MoQ out to a remote SRT ingest) or [`dial::pull`] a
+//! Beyond the listener, [`Client`] is the *dial-out* role: name a remote SRT
+//! listener and either [`Client::publish`] a MoQ broadcast to it (restream MoQ
+//! out to a remote SRT ingest) or [`Client::pull`] a
 //! remote stream into an origin (ingest a remote SRT source). It reuses the same
 //! MPEG-TS <-> moq bridge; only the SRT caller transport is new.
 //!
@@ -44,6 +44,7 @@ mod listen;
 mod server;
 mod ts;
 
+pub use dial::Client;
 pub use error::{Error, Result};
 pub use listen::{Config, run};
-pub use server::{Publish, Request, Server, Subscribe};
+pub use server::{Publish, Reject, Request, Server, Subscribe};

@@ -13,14 +13,14 @@ RTMP server such as Twitch. Both legacy RTMP (H.264 + AAC) and enhanced RTMP
 ```bash
 # Accept an OBS push and publish it to a relay.
 # In OBS: server rtmp://host:1935/live, any stream key.
-moq --client-connect https://relay.example.com/anon --broadcast live.hang import rtmp --listen '[::]:1935'
+moq --connect https://relay.example.com/anon --broadcast live.hang import rtmp --listen '[::]:1935'
 
 # Serve the broadcast to RTMP players
-moq --client-connect https://relay.example.com/anon --broadcast live.hang export rtmp --listen '[::]:1935'
+moq --connect https://relay.example.com/anon --broadcast live.hang export rtmp --listen '[::]:1935'
 ffplay rtmp://localhost:1935/live
 
 # Restream to Twitch
-moq --client-connect https://relay.example.com/anon --broadcast live.hang export rtmp --connect 'rtmp://live.twitch.tv/app/<key>'
+moq --connect https://relay.example.com/anon --broadcast live.hang export rtmp --connect 'rtmp://live.twitch.tv/app/<key>'
 ```
 
 A listener bridges exactly one `--broadcast` and ignores the RTMP app and

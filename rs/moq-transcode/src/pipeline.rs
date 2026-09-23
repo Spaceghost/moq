@@ -18,6 +18,15 @@ use std::collections::HashMap;
 
 use hang::catalog::{Video, VideoConfig};
 
+/// Picture identity for ladder follow: a stall bit flipping is not a source change.
+fn same_picture(a: &VideoConfig, b: &VideoConfig) -> bool {
+	let mut a = a.clone();
+	let mut b = b.clone();
+	a.stalled = None;
+	b.stalled = None;
+	a == b
+}
+
 use crate::catalog::{self, Names, Published};
 use crate::feed::Feed;
 use crate::{Config, Error, active, rung};
@@ -58,7 +67,7 @@ impl Pipeline {
 	) -> Result<Self, Error> {
 		// One shared live decode for every rung of this source: N active rungs
 		// share one subscription and one decoder instead of N.
-		let feed = Feed::new(source.track(&name)?, rendition.clone(), config.decoder.clone());
+		let feed = Feed::new(source.track(&name)?, rendition.clone(), config.feed_decoder());
 
 		let mut ladder = Self {
 			source,
@@ -122,6 +131,7 @@ impl Pipeline {
 			};
 			published.push(Published { rung, entry });
 		}
+		catalog::inherit_stalled(&mut published, source);
 		Ok(published)
 	}
 
@@ -164,7 +174,9 @@ impl Pipeline {
 				return Ok(());
 			}
 		};
-		if name == self.name && rendition == self.rendition {
+		if name == self.name && same_picture(&rendition, &self.rendition) {
+			catalog::inherit_stalled(&mut self.rungs, &rendition);
+			self.rendition = rendition;
 			return Ok(());
 		}
 
@@ -195,11 +207,7 @@ impl Pipeline {
 				let _ = retired.send(true);
 			}
 			self.serving.clear();
-			self.feed = Feed::new(
-				self.source.track(&name)?,
-				rendition.clone(),
-				self.config.decoder.clone(),
-			);
+			self.feed = Feed::new(self.source.track(&name)?, rendition.clone(), self.config.feed_decoder());
 		}
 		self.name = name;
 		self.rendition = rendition;

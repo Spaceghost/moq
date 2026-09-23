@@ -25,6 +25,7 @@ const MOVED = {
 	"/lib/rs/env/wasm": "/lib/rs/",
 	"/lib/rs/crate": "/lib/rs/",
 	"/lib/rs/crate/moq-native": "/lib/rs/",
+	"/lib/rs/crate/moq-tokio": "/lib/rs/",
 	"/lib/rs/crate/web-transport": "/lib/rs/",
 	"/lib/rs/crate/libmoq": "/lib/c/",
 	"/lib/rs/crate/moq-boy": "/bin/demo",

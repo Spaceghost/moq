@@ -14,8 +14,10 @@ It stands up a `moq-relay`, then for each publisher language publishes an H.264
 broadcast and confirms every subscriber sees data flowing before the timeout.
 Most subscribers check for a non-empty frame. The browser additionally verifies
 WebCodecs output painted to a canvas and drives the player's pause/resume controls.
-The browser publisher also sends fake microphone audio, which the browser
-subscriber checks end-to-end.
+Every publisher but the Rust CLI also carries an Opus track, which the browser
+subscriber checks end-to-end: the browser encodes fake microphone audio, and the
+Python and Go clients encode a synthetic tone through `moq-ffi` at a 2.5 ms frame
+duration, so the matrix covers the FFI audio path with a non-default codec config.
 
 `just test smoke-media` is a separate, browser-only run that asks a harder
 question: is the media a viewer gets actually advancing and in sync, and does the
@@ -25,10 +27,10 @@ player survive the publication lifecycle. See [Media QA](#media-qa).
 
 | Client | Source under test | Built with | Roles |
 |---|---|---|---|
-| Rust | `rs/moq-relay` + `rs/moq-cli` | `cargo build` | publish + subscribe |
-| Python | `py/moq-rs` (+ `rs/moq-ffi`, import `moq`) | `just py build` (maturin editable into `.venv`) | publish + subscribe |
-| Go | `go/wrapper` (+ `rs/moq-ffi`, import `moq-go/moq`) | `go/scripts/stage.sh` (uniffi-bindgen-go) + `go build` | publish + subscribe |
-| Browser | `js/watch` + `js/publish` | `vite build` + headless Chromium (Playwright) | audio/video publish + rendered playback |
+| Rust | `rs/moq-relay` + `rs/moq-cli` | `cargo build` | publish (video) + subscribe |
+| Python | `py/moq-rs` (+ `rs/moq-ffi`, import `moq`) | `just py build` (maturin editable into `.venv`) | publish (video + audio) + subscribe |
+| Go | `go/wrapper` (+ `rs/moq-ffi`, import `moq-go/moq`) | `go/scripts/stage.sh` (uniffi-bindgen-go) + `go build` | publish (video + audio) + subscribe |
+| Browser | `js/watch` + `js/publish` | `vite build` + headless Chromium (Playwright) | publish (video + audio) + rendered playback |
 | Native JS | `js/net` + `js/hang` + the npm `@moq/web-transport` polyfill | `node` (tsx) and `bun` | subscribe |
 | C | `rs/libmoq` | `cargo build -p libmoq` + `cc` | subscribe |
 | GStreamer | `rs/moq-gst` (`moqsrc`) | `cargo build -p moq-gst` + `gst-launch-1.0` | subscribe |
@@ -69,7 +71,7 @@ Playwright's Chromium, which
 just test smoke
 
 # Full matrix: rust/python/go/browser publish; everyone subscribes.
-just test smoke-full
+just test smoke --all
 
 # Pick your own axes:
 just test smoke --publishers rust,python --subscribers rust,c,js-native-bun
@@ -135,13 +137,19 @@ names the assertion that has to catch it, and passes only by failing there:
 | tone table shifted 800ms ahead of the picture | `audio/video sync` |
 | the detached player's session never torn down | `resource baseline` |
 
+The leaked-session control waits for an extra `AudioContext` rather than an extra
+session: every player on one relay URL shares a transport, so a session count
+cannot move.
+
 Not covered yet: other browser engines (the capability probe is the groundwork),
 camera/microphone permission denial, asserting the gesture gate rather than only
 exercising it, and any claim about physical playback.
 
 The relay's port is reserved for the run rather than fixed, so two checkouts can
-smoke-test at once; `SMOKE_PORT` pins one instead. `MOQ_TEST_KEEP=1` keeps the run
-directory and its logs. See [the harness contract](../README.md).
+smoke-test at once; `SMOKE_PORT` pins one instead. A failing run keeps its
+directory, including a Playwright trace of the failing page, and CI uploads it;
+`MOQ_TEST_KEEP=1` keeps a passing run's too. See [the harness
+contract](../README.md).
 
 ## Layout
 

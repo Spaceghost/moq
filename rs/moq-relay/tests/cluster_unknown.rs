@@ -1,11 +1,11 @@
 //! Regression for an external publisher whose protocol does not declare a Hop ID.
-//! The relay records that publisher as `Origin::UNKNOWN`; reflected cluster paths
+//! The relay records that publisher as `Hop::UNKNOWN`; reflected cluster paths
 //! must not replace it while gossiping around a redundant mesh.
 
 use std::{net::TcpListener, time::Duration};
 
-use moq_net::Origin;
-use moq_relay::{Config, PublicConfig, Relay};
+use moq_relay::{Config, Relay};
+use url::Url;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 const PATH: &str = "opalin/cell-clumsy-octopus/cameras/left.hang";
@@ -27,16 +27,16 @@ async fn spawn_relay(
 	let port = free_tcp_port();
 
 	let mut config = Config::default();
-	config.server.tcp.bind = Some(format!("127.0.0.1:{port}").parse().expect("parse bind"));
-	config.client.bind = "127.0.0.1:0".parse().expect("parse client bind");
-	config.client.tls.disable_verify = Some(true);
-	config.client.version.extend(cluster_version);
+	config.listen.tcp.bind = Some(format!("127.0.0.1:{port}").parse().expect("parse bind"));
+	config.connect.bind = Some("127.0.0.1:0".parse().expect("parse client bind"));
+	config.connect.tls.insecure = Some(true);
+	config.connect.version.extend(cluster_version);
 	#[allow(deprecated)]
 	{
-		config.auth.public = Some(PublicConfig::Simple(vec![String::new()]));
+		config.auth.public = vec![moq_auth::Pattern::all()];
 	}
 	config.cluster.id = Some(id);
-	config.cluster.connect = connect;
+	config.cluster.connect = connect.into_iter().map(moq_relay::cluster::Peer::new).collect();
 
 	let relay = Relay::load(config).await.expect("relay load");
 	let handle = tokio::spawn(async move {
@@ -55,18 +55,18 @@ async fn spawn_relay(
 	(port, handle)
 }
 
-fn client(version: Option<moq_net::Version>) -> moq_native::Client {
-	let mut config = moq_native::ClientConfig::default();
-	config.tls.disable_verify = Some(true);
-	config.websocket.delay = None;
-	config.bind = "127.0.0.1:0".parse().expect("parse bind");
+fn client(version: Option<moq_net::Version>) -> moq_tokio::Client {
+	let mut config = moq_tokio::connect::Config::default();
+	config.tls.insecure = Some(true);
+	config.websocket.delay = Duration::ZERO;
+	config.bind = Some("127.0.0.1:0".parse().expect("parse bind"));
 	config.version.extend(version);
-	config.init().expect("client init")
+	config.init(Default::default()).expect("client init")
 }
 
 struct Publisher {
 	_broadcast: moq_net::broadcast::Producer,
-	_session: moq_net::Session,
+	_session: moq_tokio::Connection,
 	streamer: tokio::task::AbortHandle,
 }
 
@@ -80,12 +80,11 @@ impl Drop for Publisher {
 }
 
 async fn publish_version(port: u16, version: &str) -> Publisher {
-	let url = format!("tcp://127.0.0.1:{port}").parse().expect("parse url");
-	let origin = Origin::random().produce();
-	let mut broadcast = origin
-		.create_broadcast(PATH, moq_net::broadcast::Route::new().with_announce(true))
-		.expect("create broadcast");
-	let mut track = broadcast.create_track("video", None).expect("create track");
+	let url: Url = format!("tcp://127.0.0.1:{port}").parse().expect("parse url");
+	let origin = moq_tokio::origin::spawn();
+	let broadcast = origin.create_broadcast(PATH).expect("create broadcast");
+	broadcast.announce(Default::default()).expect("create broadcast");
+	let track = broadcast.create_track("video", None).expect("create track");
 
 	// Stream like a real publisher: a fresh group every 100ms, so a subscriber
 	// that attaches at any point receives one (and the test doesn't depend on
@@ -106,10 +105,13 @@ async fn publish_version(port: u16, version: &str) -> Publisher {
 	.abort_handle();
 
 	let version = version.parse().expect("parse version");
-	let session = tokio::time::timeout(TIMEOUT, client(Some(version)).with_publisher(&origin).connect(url))
-		.await
-		.expect("publisher connect timeout")
-		.expect("publisher connect failed");
+	let session = tokio::time::timeout(
+		TIMEOUT,
+		client(Some(version)).with_publisher(&origin).connect(url).established(),
+	)
+	.await
+	.expect("publisher connect timeout")
+	.expect("publisher connect failed");
 
 	Publisher {
 		_broadcast: broadcast,
@@ -128,10 +130,10 @@ async fn publish_unknown(port: u16) -> Publisher {
 /// `Err` carries why it never arrived, so a failing assertion says which step
 /// broke rather than just "no frame".
 async fn read_first_frame(port: u16) -> Result<Vec<u8>, String> {
-	let url = format!("tcp://127.0.0.1:{port}").parse().expect("parse url");
-	let origin = Origin::random().produce();
+	let url: Url = format!("tcp://127.0.0.1:{port}").parse().expect("parse url");
+	let origin = moq_tokio::origin::spawn();
 	let consumer = origin.consume();
-	let session = tokio::time::timeout(TIMEOUT, client(None).with_subscriber(origin).connect(url))
+	let session = tokio::time::timeout(TIMEOUT, client(None).with_subscriber(origin).connect(url).established())
 		.await
 		.map_err(|_| "subscriber connect timeout".to_string())?
 		.map_err(|err| format!("subscriber connect failed: {err}"))?;
@@ -139,15 +141,26 @@ async fn read_first_frame(port: u16) -> Result<Vec<u8>, String> {
 	// Wait for the announcement rather than asking the moment the session connects:
 	// `request_broadcast` answers on the spot, so it would race the announcement that
 	// makes the path routable.
-	let broadcast = tokio::time::timeout(TIMEOUT, consumer.announced_broadcast(PATH))
+	tokio::time::timeout(TIMEOUT, consumer.routed(PATH))
 		.await
-		.map_err(|_| "announced_broadcast timed out".to_string())?
+		.map_err(|_| "routed timed out".to_string())?
 		.ok_or_else(|| "origin closed before the broadcast was announced".to_string())?;
-
-	let mut track = tokio::time::timeout(TIMEOUT, broadcast.track("video").expect("track handle").subscribe(None))
+	let broadcast = consumer
+		.request_broadcast(PATH)
 		.await
-		.map_err(|_| "subscribe timed out".to_string())?
-		.map_err(|err| format!("subscribe failed: {err}"))?;
+		.map_err(|err| format!("broadcast unroutable: {err}"))?;
+
+	// This verifies route propagation rather than real-time backlog skipping. Give
+	// every hop enough tolerance for the next 100ms group to arrive while the
+	// selected group's frame is still crossing the redundant mesh.
+	let subscription = moq_net::track::Subscription::default().with_max_age(Duration::from_secs(1));
+	let mut track = tokio::time::timeout(
+		TIMEOUT,
+		broadcast.track("video").expect("track handle").subscribe(subscription),
+	)
+	.await
+	.map_err(|_| "subscribe timed out".to_string())?
+	.map_err(|err| format!("subscribe failed: {err}"))?;
 
 	let mut group = tokio::time::timeout(TIMEOUT, track.recv_group())
 		.await
@@ -167,10 +180,10 @@ async fn read_first_frame(port: u16) -> Result<Vec<u8>, String> {
 }
 
 async fn watch_announces(port: u16, window: Duration) -> Vec<(String, bool)> {
-	let url = format!("tcp://127.0.0.1:{port}").parse().expect("parse url");
-	let origin = Origin::random().produce();
+	let url: Url = format!("tcp://127.0.0.1:{port}").parse().expect("parse url");
+	let origin = moq_tokio::origin::spawn();
 	let mut announced = origin.consume().announced();
-	let _session = tokio::time::timeout(TIMEOUT, client(None).with_subscriber(origin).connect(url))
+	let _session = tokio::time::timeout(TIMEOUT, client(None).with_subscriber(origin).connect(url).established())
 		.await
 		.expect("viewer connect timeout")
 		.expect("viewer connect failed");
@@ -178,7 +191,7 @@ async fn watch_announces(port: u16, window: Duration) -> Vec<(String, bool)> {
 	let mut updates = Vec::new();
 	let deadline = tokio::time::Instant::now() + window;
 	while let Ok(Some(update)) = tokio::time::timeout_at(deadline, announced.next()).await {
-		updates.push((update.path.as_str().to_string(), update.broadcast.is_some()));
+		updates.push((update.prefix.as_str().to_string(), update.kind.is_active()));
 	}
 	updates
 }

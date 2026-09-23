@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking
+
+- `serve` takes the node's `session::Registry`; `supervise` takes an optional `session::Registration` so a push can re-check the lease.
+- `Auth::admit(request)` no longer takes byte counters; `Admission` no longer carries them; `supervise(session, lease, shutdown)` and `Lease::close(reason, bytes)` take the totals at close.
+- Every session is admitted through a `moq_auth` lease: `--auth-url` asks an auth server per session event, `--auth-public` grants anonymous patterns, and exactly one must be set. `--auth-key`, `--auth-key-dir`, `--auth-public-api`, `--auth-domain`, `--auth-api`, `--auth-api-mode`, `--auth-mtls-tier`, and `--auth-tls-*` are gone, along with the `Cache-Control` driven cache and the unrestricted mTLS grant: a verified client certificate is reported in the request and admits what the server grants.
+- `--auth-public` and its `-subscribe`/`-publish` forms take patterns (`anon/**`), not prefixes.
+- Embedding: `Connection` holds a `Lease` per session and `supervise` follows it; `AuthToken` is built from a `moq_auth::Grant`; `MtlsPeer` carries the `PeerIdentity`.
+
+### Added
+
+- `session::{Registry, Filter}` and `Relay::sessions()`: live sessions on this node, listed at `GET /sessions` and nudged at `POST /sessions/revalidate` on the internal listener. A push is a re-check, not an authority.
+- *(relay)* `ClusterOptions` so the origin is constructed with its cache settings
+- `[cluster.lan] app` / `--cluster-lan-app` names the DNS-SD application the LAN mesh advertises under
+- *(relay)* `Cluster::with_advertise` / `Cluster::with_connect` so a LAN mesh can advertise a generated certificate and pin it when dialing
+- *(relay)* `/.cluster/<credential>` authenticates a LAN peer without `cluster.token`
+- *(relay)* `Relay::with_web` / `Relay::with_internal` and borrowed handles (`cluster`, `auth`, `client`, `stats`, `shutdown`, `shutdown_trigger`, `web`, `internal`, `addr`) so an embedder mounts routes without taking the sockets
+- *(relay)* `ShutdownTrigger` is `Clone`, and `Relay::run` returns once a trigger fired from an embedder's task has drained the sessions
+
+### Changed
+
+- `[cluster.lan] secret` is optional; without it the LAN mesh is open to anyone who can reach the listener
+- `--cluster-lan` no longer requires `--cluster-node`; a generated certificate's fingerprint is advertised instead
+- *(relay)* [**breaking**] `Relay` owns listeners, workers, and shutdown joins. Fields are private; destructuring and driving `serve` yourself can no longer drop a newly added socket owner. Clone the handles you need, mount routes, then call `run`.
+
+### Fixed
+
+- LAN mesh advertises an in-memory listener identity's fingerprint
+- LAN mesh refuses a client/listener version set with no shared path-capable version
+
+### Removed
+
+- *(relay)* `Cluster::with_cache`; pass the cache to `Cluster::new` via `ClusterOptions`
+- *(relay)* [**breaking**] public `Relay` fields (`server`, `workers`, `uring`, and the rest). Use the accessors and `run`.
+
 ## [0.14.18](https://github.com/moq-dev/moq/compare/moq-relay-v0.14.17...moq-relay-v0.14.18) - 2026-09-17
 
 ### Other

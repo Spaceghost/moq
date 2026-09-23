@@ -1,16 +1,20 @@
-//! HTTP server: serves HLS for MoQ broadcasts, fetching media on demand.
+//! HTTP server: serves HLS and DASH for MoQ broadcasts, fetching media on demand.
 //!
 //! Routes are path-based, so one server can expose many broadcasts:
 //!
 //! ```text
 //! GET /{broadcast}/master.m3u8
+//! GET /{broadcast}/manifest.mpd
 //! GET /{broadcast}/{kind}/{rendition}/media.m3u8
 //! GET /{broadcast}/{kind}/{rendition}/init.mp4
-//! GET /{broadcast}/{kind}/{rendition}/seg/{group}.m4s
+//! GET /{broadcast}/{kind}/{rendition}/seg/{segment}.m4s
+//! GET /{broadcast}/{kind}/{rendition}/seg/t{pts}.m4s
 //! ```
 //!
 //! `{kind}` is `video` or `audio`, so a video and an audio rendition that share a
-//! name address distinct resources.
+//! name address distinct resources. The two `seg/` forms name the same bytes: HLS
+//! playlists address a segment by its aligned number, the DASH manifest by its
+//! timeline `pts` (`$Time$`).
 //!
 //! Every request is served. To gate access, wrap [`Server::router`] in your own
 //! [`axum`] middleware. It runs before routing, so a rejected request never reaches
@@ -95,10 +99,10 @@ impl Server {
 			}
 		}
 
-		// Confirm the broadcast is announced (and in scope) before building a broadcaster;
-		// `Broadcaster::new` re-resolves it through the origin, which also lets a rendition's
-		// catalog `broadcast` field reference a sibling broadcast.
-		tokio::time::timeout(RESOLVE_TIMEOUT, self.inner.origin.announced_broadcast(name))
+		// Confirm a route covers the broadcast (and it is in scope) before building a
+		// broadcaster; `Broadcaster::new` re-resolves it through the origin, which also
+		// lets a rendition's catalog `broadcast` field reference a sibling broadcast.
+		tokio::time::timeout(RESOLVE_TIMEOUT, self.inner.origin.routed(name))
 			.await
 			.ok()
 			.flatten()?;
@@ -138,6 +142,19 @@ async fn evict_closed(inner: Arc<Inner>, name: String, broadcaster: Arc<Broadcas
 
 #[cfg(test)]
 mod tests {
+	/// Build an origin producer, spawning its driver on the ambient runtime.
+	fn produce_origin() -> moq_net::origin::Producer {
+		let (producer, driver) = moq_net::origin::Producer::new(moq_net::origin::Config::default());
+		if tokio::runtime::Handle::try_current().is_ok() {
+			tokio::spawn(moq_net::time::run(driver));
+		} else {
+			// A sync test: nothing polls the driver, and dropping it would tear
+			// the origin down, so leak it and rely on the synchronous half.
+			std::mem::forget(driver);
+		}
+		producer
+	}
+
 	use super::*;
 
 	/// Let the origin's spawned attach/detach tasks run: a created broadcast
@@ -169,7 +186,7 @@ mod tests {
 
 		// An origin with no broadcasts: a request that reaches the handlers 404s after
 		// RESOLVE_TIMEOUT, so a 401 proves the middleware rejected it first.
-		let origin = moq_net::Origin::random().produce();
+		let origin = produce_origin();
 		let server = Server::new(origin.consume(), Config::default());
 		let app = server.router().layer(middleware::from_fn(gate));
 
@@ -203,7 +220,7 @@ mod tests {
 		use axum::http::{StatusCode, header};
 		use tower::ServiceExt;
 
-		let origin = moq_net::Origin::random().produce();
+		let origin = produce_origin();
 		let server = Server::new(origin.consume(), Config::default());
 		let app = Router::new().nest("/hls", server.router());
 
@@ -223,10 +240,9 @@ mod tests {
 	}
 
 	async fn closed_broadcaster() -> Arc<Broadcaster> {
-		let origin = moq_net::Origin::random().produce();
-		let mut producer = origin
-			.create_broadcast("gone", moq_net::broadcast::Route::new().with_announce(true))
-			.expect("publish allowed");
+		let origin = produce_origin();
+		let producer = origin.create_broadcast("gone").expect("publish allowed");
+		producer.announce(Default::default()).expect("publish allowed");
 		settle().await;
 		let source = moq_mux::Source::new(origin.consume(), "gone");
 		let broadcaster = Broadcaster::new(source, Config::default())
@@ -240,7 +256,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn broadcaster_replaces_finished_cached_instance() {
-		let origin = moq_net::Origin::random().produce();
+		let origin = produce_origin();
 		let server = Server::new(origin.consume(), Config::default());
 		let stale = closed_broadcaster().await;
 
@@ -250,9 +266,8 @@ mod tests {
 			.lock()
 			.unwrap()
 			.insert("live".to_string(), stale.clone());
-		let _producer = origin
-			.create_broadcast("live", moq_net::broadcast::Route::new().with_announce(true))
-			.expect("publish allowed");
+		let _producer = origin.create_broadcast("live").expect("publish allowed");
+		_producer.announce(Default::default()).expect("publish allowed");
 		settle().await;
 
 		let fresh = server.broadcaster("live").await.expect("broadcast announced");
@@ -263,12 +278,11 @@ mod tests {
 
 	#[tokio::test]
 	async fn eviction_keeps_newer_cached_instance() {
-		let origin = moq_net::Origin::random().produce();
+		let origin = produce_origin();
 		let server = Server::new(origin.consume(), Config::default());
 		let old = closed_broadcaster().await;
-		let mut new_producer = origin
-			.create_broadcast("live", moq_net::broadcast::Route::new().with_announce(true))
-			.expect("publish allowed");
+		let new_producer = origin.create_broadcast("live").expect("publish allowed");
+		new_producer.announce(Default::default()).expect("publish allowed");
 		settle().await;
 		let new = Broadcaster::new(moq_mux::Source::new(origin.consume(), "live"), Config::default())
 			.await

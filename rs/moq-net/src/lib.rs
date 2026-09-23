@@ -17,7 +17,7 @@
 //! `announce`) that owns the short `Producer` / `Consumer` / `Info` names.
 //!
 //! Traffic counters for the levels above live in [`stats`]: build a [`stats::Registry`]
-//! and hand each session a [`stats::Handle`] via [`Client::with_stats`] /
+//! and hand each session a [`stats::Session`] via [`Client::with_stats`] /
 //! [`Server::with_stats`]. Publishing the counters as MoQ broadcasts lives in the
 //! `moq-stats` crate.
 //!
@@ -46,28 +46,23 @@
 //! gives another writer that contributes to the same shared state. Closing the
 //! last producer signals consumers that no more updates are coming.
 //!
-//! ## Async
-//! This library is async-first. [`Client::connect`] and [`Server::accept`] return a
-//! `(Session, Driver)` pair: the [`Session`] is the handle, and the [`Driver`] is
-//! the future that runs all of its protocol work. Nothing is spawned behind your
-//! back: spawn the driver on your executor, await it in place, or step
-//! [`Driver::poll`] with a [`kio::Waiter`] from your own `poll_*` function. The
-//! driver holds no session handle, so the transport still closes when the last
-//! [`Session`] clone drops (or on [`Session::abort`]), which in turn finishes the
-//! driver.
+//! ## Driving and time
+//! This library never spawns tasks or reads the clock. [`Client::connect`] and
+//! [`Server::accept`] take an initial [`time::Instant`] and return
+//! `(Session, Driver)`. Poll the [`Driver`] with the current instant and a
+//! [`kio::Waiter`], then wake on external activity or at the deadline it
+//! returns; [`time::run`] does exactly that on tokio or the browser. The last
+//! [`Session`] drop requests closure; dropping the driver cancels it.
 //!
-//! The crate has no direct tokio dependency: every future is built on [`kio`]
-//! (plain [`std::task::Waker`] plumbing) and `futures`, so any executor can poll
-//! them, and the `poll_xxx` counterparts can be stepped synchronously with a
-//! [`kio::Waiter`].
+//! [`origin::Producer::new`] also returns a producer and driver. Its driver runs
+//! route changes, serving, linger, teardown, and the origin's cache expiration.
+//! Standalone caches expose [`cache::Pool::gc`]. Frame read/write methods
+//! clear their expiration timestamp for the next cleanup pass. Datagrams use a bounded
+//! FIFO; model read/write APIs take no wall-clock time.
 //!
-//! The one remaining runtime tie is time. Timers go through `web_async::time`,
-//! which is backed by tokio's time driver on native (and `wasmtimer` in the
-//! browser), and those timers panic when polled outside a tokio runtime. So on
-//! native you still need a tokio runtime to poll a [`Driver`] (bandwidth sampling,
-//! the control stream timeout, and subscription linger all sleep); purely
-//! model-layer methods (tracks, groups, frames, origins) never touch a timer and
-//! run on any executor.
+//! Both drivers implement [`time::Driver`]. `moq-uring` drives thread-local
+//! transports on its own timer heap. Tests advance time by supplying a later
+//! instant.
 
 #![warn(missing_docs)]
 // The browser transport is `!Send`, so on wasm the shared state behind these `Arc`s is
@@ -77,7 +72,9 @@
 
 mod client;
 mod coding;
+mod driver;
 mod error;
+pub mod goaway;
 // Not part of the public API: compiled only for the crate's own tests and for the
 // `fuzz/` harness.
 #[cfg(any(test, feature = "fuzz"))]
@@ -86,25 +83,29 @@ pub mod fuzz;
 mod ietf;
 mod lite;
 mod model;
-mod path;
+pub mod path;
 mod recv;
-mod server;
-mod session;
 mod setup;
 mod util;
 mod version;
 
+mod runtime;
+pub mod server;
+pub mod session;
 pub mod stats;
+pub mod time;
+pub mod transport;
 
 pub use client::*;
 pub use coding::{BoundsExceeded, DecodeError, EncodeError, VarInt};
+pub use driver::Driver;
 pub use error::*;
 /// The session direction a client advertises in its SETUP (moq-lite-05+).
 pub use lite::Role;
 pub use model::*;
-pub use path::*;
-pub use server::*;
-pub use session::*;
+pub use path::{AsPath, InvalidPattern, Path, PathOwned, Pattern, Patterns};
+pub use server::Server;
+pub use session::Session;
 pub use version::*;
 
 // Re-export the bytes crate

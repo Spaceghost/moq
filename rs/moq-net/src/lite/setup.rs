@@ -13,8 +13,8 @@ const PARAM_PATH: u64 = 0x2;
 const PARAM_ROLE: u64 = 0x3;
 /// Setup Parameter id for the link cost the dialer assigns to this connection.
 const PARAM_COST: u64 = 0x4;
-/// Setup Parameter id for the endpoint's origin (hop) id.
-const PARAM_ORIGIN: u64 = 0x5;
+/// Setup Parameter id for the endpoint's Hop ID.
+const PARAM_HOP: u64 = 0x5;
 
 /// The cost of crossing a link that neither end priced.
 ///
@@ -54,7 +54,7 @@ impl ProbeLevel {
 	/// Both metrics are sampled rather than declared, so this only works for a
 	/// transport whose figures exist by the time the session starts. QUIC and TCP
 	/// both qualify: their RTT comes from the handshake, which has already happened.
-	pub fn detect<S: web_transport_trait::Session>(session: &S) -> Self {
+	pub fn detect<S: crate::transport::poll::Session>(session: &S) -> Self {
 		use web_transport_trait::Stats as _;
 		let stats = session.stats();
 		match stats.estimated_send_rate().is_some() || stats.rtt().is_some() {
@@ -176,12 +176,12 @@ pub struct Setup {
 	/// Directional: it prices the sender's own egress, so both ends declare their own
 	/// and the two need not match. `None` means the default cost of 1.
 	pub cost: Option<u64>,
-	/// This endpoint's origin (hop) id, the identity it stamps onto forwarded
+	/// This endpoint's Hop ID, the identity it stamps onto forwarded
 	/// announcements. The peer uses it to serve this endpoint's subscriptions from
 	/// a route that does not flow through it (the same split horizon the announce
 	/// filter applies). `None` when the endpoint has no meaningful identity (a
 	/// leaf that never forwards); a wire value of 0 decodes as `None`.
-	pub origin: Option<crate::Origin>,
+	pub hop: Option<crate::Hop>,
 }
 
 impl Message for Setup {
@@ -207,16 +207,14 @@ impl Message for Setup {
 		let cost = params.get_varint(PARAM_COST)?;
 		// 0 is legal on the wire but carries no identity (it can't be excluded),
 		// so it decodes as "not declared" rather than an error.
-		let origin = params
-			.get_varint(PARAM_ORIGIN)?
-			.and_then(|id| crate::Origin::new(id).ok());
+		let hop = params.get_varint(PARAM_HOP)?.and_then(|id| crate::Hop::new(id).ok());
 
 		Ok(Self {
 			probe,
 			path,
 			role,
 			cost,
-			origin,
+			hop,
 		})
 	}
 
@@ -241,8 +239,8 @@ impl Message for Setup {
 		if let Some(cost) = self.cost {
 			params.set_varint(PARAM_COST, cost);
 		}
-		if let Some(origin) = self.origin {
-			params.set_varint(PARAM_ORIGIN, origin.id());
+		if let Some(hop) = self.hop {
+			params.set_varint(PARAM_HOP, hop.id());
 		}
 
 		params.encode(w, version)
@@ -263,40 +261,37 @@ impl PeerSetup {
 		*self.0.lock() = Some(setup);
 	}
 
-	/// Await the peer's advertised probe level, blocking until its SETUP arrives.
-	pub async fn probe_level(&self) -> ProbeLevel {
-		self.wait(|setup| setup.probe).await
+	/// Poll for the peer's advertised probe level, waiting until its SETUP arrives.
+	pub fn poll_probe_level(&self, waiter: &kio::Waiter) -> std::task::Poll<ProbeLevel> {
+		self.poll_get(waiter, |setup| setup.probe)
 	}
 
-	/// Await the link cost the peer (the dialing side) declared in its SETUP.
+	/// Poll for the link cost the peer (the dialing side) declared in its SETUP.
 	/// `None` when it declared none, meaning the default cost of 1.
-	pub async fn cost(&self) -> Option<u64> {
-		self.wait(|setup| setup.cost).await
+	pub fn poll_cost(&self, waiter: &kio::Waiter) -> std::task::Poll<Option<u64>> {
+		self.poll_get(waiter, |setup| setup.cost)
 	}
 
-	/// Await the origin (hop) id the peer declared in its SETUP. `None` when it
-	/// declared none: a leaf with no identity worth excluding.
-	pub async fn origin(&self) -> Option<crate::Origin> {
-		self.wait(|setup| setup.origin).await
+	/// Poll for the [`Hop`](crate::Hop) id the peer declared in its SETUP `Hop`
+	/// parameter. `None` when it declared none: a leaf with no identity worth excluding.
+	pub fn poll_hop(&self, waiter: &kio::Waiter) -> std::task::Poll<Option<crate::Hop>> {
+		self.poll_get(waiter, |setup| setup.hop)
 	}
 
-	/// Await the peer's SETUP and read a field out of it.
+	/// Poll for a field of the peer's SETUP.
 	///
 	/// The peer MUST send exactly one SETUP, so this resolves once that stream is read.
-	/// Waits forever if it never does; the caller is a session task, cancelled when the
-	/// driver drops.
-	async fn wait<T>(&self, f: impl FnOnce(&Setup) -> T) -> T {
-		let slot = self
-			.0
-			.wait(|setup| {
-				if setup.is_some() {
-					std::task::Poll::Ready(())
-				} else {
-					std::task::Poll::Pending
-				}
-			})
-			.await;
-		f(slot.as_ref().expect("waited for Some"))
+	/// Pends forever if it never does; the caller is session state, dropped with the
+	/// driver.
+	fn poll_get<T>(&self, waiter: &kio::Waiter, f: impl FnOnce(&Setup) -> T) -> std::task::Poll<T> {
+		let slot = std::task::ready!(self.0.poll(waiter, |setup| {
+			if setup.is_some() {
+				std::task::Poll::Ready(())
+			} else {
+				std::task::Poll::Pending
+			}
+		}));
+		std::task::Poll::Ready(f(slot.as_ref().expect("waited for Some")))
 	}
 }
 
@@ -379,9 +374,9 @@ mod tests {
 	}
 
 	#[test]
-	fn origin_round_trip() {
+	fn hop_round_trip() {
 		let msg = Setup {
-			origin: Some(crate::Origin::new(42).unwrap()),
+			hop: Some(crate::Hop::new(42).unwrap()),
 			..Default::default()
 		};
 		assert_eq!(round_trip(&msg), msg);
@@ -390,12 +385,12 @@ mod tests {
 	// A declared id of 0 carries no identity (it cannot be excluded), so it
 	// decodes as absent rather than erroring.
 	#[test]
-	fn origin_zero_decodes_as_none() {
+	fn hop_zero_decodes_as_none() {
 		use crate::coding::Encode;
 
 		let version = Version::Lite05;
 		let mut params = Parameters::default();
-		params.set_varint(super::PARAM_ORIGIN, 0);
+		params.set_varint(super::PARAM_HOP, 0);
 		let mut body = bytes::BytesMut::new();
 		params.encode(&mut body, version).unwrap();
 		// Frame the body with the Message Length prefix `Setup::decode` expects.
@@ -404,7 +399,7 @@ mod tests {
 		buf.extend_from_slice(&body);
 		let mut slice = &buf[..];
 		let got = Setup::decode(&mut slice, version).unwrap();
-		assert_eq!(got.origin, None);
+		assert_eq!(got.hop, None);
 	}
 
 	#[test]

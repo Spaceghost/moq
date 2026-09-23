@@ -15,12 +15,15 @@ struct TaskEntry {
 	close: Option<oneshot::Sender<()>>,
 	callback: ffi::OnStatus,
 	/// Reads live connection stats, reporting `None` while reconnecting.
-	stats: moq_native::ConnectionStatsReader,
+	stats: moq_tokio::connection::Monitor,
+	/// One allocator for the session. Every `moq_session_bandwidth` handle clones
+	/// it, so they share one reservation registry.
+	bandwidth: moq_net::bandwidth::Allocator,
 }
 
 /// Everything needed to prepare a session without holding the global state lock.
 pub(crate) struct Connect {
-	pub config: moq_native::ClientConfig,
+	pub config: crate::client::Config,
 	pub url: Url,
 	pub publish: Option<moq_net::origin::Producer>,
 	pub consume: Option<moq_net::origin::Producer>,
@@ -32,7 +35,9 @@ impl Connect {
 	pub fn prepare(self) -> Result<PreparedConnect, Error> {
 		let mut client = self
 			.config
-			.init()
+			.connect
+			.clone()
+			.init(self.config.quic.clone())
 			.map_err(|err| Error::InvalidConfig(err.to_string()))?;
 		if let Some(publish) = &self.publish {
 			client = client.with_publisher(publish);
@@ -53,7 +58,7 @@ impl Connect {
 
 /// A validated session request ready for insertion into global state.
 pub(crate) struct PreparedConnect {
-	client: moq_native::Client,
+	client: moq_tokio::Client,
 	url: Url,
 	publish: Option<moq_net::origin::Producer>,
 	consume: Option<moq_net::origin::Producer>,
@@ -76,16 +81,18 @@ impl Session {
 			callback,
 		} = request;
 
-		// Build the reconnect loop up front so we can grab a stats reader for it
+		// Build the reconnect loop up front so we can grab a monitor for it
 		// before moving it into the spawned task.
-		let reconnect = client.reconnect(url);
-		let stats = reconnect.stats();
+		let reconnect = client.connect(url);
+		let stats = reconnect.monitor();
+		let bandwidth = moq_net::bandwidth::Allocator::new(reconnect.send_bandwidth());
 
 		let closed = oneshot::channel();
 		let entry = TaskEntry {
 			close: Some(closed.0),
 			callback,
 			stats,
+			bandwidth,
 		};
 		let id = self.task.insert(Some(entry))?;
 
@@ -113,11 +120,22 @@ impl Session {
 		Ok(id)
 	}
 
+	/// The session's bandwidth allocator. Clones share one reservation registry.
+	pub fn bandwidth(&self, id: Id) -> Result<moq_net::bandwidth::Allocator, Error> {
+		Ok(self
+			.task
+			.get(id)
+			.and_then(|entry| entry.as_ref())
+			.ok_or(Error::SessionNotFound)?
+			.bandwidth
+			.clone())
+	}
+
 	/// Snapshot the current connection's stats.
 	///
 	/// Errors with [`Error::SessionNotFound`] if the handle is unknown, or [`Error::Offline`]
 	/// if the session is currently between connections (reconnecting).
-	pub fn stats(&self, id: Id) -> Result<moq_net::ConnectionStats, Error> {
+	pub fn stats(&self, id: Id) -> Result<moq_net::session::Stats, Error> {
 		self.task
 			.get(id)
 			.and_then(|entry| entry.as_ref())
@@ -131,7 +149,7 @@ impl Session {
 	///
 	/// Errors with [`Error::SessionNotFound`] if the handle is unknown, or [`Error::Offline`]
 	/// if the session is currently between connections (reconnecting).
-	pub fn snapshot(&self, id: Id) -> Result<moq_native::ConnectionSnapshot, Error> {
+	pub fn snapshot(&self, id: Id) -> Result<moq_tokio::connection::Snapshot, Error> {
 		self.task
 			.get(id)
 			.and_then(|entry| entry.as_ref())
@@ -145,10 +163,10 @@ impl Session {
 	///
 	/// Returns the terminal error via `?`. Disconnects aren't reported: status 0 is reserved for a
 	/// clean close (delivered as the terminal callback once the task ends).
-	async fn report(callback: ffi::OnStatus, mut reconnect: moq_native::Reconnect) -> Result<(), Error> {
+	async fn report(callback: ffi::OnStatus, mut reconnect: moq_tokio::Connection) -> Result<(), Error> {
 		let mut connects: u64 = 0;
 		loop {
-			if let moq_native::Status::Connected = reconnect.status().await.map_err(map_connect_error)? {
+			if let moq_tokio::Status::Connected = reconnect.status().await.map_err(map_connect_error)? {
 				connects += 1;
 				// Positive status carries the connection epoch, so callers can tell a
 				// reconnect (>1) from the first connect (1). No lock is held, so the C
@@ -174,11 +192,17 @@ impl Session {
 	}
 }
 
-fn map_connect_error(err: moq_native::Error) -> Error {
-	match err.connect_error() {
-		Some(moq_native::ConnectError::Unauthorized) => Error::Unauthorized,
-		Some(moq_native::ConnectError::Forbidden) => Error::Forbidden,
-		_ => Error::Connect(Arc::new(err.into())),
+fn map_connect_error(err: moq_tokio::Error) -> Error {
+	match err {
+		// Local auth stays the dedicated C status. A scoped protocol close is `Error::Moq`
+		// so `moq_error_protocol` can recover the registry and code.
+		moq_tokio::Error::MoqNet(moq_net::Error::Unauthorized) => Error::Unauthorized,
+		moq_tokio::Error::MoqNet(err) => err.into(),
+		err => match err.connect_error() {
+			Some(moq_tokio::ConnectError::Unauthorized) => Error::Unauthorized,
+			Some(moq_tokio::ConnectError::Forbidden) => Error::Forbidden,
+			_ => Error::Connect(Arc::new(err.into())),
+		},
 	}
 }
 
@@ -190,11 +214,11 @@ mod tests {
 	#[test]
 	fn maps_native_auth_connect_errors() {
 		assert!(matches!(
-			map_connect_error(moq_native::ConnectError::Unauthorized.into()),
+			map_connect_error(moq_tokio::ConnectError::Unauthorized.into()),
 			Error::Unauthorized
 		));
 		assert!(matches!(
-			map_connect_error(moq_native::ConnectError::Forbidden.into()),
+			map_connect_error(moq_tokio::ConnectError::Forbidden.into()),
 			Error::Forbidden
 		));
 		assert!(matches!(
@@ -202,11 +226,20 @@ mod tests {
 			Error::Unauthorized
 		));
 		assert!(matches!(
-			map_connect_error(moq_native::Error::ConnectFailed),
+			map_connect_error(moq_net::Error::from(moq_net::SessionError::Unauthorized).into()),
+			Error::Moq(moq_net::Error::Session(moq_net::SessionError::Unauthorized))
+		));
+		assert!(matches!(
+			map_connect_error(moq_tokio::Error::ConnectFailed),
 			Error::Connect(_)
 		));
 		assert_eq!(Error::Unauthorized.code(), -34);
 		assert_eq!(Error::Forbidden.code(), -35);
-		assert_eq!(map_connect_error(moq_native::Error::ConnectFailed).code(), -5);
+		assert_eq!(map_connect_error(moq_net::Error::Unauthorized.into()).code(), -34);
+		assert_eq!(
+			map_connect_error(moq_net::Error::from(moq_net::SessionError::Unauthorized).into()).code(),
+			-2
+		);
+		assert_eq!(map_connect_error(moq_tokio::Error::ConnectFailed).code(), -5);
 	}
 }

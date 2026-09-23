@@ -73,6 +73,11 @@ pub trait MediaSink: Send {
 	/// loop has already converted the timestamp to microseconds.
 	fn on_frame(&mut self, mid: str0m::media::Mid, frame: codec::Frame) -> Result<()>;
 
+	/// Re-evaluate stall from source silence on every ingest track.
+	fn tick(&mut self) -> Result<()> {
+		Ok(())
+	}
+
 	/// Called once when the session ends with a genuine failure, so the sink can
 	/// abort its tracks with the real cause instead of a bare `Error::Dropped`.
 	fn abort(&mut self, err: moq_net::Error);
@@ -226,8 +231,13 @@ impl Session {
 				return Err(Error::IceTimeout);
 			}
 
-			let timeout = match self.rtc.poll_output().map_err(Error::Rtc)? {
-				Output::Timeout(t) => t,
+			let timeout = match self.rtc.poll_output().map_err(Error::rtc)? {
+				Output::Timeout(t) => {
+					if let MediaRole::Ingest(sink) = &mut self.role {
+						sink.tick()?;
+					}
+					t
+				}
 				Output::Transmit(t) => {
 					let dst = crate::net::to_family(t.destination, socket_v6);
 					if let Err(err) = self.socket.send_to(&t.contents, dst).await {
@@ -252,7 +262,7 @@ impl Session {
 				duration = duration.min(ICE_ESTABLISH_TIMEOUT.saturating_sub(started.elapsed()));
 			}
 			if duration.is_zero() {
-				self.rtc.handle_input(Input::Timeout(now)).map_err(Error::Rtc)?;
+				self.rtc.handle_input(Input::Timeout(now)).map_err(Error::rtc)?;
 				continue;
 			}
 
@@ -282,8 +292,8 @@ impl Session {
 							// address family, not the socket bind (see the `locals` docs).
 							let local = pick_local(&self.locals, src);
 							let recv = Receive::new(str0m::net::Protocol::Udp, src, local, &data)
-								.map_err(Error::RtcInput)?;
-							self.rtc.handle_input(Input::Receive(now, recv)).map_err(Error::Rtc)?;
+								.map_err(Error::rtc_input)?;
+							self.rtc.handle_input(Input::Receive(now, recv)).map_err(Error::rtc)?;
 						}
 						// Every sender dropped: the demux unregistered us (or the
 						// 1:1 reader stopped). Nothing more will arrive, so end.
@@ -294,7 +304,7 @@ impl Session {
 				_ = tokio::time::sleep(duration) => {
 					self.rtc
 						.handle_input(Input::Timeout(Instant::now()))
-						.map_err(Error::Rtc)?;
+						.map_err(Error::rtc)?;
 				}
 			}
 		}
@@ -582,6 +592,13 @@ impl Bridges {
 		Ok(())
 	}
 
+	pub fn tick(&mut self) -> Result<()> {
+		for bridge in self.inner.values_mut() {
+			bridge.tick()?;
+		}
+		Ok(())
+	}
+
 	/// Abort every bridge's track with `err` so subscribers see the real cause
 	/// rather than a bare `Error::Dropped`.
 	///
@@ -670,7 +687,7 @@ pub(crate) fn advertised_candidates(advertise: &[SocketAddr], local: SocketAddr)
 	};
 
 	for addr in &candidates {
-		Candidate::host(*addr, "udp").map_err(str0m::RtcError::from)?;
+		Candidate::host(*addr, "udp").map_err(Error::rtc)?;
 	}
 	Ok(candidates)
 }

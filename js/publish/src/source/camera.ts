@@ -2,10 +2,11 @@ import { Effect, type Getter, getter, type Inputs, type Readonlys, readonlys, Si
 import type * as Video from "../video";
 import { Device, type DeviceProps } from "./device";
 import { Retry } from "./retry";
+import type { Media } from "./types";
 
 // Signals the camera reads.
 export type CameraInput = {
-	// Whether to hold the camera open. When false the track is stopped and `out.source` clears.
+	// Whether to hold the camera open. Defaults to true. When false the track is stopped and `out.source` clears.
 	enabled: Getter<boolean>;
 };
 
@@ -19,7 +20,7 @@ export interface CameraProps extends Inputs<CameraInput> {
 
 type CameraOutput = {
 	// The live camera track, or undefined while disabled or denied.
-	source: Signal<Video.Source | undefined>;
+	source: Signal<Media | undefined>;
 };
 
 /** Captures video from a camera, tracking the available devices. */
@@ -45,7 +46,7 @@ export class Camera {
 	constraints: Signal<Video.Constraints | undefined>;
 
 	readonly #out: CameraOutput = {
-		source: new Signal<Video.Source | undefined>(undefined),
+		source: new Signal<Media | undefined>(undefined),
 	};
 	readonly out = readonlys(this.#out);
 
@@ -54,7 +55,7 @@ export class Camera {
 
 	constructor(props?: CameraProps) {
 		this.in = {
-			enabled: getter(props?.enabled ?? false),
+			enabled: getter(props?.enabled ?? true),
 		};
 		this.device = new Device("video", props?.device);
 		this.constraints = Signal.from(props?.constraints);
@@ -113,7 +114,7 @@ export class Camera {
 
 			if (!stream) return this.#retry.failed();
 
-			const source = stream.getVideoTracks()[0] as Video.Source | undefined;
+			const source = stream.getVideoTracks()[0] as Video.StreamTrack | undefined;
 
 			// getUserMedia resolved, so we have permission even if no track came back.
 			effect.cleanup(this.device.capture(source?.getSettings().deviceId));
@@ -122,7 +123,7 @@ export class Camera {
 			if (!source || source.readyState === "ended") return this.#retry.failed();
 
 			this.#retry.succeeded(effect, source);
-			effect.set(this.#out.source, source);
+			effect.set(this.#out.source, { video: source });
 		});
 	}
 

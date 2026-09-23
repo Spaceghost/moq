@@ -7,7 +7,10 @@ license = "MIT OR Apache-2.0"
 
 version = "0.11.2"
 edition = "2024"
-rust-version.workspace = true
+# Depends on moq-relay, whose sysinfo 0.39 needs 1.95, above the 1.91 workspace
+# floor. This binary is an application, so the bump stays here rather than
+# raising the libraries others build on.
+rust-version = "1.95"
 
 keywords = ["quic", "http3", "webtransport", "media", "live"]
 categories = ["multimedia", "network-programming", "web-programming"]
@@ -23,21 +26,21 @@ path = "src/main.rs"
 doc = false
 
 [features]
-default = ["iroh", "noq", "websocket", "nvidia"]
-iroh = ["moq-native/iroh"]
-jemalloc = ["moq-native/jemalloc"]
-noq = ["moq-native/noq"]
-quinn = ["moq-native/quinn"]
-quiche = ["moq-native/quiche"]
+default = ["iroh", "cluster-lan", "noq", "websocket", "nvidia"]
+iroh = ["moq-tokio/iroh"]
+# LAN discovery and meshing (`--cluster-lan`).
+cluster-lan = ["moq-relay/cluster-lan"]
+jemalloc = ["moq-tokio/jemalloc"]
+noq = ["moq-tokio/noq"]
 # qlog trace capture (`--client-quic-qlog <DIR>`). Off by default: it compiles the
 # qlog machinery into the enabled backends and is only wanted for debugging or
 # congestion-control testing.
-qlog = ["moq-native/qlog"]
-websocket = ["moq-native/websocket"]
+qlog = ["moq-tokio/qlog"]
+websocket = ["moq-tokio/websocket"]
 # Device capture (camera + microphone) + encode/publish. Off by default because
-# it pulls in moq-video + moq-audio capture, which add system build deps on Linux
-# (camera: `v4l`/v4l2-sys-mit needs libclang + V4L2 headers via bindgen; mic: cpal
-# needs ALSA/libasound), plus binary size. macOS/Windows use OS frameworks, no
+# it pulls in moq-video + moq-audio capture: on Linux the microphone needs
+# ALSA/libasound at build time through cpal (the camera needs nothing, moq-v4l
+# checks its bindings in), plus binary size. macOS/Windows use OS frameworks, no
 # extra install. H.264 is vendored static (openh264), so no system ffmpeg/libav.
 # Enable with `cargo build -p moq-cli --features capture`, adding `pipewire` for
 # display capture on Linux.
@@ -54,7 +57,7 @@ play = ["dep:moq-video", "moq-video/render", "dep:moq-audio", "moq-audio/playbac
 # the matching moq-video feature, so it only bites when something else pulls in
 # moq-video: `capture`, `transcode`, or `play`. For a build with no CUDA
 # dependencies, drop it:
-#   cargo build -p moq-cli --no-default-features --features "iroh noq websocket capture"
+#   cargo build -p moq-cli --no-default-features --features "iroh,noq,websocket,capture"
 nvidia = ["moq-video?/nvidia", "moq-transcode?/nvidia"]
 # Compatibility aliases for the pre-consolidation names, kept so a manifest that
 # already asks for the old split still resolves. Undocumented on purpose: the
@@ -67,10 +70,9 @@ nvdec = ["nvidia"]
 # pulls in moq-video.
 vaapi = ["moq-video?/vaapi", "moq-transcode?/vaapi"]
 # The V4L2 M2M codecs of an ARM SoC (a Raspberry Pi's VideoCore and the like),
-# opt-in like the moq-video feature it turns on: the `v4l` crate's bindgen needs
-# libclang and the kernel headers on the build host. `capture` already pays that
-# for the camera, so a capture build adds it for free. Only bites when `capture`,
-# `transcode`, or `play` pulls in moq-video.
+# opt-in like the moq-video feature it turns on. Costs the build nothing: moq-v4l
+# checks its bindings in. Only applies when `capture`, `transcode`, or `play`
+# pulls in moq-video.
 v4l2 = ["moq-video?/v4l2", "moq-transcode?/v4l2"]
 # Screen capture for `capture --display` on Linux (xdg-desktop-portal + PipeWire),
 # opt-in like moq-video's own `pipewire` because it links libpipewire-0.3 at
@@ -88,33 +90,44 @@ anyhow = { workspace = true, features = ["backtrace"] }
 axum = { workspace = true }
 axum-server = { workspace = true }
 bytes = { workspace = true }
-clap = { workspace = true }
 hang = { workspace = true }
 humantime = { workspace = true }
 moq-audio = { workspace = true, optional = true, features = ["aac"] }
+moq-auth = { workspace = true, features = ["serve"] }
 # `server` enables the HTTP egress server for `moq export hls`; the importer is always available.
 moq-hls = { workspace = true, features = ["server"] }
 moq-mux = { workspace = true }
-# Raw qmux listeners are part of the CLI surface. `uds` compiles only on Unix.
-moq-native = { workspace = true, default-features = false, features = ["aws-lc-rs", "tcp", "uds"] }
+# Cluster, LAN mesh, and inbound `/.cluster` auth. default-features off so the
+# CLI's own feature set (iroh, noq, cluster-lan) is what selects them.
+moq-relay = { workspace = true }
 moq-rtc = { workspace = true }
 moq-rtmp = { workspace = true }
 moq-srt = { workspace = true }
-moq-token-cli = { workspace = true }
-moq-transcode = { workspace = true, optional = true }
-moq-video = { workspace = true, optional = true }
+# Raw qmux listeners are part of the CLI surface. `uds` compiles only on Unix.
+moq-tokio = { workspace = true, default-features = false, features = ["aws-lc-rs", "tcp", "uds"] }
+moq-transcode = { workspace = true, optional = true, features = ["openh264"] }
+moq-video = { workspace = true, optional = true, features = ["openh264"] }
 pollster = { workspace = true, optional = true }
+reqwest = { workspace = true, features = ["rustls", "json"] }
 rustls = { version = "0.23", features = ["aws-lc-rs"], default-features = false }
+serde = { workspace = true }
+serde_json = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tower-http = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
+usage = { workspace = true, features = ["completions", "config"] }
 winit = { version = "0.30.13", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 sd-notify = { workspace = true }
 
 [dev-dependencies]
+# Authors an MSF-only catalog, which is the one shape that tells a completer reading
+# the wrong catalog track apart from one reading the right one: `moq-mux`'s producer
+# publishes hang and MSF from the same source, so both answer for an ordinary broadcast.
+moq-msf = { workspace = true }
+tempfile = { workspace = true }
 # `test-util` enables `tokio::time::pause` so the TS round-trip test simulates the
 # exporter drain timeouts instantly instead of waiting on the wall clock.
 tokio = { workspace = true, features = ["test-util"] }

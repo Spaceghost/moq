@@ -22,6 +22,22 @@ pub enum Error {
 	#[error("ICE did not connect before the establishment deadline")]
 	IceTimeout,
 
+	/// A broadcast did not produce a catalog before the negotiation deadline.
+	#[error("catalog did not arrive before the negotiation deadline")]
+	CatalogTimeout,
+
+	/// The catalog track closed before publishing its first snapshot.
+	#[error("catalog closed before its first snapshot")]
+	CatalogClosed,
+
+	/// The catalog has no rendition this gateway can send over WebRTC.
+	#[error("catalog has no WebRTC-compatible renditions")]
+	NoRenditions,
+
+	/// The WebRTC engine produced no SDP changes for an offer.
+	#[error("no SDP changes to apply")]
+	NoSdpChanges,
+
 	/// I/O error on the media socket (bind, send, or receive).
 	#[error("io error: {0}")]
 	Io(#[from] std::io::Error),
@@ -34,17 +50,41 @@ pub enum Error {
 	#[error("mux error: {0}")]
 	Mux(#[from] moq_mux::Error),
 
-	/// Error from the str0m WebRTC engine (SDP negotiation, DTLS, media state).
+	/// HTTP transport failed while dialing a WHIP or WHEP endpoint.
+	#[error("http error: {0}")]
+	Http(std::sync::Arc<reqwest::Error>),
+
+	/// A WHIP or WHEP endpoint rejected the HTTP request.
+	#[error("HTTP endpoint returned status {0}")]
+	HttpStatus(u16),
+
+	/// Error from the WebRTC engine (SDP negotiation, DTLS, media state).
 	#[error("rtc error: {0}")]
-	Rtc(#[from] str0m::RtcError),
+	Rtc(String),
 
-	/// Error feeding a received UDP datagram into the str0m WebRTC engine.
+	/// Error feeding a received UDP datagram into the WebRTC engine.
 	#[error("rtc input error: {0}")]
-	RtcInput(#[from] str0m::error::NetError),
+	RtcInput(String),
 
-	/// Catch-all for gateway logic that reports via `anyhow`.
-	#[error(transparent)]
-	Other(#[from] anyhow::Error),
+	/// An internal video bridge could not be initialized.
+	#[error("video bridge initialization failed")]
+	BridgeFailed,
+}
+
+impl From<reqwest::Error> for Error {
+	fn from(err: reqwest::Error) -> Self {
+		Self::Http(std::sync::Arc::new(err))
+	}
+}
+
+impl Error {
+	pub(crate) fn rtc(err: impl std::fmt::Display) -> Self {
+		Self::Rtc(err.to_string())
+	}
+
+	pub(crate) fn rtc_input(err: impl std::fmt::Display) -> Self {
+		Self::RtcInput(err.to_string())
+	}
 }
 
 /// Convenience alias for results from the WebRTC <-> MoQ gateway.

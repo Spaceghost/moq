@@ -10,39 +10,51 @@ use hang::moq_net;
 use moq_rtmp::{Client, Request, Server};
 use url::Url;
 
-use crate::moq::notify_ready;
+use crate::moq::{ImportTarget, notify_ready};
 
 /// RTMP endpoint args: exactly one of `--connect` (dial) / `--listen` (bind).
 /// The parent direction fixes whether that dial/bind pushes or pulls. Import uses
 /// this directly; export wraps it in [`ExportArgs`] for the egress-only knobs.
-#[derive(clap::Args, Clone)]
-#[command(group = clap::ArgGroup::new("rtmp-mode").required(true).multiple(false).args(["rtmp-connect", "rtmp-listen"]))]
+#[derive(usage::Args, Clone)]
+#[usage(unknown_flags = "error", args_override_self = false)]
+#[usage(group("rtmp-mode", required))]
 pub struct Args {
 	/// Dial `rtmp://host[:1935]/<app>/<key>`.
-	#[arg(id = "rtmp-connect", long = "connect", value_name = "URL")]
+	#[usage(name = "rtmp-connect", long = "connect", value_name = "URL", group = "rtmp-mode")]
 	pub connect: Option<Url>,
 
 	/// Bind an RTMP listener, bridging the single `--broadcast` (the RTMP app/key
 	/// is accepted but not used for routing).
-	#[arg(id = "rtmp-listen", long = "listen", value_name = "ADDR")]
+	#[usage(name = "rtmp-listen", long = "listen", value_name = "ADDR", group = "rtmp-mode")]
 	pub listen: Option<SocketAddr>,
 }
 
 /// RTMP export args: the endpoint plus egress-only tuning. Split from the import
 /// side so the frame-drop knob only shows where it applies.
-#[derive(clap::Args, Clone)]
+#[derive(usage::Args, Clone)]
+#[usage(unknown_flags = "error", args_override_self = false)]
 pub struct ExportArgs {
-	#[command(flatten)]
+	#[usage(flatten)]
 	pub endpoint: Args,
 
-	/// Maximum latency before skipping a stalled group. RTMP is unpaced, so this
+	/// How stale a group may get before it is skipped. RTMP is unpaced, so this
 	/// bounds buffering, not the wire rate.
-	#[arg(long = "latency-max", default_value = "500ms", value_parser = humantime::parse_duration)]
-	pub latency_max: Duration,
+	#[usage(long, default = "500ms")]
+	pub max_age: crate::duration::Duration,
+
+	/// The released spelling of [`Self::max_age`].
+	#[usage(long = "latency-max", hide = true)]
+	pub(crate) latency_max: Option<crate::duration::Duration>,
 }
 
-/// Accept incoming RTMP publishes into the Origin as `name`; reject plays (import).
-pub async fn listen_import(origin: moq_net::origin::Producer, addr: SocketAddr, name: String) -> anyhow::Result<()> {
+/// Accept incoming RTMP publishes into the Origin as `target.name`; reject plays (import).
+pub async fn listen_import(target: ImportTarget, addr: SocketAddr) -> anyhow::Result<()> {
+	let ImportTarget {
+		origin,
+		name,
+		max_age,
+		bandwidth,
+	} = target;
 	let mut server = Server::bind(addr).await?;
 	tracing::info!(%addr, %name, "RTMP listening (import)");
 	notify_ready();
@@ -52,8 +64,14 @@ pub async fn listen_import(origin: moq_net::origin::Producer, addr: SocketAddr, 
 			Request::Publish(publish) => {
 				let origin = origin.clone();
 				let name = name.clone();
+				let bandwidth = bandwidth.clone();
 				tokio::spawn(async move {
-					if let Err(err) = publish.accept(&origin, &name).await {
+					if let Err(err) = publish
+						.with_max_age(max_age)
+						.with_bandwidth(bandwidth)
+						.accept(&origin, &name)
+						.await
+					{
 						tracing::warn!(%name, %err, "RTMP ingest ended with error");
 					}
 				});
@@ -75,7 +93,7 @@ pub async fn listen_export(
 	origin: moq_net::origin::Consumer,
 	addr: SocketAddr,
 	name: String,
-	latency: Duration,
+	max_age: Duration,
 ) -> anyhow::Result<()> {
 	let mut server = Server::bind(addr).await?;
 	tracing::info!(%addr, %name, "RTMP listening (export)");
@@ -87,7 +105,7 @@ pub async fn listen_export(
 				let origin = origin.clone();
 				let name = name.clone();
 				tokio::spawn(async move {
-					if let Err(err) = play.with_latency(latency).accept(&origin, &name).await {
+					if let Err(err) = play.with_max_age(max_age).accept(&origin, &name).await {
 						tracing::warn!(%name, %err, "RTMP play ended with error");
 					}
 				});
@@ -106,15 +124,19 @@ pub async fn listen_export(
 	Ok(())
 }
 
-/// Dial a remote RTMP server and pull its play into the Origin under `name` (import).
-pub async fn connect_import(origin: moq_net::origin::Producer, url: Url, name: String) -> anyhow::Result<()> {
+/// Dial a remote RTMP server and pull its play into the Origin under `target.name` (import).
+pub async fn connect_import(target: ImportTarget, url: Url) -> anyhow::Result<()> {
 	let (addr, app, key) = parse_url(&url).await?;
+	let name = &target.name;
 	// The stream key is the ingest credential, so log the dial target and app instead.
 	tracing::info!(%addr, %app, %name, "RTMP client pulling");
 	notify_ready();
 
-	let client = Client::connect(addr, &app).await?;
-	Ok(client.pull(&key, &origin, &name).await?)
+	let client = Client::connect(addr, &app)
+		.await?
+		.with_import_max_age(target.max_age)
+		.with_import_bandwidth(target.bandwidth);
+	Ok(client.pull(&key, &target.origin, name).await?)
 }
 
 /// Push a broadcast from the Origin to a remote RTMP server (export).
@@ -122,13 +144,13 @@ pub async fn connect_export(
 	origin: moq_net::origin::Consumer,
 	url: Url,
 	name: String,
-	latency: Duration,
+	max_age: Duration,
 ) -> anyhow::Result<()> {
 	let (addr, app, key) = parse_url(&url).await?;
 	// Confirm the broadcast is reachable (and wait for it to be announced) before dialing;
 	// the FLV export re-resolves it (and any referenced sibling broadcast) through the origin.
 	origin
-		.announced_broadcast(&name)
+		.routed(&name)
 		.await
 		.with_context(|| format!("origin closed before broadcast `{name}` was announced"))?;
 
@@ -136,7 +158,7 @@ pub async fn connect_export(
 	tracing::info!(%addr, %app, %name, "RTMP client pushing");
 	notify_ready();
 
-	let client = Client::connect(addr, &app).await?.with_latency(latency);
+	let client = Client::connect(addr, &app).await?.with_export_max_age(max_age);
 	Ok(client.publish(&key, origin, &name).await?)
 }
 

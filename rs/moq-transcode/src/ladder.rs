@@ -13,12 +13,12 @@ pub struct Rung {
 
 	/// The configured maximum in bits per second: the CBR target advertised in the
 	/// derivative catalog.
-	pub bitrate: u64,
+	pub bitrate: moq_net::bandwidth::Rate,
 }
 
 impl Rung {
 	/// A rung at `height` pixels and `bitrate` bits per second.
-	pub fn new(height: u32, bitrate: u64) -> Self {
+	pub fn new(height: u32, bitrate: moq_net::bandwidth::Rate) -> Self {
 		Self { height, bitrate }
 	}
 }
@@ -88,10 +88,10 @@ impl Ladder {
 	pub fn new(rungs: impl IntoIterator<Item = Rung>) -> Result<Self, Error> {
 		let mut rungs: Vec<Rung> = rungs.into_iter().collect();
 		for rung in &mut rungs {
-			if rung.height < 2 || rung.bitrate == 0 {
+			if rung.height < 2 || rung.bitrate.as_bps() == 0 {
 				return Err(Error::Empty {
 					height: rung.height,
-					bitrate: rung.bitrate,
+					bitrate: rung.bitrate.as_bps(),
 				});
 			}
 			// Normalize before checking uniqueness: odd heights can share a track name.
@@ -104,7 +104,7 @@ impl Ladder {
 			let (below, rung) = (pair[0], pair[1]);
 			if below.bitrate == rung.bitrate {
 				return Err(Error::DuplicateBitrate {
-					bitrate: rung.bitrate,
+					bitrate: rung.bitrate.as_bps(),
 					first: below.height,
 					second: rung.height,
 				});
@@ -112,9 +112,9 @@ impl Ladder {
 			if rung.height <= below.height {
 				return Err(Error::Unordered {
 					height: rung.height,
-					bitrate: rung.bitrate,
+					bitrate: rung.bitrate.as_bps(),
 					below_height: below.height,
-					below_bitrate: below.bitrate,
+					below_bitrate: below.bitrate.as_bps(),
 				});
 			}
 		}
@@ -133,11 +133,11 @@ impl Default for Ladder {
 	/// so only strictly-lower renditions are offered.
 	fn default() -> Self {
 		Self::new([
-			Rung::new(240, 350_000),
-			Rung::new(360, 600_000),
-			Rung::new(480, 1_200_000),
-			Rung::new(720, 2_500_000),
-			Rung::new(1080, 5_000_000),
+			Rung::new(240, moq_net::bandwidth::Rate::from_bps(350_000)),
+			Rung::new(360, moq_net::bandwidth::Rate::from_bps(600_000)),
+			Rung::new(480, moq_net::bandwidth::Rate::from_bps(1_200_000)),
+			Rung::new(720, moq_net::bandwidth::Rate::from_bps(2_500_000)),
+			Rung::new(1080, moq_net::bandwidth::Rate::from_bps(5_000_000)),
 		])
 		.expect("the default ladder is ordered")
 	}
@@ -162,22 +162,26 @@ mod tests {
 	#[test]
 	fn custom_ladder_out_of_order() {
 		let ladder = Ladder::new([
-			Rung::new(720, 2_500_000),
-			Rung::new(240, 350_000),
-			Rung::new(480, 1_200_000),
+			Rung::new(720, moq_net::bandwidth::Rate::from_bps(2_500_000)),
+			Rung::new(240, moq_net::bandwidth::Rate::from_bps(350_000)),
+			Rung::new(480, moq_net::bandwidth::Rate::from_bps(1_200_000)),
 		])
 		.unwrap();
 		assert_eq!(heights(&ladder), [240, 480, 720]);
 		// The neighbour is the next rendition down, which is what the band
 		// formula reads.
-		assert_eq!(ladder.rungs()[1].bitrate, 1_200_000);
-		assert_eq!(ladder.rungs()[0].bitrate, 350_000);
+		assert_eq!(ladder.rungs()[1].bitrate.as_bps(), 1_200_000);
+		assert_eq!(ladder.rungs()[0].bitrate.as_bps(), 350_000);
 	}
 
 	/// Two rungs at one maximum: neither is the lower, so there is no ladder.
 	#[test]
 	fn duplicate_ceiling_is_refused() {
-		let err = Ladder::new([Rung::new(720, 2_500_000), Rung::new(480, 2_500_000)]).unwrap_err();
+		let err = Ladder::new([
+			Rung::new(720, moq_net::bandwidth::Rate::from_bps(2_500_000)),
+			Rung::new(480, moq_net::bandwidth::Rate::from_bps(2_500_000)),
+		])
+		.unwrap_err();
 		assert_eq!(
 			err,
 			Error::DuplicateBitrate {
@@ -193,7 +197,11 @@ mod tests {
 	/// "next lower rendition", so it is refused too.
 	#[test]
 	fn duplicate_height_is_refused() {
-		let err = Ladder::new([Rung::new(721, 2_500_000), Rung::new(720, 1_200_000)]).unwrap_err();
+		let err = Ladder::new([
+			Rung::new(721, moq_net::bandwidth::Rate::from_bps(2_500_000)),
+			Rung::new(720, moq_net::bandwidth::Rate::from_bps(1_200_000)),
+		])
+		.unwrap_err();
 		assert_eq!(
 			err,
 			Error::Unordered {
@@ -209,7 +217,11 @@ mod tests {
 	/// which rendition is lower, and guessing either one mis-ranks the ladder.
 	#[test]
 	fn resolution_inversion_is_refused() {
-		let err = Ladder::new([Rung::new(1080, 1_000_000), Rung::new(360, 3_000_000)]).unwrap_err();
+		let err = Ladder::new([
+			Rung::new(1080, moq_net::bandwidth::Rate::from_bps(1_000_000)),
+			Rung::new(360, moq_net::bandwidth::Rate::from_bps(3_000_000)),
+		])
+		.unwrap_err();
 		assert_eq!(
 			err,
 			Error::Unordered {
@@ -224,14 +236,14 @@ mod tests {
 	#[test]
 	fn rung_without_a_rendition_is_refused() {
 		assert_eq!(
-			Ladder::new([Rung::new(1, 350_000)]).unwrap_err(),
+			Ladder::new([Rung::new(1, moq_net::bandwidth::Rate::from_bps(350_000))]).unwrap_err(),
 			Error::Empty {
 				height: 1,
 				bitrate: 350_000
 			}
 		);
 		assert_eq!(
-			Ladder::new([Rung::new(240, 0)]).unwrap_err(),
+			Ladder::new([Rung::new(240, moq_net::bandwidth::Rate::from_bps(0))]).unwrap_err(),
 			Error::Empty {
 				height: 240,
 				bitrate: 0

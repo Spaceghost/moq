@@ -10,7 +10,7 @@ pub(crate) struct Live {
 	pub(crate) track: crate::container::Producer<crate::catalog::hang::Container>,
 	pub(crate) catalog: crate::catalog::Producer,
 	consumer: moq_net::broadcast::Consumer,
-	_broadcast: moq_net::broadcast::Producer,
+	broadcast: moq_net::broadcast::Producer,
 }
 
 impl Live {
@@ -18,17 +18,45 @@ impl Live {
 	pub(crate) fn new(name: &str, insert: impl FnOnce(&mut crate::catalog::Producer, String)) -> Self {
 		let mut broadcast = moq_net::broadcast::Info::new().produce();
 		let consumer = broadcast.consume();
-		let mut catalog = crate::catalog::Producer::new(&mut broadcast).unwrap();
+		let mut catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
 		let track = broadcast
-			.create_track(broadcast.unique_name(name), hang::container::track_info())
+			.create_track(
+				broadcast.unique_name(name),
+				hang::container::track_info(hang::catalog::PRIORITY.video),
+			)
 			.unwrap();
 		insert(&mut catalog, track.name().to_string());
+		let kind = if catalog.modify().unwrap().video.renditions.contains_key(track.name()) {
+			crate::container::Kind::Video
+		} else {
+			crate::container::Kind::Audio
+		};
+		let format = crate::catalog::hang::Container::Legacy(kind);
 		Self {
-			track: crate::container::Producer::new(track, crate::catalog::hang::Container::Legacy),
+			track: crate::container::Producer::new(track, format),
 			catalog,
 			consumer,
-			_broadcast: broadcast,
+			broadcast,
 		}
+	}
+
+	/// Add another track named `name` to the same broadcast, with `insert`
+	/// registering its catalog rendition. Used to build an A/V broadcast.
+	pub(crate) fn add_track(
+		&mut self,
+		name: &str,
+		insert: impl FnOnce(&mut crate::catalog::Producer, String),
+	) -> crate::container::Producer<crate::catalog::hang::Container> {
+		let name = self.broadcast.unique_name(name);
+		let track = self
+			.broadcast
+			.create_track(name, hang::container::track_info(hang::catalog::PRIORITY.audio))
+			.unwrap();
+		insert(&mut self.catalog, track.name().to_string());
+		crate::container::Producer::new(
+			track,
+			crate::catalog::hang::Container::Legacy(crate::container::Kind::Data),
+		)
 	}
 
 	/// One Avc3-shape H.264 rendition (320x240 at 30 fps).
@@ -44,7 +72,7 @@ impl Live {
 			config.coded_height = Some(240);
 			config.framerate = Some(30.0);
 			config.container = Container::Legacy;
-			catalog.lock().video.renditions.insert(name, config);
+			catalog.modify().unwrap().video.renditions.insert(name, config);
 		})
 	}
 
@@ -52,7 +80,7 @@ impl Live {
 	pub(crate) fn audio(mut config: AudioConfig) -> Self {
 		config.container = Container::Legacy;
 		Self::new(".audio", |catalog, name| {
-			catalog.lock().audio.renditions.insert(name, config);
+			catalog.modify().unwrap().audio.renditions.insert(name, config);
 		})
 	}
 
@@ -61,7 +89,8 @@ impl Live {
 	}
 
 	pub(crate) async fn catalog_stream(&self) -> crate::catalog::Consumer {
-		crate::catalog::Consumer::<()>::new(&self.consumer, crate::catalog::CatalogFormat::Hang)
+		self.source()
+			.catalog::<()>(crate::catalog::CatalogFormat::Hang)
 			.await
 			.expect("catalog consumer")
 	}

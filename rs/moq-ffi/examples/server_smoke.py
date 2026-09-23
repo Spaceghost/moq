@@ -7,7 +7,7 @@ Usage:
 
     # Build the cdylib and generate the Python bindings.
     cargo build --release --package moq-ffi
-    cargo run --bin uniffi-bindgen -- generate \
+    cargo run --package uniffi-bindgen -- generate \
         --library target/release/libmoq_ffi.so \
         --language python --out-dir target/py-bindings
 
@@ -41,7 +41,7 @@ async def main() -> int:
     accept_task = asyncio.create_task(accept_one())
 
     client = moq.MoqClient()
-    client.set_tls_disable_verify(True)
+    client.set_tls_verify(False)
     client.set_bind("127.0.0.1:0")
 
     client_session = await client.connect(f"https://{addr}")

@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use hang::catalog::{AudioCodec, VideoCodecKind};
+use moq_mux::catalog::Stream;
 use moq_mux::catalog::hang::Catalog;
 use str0m::format::Codec;
 use str0m::media::{Frequency, MediaTime, Mid, Pt};
@@ -105,18 +106,8 @@ impl EgressSource {
 	/// caller hands `EgressSource` to [`Session::egress`](crate::session::Session::egress)
 	/// which takes the receiver via [`Self::take_writes`].
 	pub async fn new(source: moq_mux::Source) -> Result<Self> {
-		let catalog_track = source
-			.broadcast()
-			.await?
-			.track(hang::Catalog::DEFAULT_NAME)?
-			.subscribe(hang::Catalog::default_subscription())
-			.await?;
-		let mut consumer = moq_mux::catalog::hang::Consumer::new(catalog_track);
-		let catalog = consumer
-			.next()
-			.await
-			.map_err(|err| Error::Other(anyhow::anyhow!("catalog subscribe: {err}")))?
-			.ok_or_else(|| Error::Other(anyhow::anyhow!("catalog closed before first snapshot")))?;
+		let mut consumer = source.catalog::<()>(moq_mux::catalog::CatalogFormat::Hang).await?;
+		let catalog = consumer.next().await?.ok_or(Error::CatalogClosed)?;
 
 		let (tx, rx) = mpsc::channel(64);
 		Ok(Self {
@@ -197,7 +188,7 @@ impl EgressSource {
 	}
 }
 
-fn valid_reference(source: &moq_mux::Source, broadcast: Option<&moq_net::PathRelative<'_>>) -> bool {
+fn valid_reference(source: &moq_mux::Source, broadcast: Option<&moq_net::path::Relative<'_>>) -> bool {
 	source.resolve_reference(broadcast).is_some()
 }
 
@@ -303,18 +294,31 @@ pub fn dispatch(rtc: &mut str0m::Rtc, request: WriteRequest, wallclock: Instant)
 
 #[cfg(test)]
 mod tests {
+	/// Build an origin producer, spawning its driver on the ambient runtime.
+	fn produce_origin() -> moq_net::origin::Producer {
+		let (producer, driver) = moq_net::origin::Producer::new(moq_net::origin::Config::default());
+		if tokio::runtime::Handle::try_current().is_ok() {
+			tokio::spawn(moq_net::time::run(driver));
+		} else {
+			// A sync test: nothing polls the driver, and dropping it would tear
+			// the origin down, so leak it and rely on the synchronous half.
+			std::mem::forget(driver);
+		}
+		producer
+	}
+
 	use super::*;
 	use hang::catalog::{AudioConfig, H264, VideoCodec, VideoConfig};
-	use moq_net::{Origin, PathRelative};
+	use moq_net::path::Relative;
 
 	#[test]
 	fn catalog_codecs_ignores_codecs_available_only_via_escaping_references() {
-		let origin = Origin::random().produce();
+		let origin = produce_origin();
 		let source = moq_mux::Source::new(origin.consume(), "a/pub");
 		let mut catalog = Catalog::default();
 
 		let mut escaped_audio = AudioConfig::new(AudioCodec::Opus, 48_000, 2);
-		escaped_audio.broadcast = Some(PathRelative::new("../../source").to_owned());
+		escaped_audio.broadcast = Some(Relative::new("../../source").to_owned());
 		catalog.audio.renditions.insert("opus".to_string(), escaped_audio);
 
 		let mut escaped_video = VideoConfig::new(H264 {
@@ -323,11 +327,11 @@ mod tests {
 			level: 0x1e,
 			inline: false,
 		});
-		escaped_video.broadcast = Some(PathRelative::new("../../source").to_owned());
+		escaped_video.broadcast = Some(Relative::new("../../source").to_owned());
 		catalog.video.renditions.insert("h264".to_string(), escaped_video);
 
 		let mut valid_video = VideoConfig::new(VideoCodec::VP8);
-		valid_video.broadcast = Some(PathRelative::new("./source").to_owned());
+		valid_video.broadcast = Some(Relative::new("./source").to_owned());
 		catalog.video.renditions.insert("vp8".to_string(), valid_video);
 
 		let (writes_tx, writes_rx) = mpsc::channel(1);

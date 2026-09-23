@@ -6,12 +6,12 @@ Real-time pub/sub with built-in caching, fan-out, and prioritization.
 from moq_ffi import MoqError as Error
 
 from .client import Client, connect
-from .errors import is_auth, is_shutdown
+from .errors import is_auth, is_shutdown, protocol_error
 from .log import log_level
 from .origin import (
-    Announced,
+    AnnounceConsumer,
     AnnouncedBroadcast,
-    Announcement,
+    AnnounceUpdate,
     BroadcastRequest,
     OriginConsumer,
     OriginDynamic,
@@ -21,6 +21,8 @@ from .publish import (
     AudioProducer,
     BroadcastDynamic,
     BroadcastProducer,
+    ContainerProducer,
+    ContainerStreamProducer,
     GroupProducer,
     GroupRequest,
     JsonSnapshotProducer,
@@ -33,7 +35,7 @@ from .publish import (
     VideoProducer,
 )
 from .server import Request, Server, Transport
-from .session import Session
+from .session import Bandwidth, Reservation, Session
 from .subscribe import (
     AudioConsumer,
     BroadcastConsumer,
@@ -43,8 +45,8 @@ from .subscribe import (
     JsonStreamConsumer,
     MediaConsumer,
     MediaGroupConsumer,
-    RouteWatch,
     TrackConsumer,
+    VideoConsumer,
 )
 from .types import (
     Audio,
@@ -54,22 +56,32 @@ from .types import (
     AudioEncoderOutput,
     AudioFormat,
     AudioFrame,
+    AudioSampleFormat,
+    Backoff,
     Catalog,
     ConnectionStats,
+    ConnectionStatus,
     Container,
+    ContainerFormat,
     Datagram,
     Dimensions,
+    ErrorScope,
     FetchGroupOptions,
     Frame,
     MediaFrame,
+    ProtocolError,
+    ProtocolKind,
     Route,
     Subscription,
     TrackInfo,
     Video,
     VideoCodec,
+    VideoDecodedFrame,
+    VideoDecoderOutput,
     VideoEncoderInput,
     VideoEncoderKind,
     VideoEncoderOutput,
+    VideoFormat,
     VideoFrame,
     VideoHint,
     VideoPixelFormat,
@@ -77,9 +89,9 @@ from .types import (
 )
 
 __all__ = [
-    "Announced",
+    "AnnounceConsumer",
     "AnnouncedBroadcast",
-    "Announcement",
+    "AnnounceUpdate",
     "Audio",
     "AudioCodec",
     "AudioConsumer",
@@ -87,8 +99,15 @@ __all__ = [
     "AudioEncoderInput",
     "AudioEncoderOutput",
     "AudioFormat",
+    "AudioSampleFormat",
+    "VideoFormat",
+    "ContainerFormat",
+    "ContainerProducer",
+    "ContainerStreamProducer",
     "AudioFrame",
     "AudioProducer",
+    "Backoff",
+    "Bandwidth",
     "BroadcastConsumer",
     "BroadcastDynamic",
     "BroadcastProducer",
@@ -97,11 +116,15 @@ __all__ = [
     "CatalogConsumer",
     "Client",
     "ConnectionStats",
+    "ConnectionStatus",
     "Container",
     "Datagram",
     "Dimensions",
     "Error",
+    "ErrorScope",
     "Frame",
+    "ProtocolError",
+    "ProtocolKind",
     "MediaFrame",
     "FetchGroupOptions",
     "GroupConsumer",
@@ -119,8 +142,8 @@ __all__ = [
     "OriginDynamic",
     "OriginProducer",
     "Request",
+    "Reservation",
     "Route",
-    "RouteWatch",
     "Server",
     "Session",
     "Subscription",
@@ -136,6 +159,9 @@ __all__ = [
     "VideoEncoderKind",
     "VideoEncoderOutput",
     "VideoFrame",
+    "VideoConsumer",
+    "VideoDecodedFrame",
+    "VideoDecoderOutput",
     "VideoHint",
     "VideoPixelFormat",
     "VideoProducer",
@@ -144,4 +170,5 @@ __all__ = [
     "is_auth",
     "is_shutdown",
     "log_level",
+    "protocol_error",
 ]

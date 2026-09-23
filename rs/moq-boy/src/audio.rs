@@ -12,9 +12,8 @@ use anyhow::Result;
 use bytes::Bytes;
 
 /// The Game Boy APU outputs stereo audio.
-const CHANNELS: u32 = 2;
 /// 64 kbps is reasonable for stereo Game Boy audio (simple waveforms).
-const OPUS_BITRATE: u32 = 64_000;
+const OPUS_BITRATE: moq_net::bandwidth::Rate = moq_net::bandwidth::Rate::from_kbps(64);
 
 pub struct AudioEncoder {
 	producer: moq_audio::encode::Producer,
@@ -26,21 +25,19 @@ impl AudioEncoder {
 		catalog: moq_mux::catalog::Producer,
 		input_sample_rate: u32,
 	) -> Result<Self> {
-		let input = moq_audio::encode::Input {
-			format: moq_audio::Format::S16,
-			sample_rate: input_sample_rate,
-			channels: CHANNELS,
-		};
+		let mut input = moq_audio::encode::Input::new(input_sample_rate, moq_audio::Layout::Stereo);
+		input.format = moq_audio::Format::S16;
 		let mut options = moq_audio::encode::Options::default();
 		options.track = Some("audio".to_string());
-		options.bitrate = Some(OPUS_BITRATE);
+		options.settings = moq_audio::encode::Settings::from_input(moq_audio::encode::Codec::Opus, &input);
+		options.settings.bitrate = Some(OPUS_BITRATE);
 
 		let producer = moq_audio::encode::Producer::new(&mut broadcast, catalog, input, &options)?;
 		Ok(Self { producer })
 	}
 
-	pub fn track(&self) -> &moq_net::track::Producer {
-		self.producer.track()
+	pub fn demand(&self) -> moq_net::track::Demand {
+		self.producer.demand()
 	}
 
 	/// Re-anchor the timeline so a pause gap shows up in the audio PTS.
@@ -48,7 +45,7 @@ impl AudioEncoder {
 		self.producer.reset_epoch();
 	}
 
-	/// Publish an empty group marking the pause, so the gap the re-anchored epoch is about
+	/// Publish a marker group marking the pause, so the gap the re-anchored epoch is about
 	/// to open reads as a break rather than one very long packet.
 	pub fn discontinuity(&mut self) -> Result<()> {
 		self.producer.discontinuity()?;

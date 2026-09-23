@@ -1,6 +1,5 @@
 import * as Catalog from "@moq/hang/catalog";
 import * as Container from "@moq/hang/container";
-import * as Util from "@moq/hang/util";
 import type * as Moq from "@moq/net";
 import { Time } from "@moq/net";
 import {
@@ -14,8 +13,9 @@ import {
 	Signal,
 } from "@moq/signals";
 import type { Broadcast } from "../broadcast";
+import { hardwareReliable } from "../support/video";
 import type { Capture } from "./capture";
-import type { Source } from "./types";
+import { normalizeSource, type Source } from "./types";
 
 /** Cumulative encoder output totals, measured from the chunks the encoder produces. */
 export interface Stats {
@@ -36,7 +36,7 @@ export interface Config {
 	codec?: string;
 
 	// Constrain the encoded width/height in pixels. If unset, source width.max and height.max
-	// constraints provide the cap when both are present.
+	// constraints provide the cap when both are present; otherwise screens default to logical pixels.
 	maxPixels?: number;
 
 	// Cap the encoded resolution to this fraction of the source pixel count.
@@ -62,7 +62,7 @@ export interface Config {
 
 // Signals the encoder reads.
 export type EncoderInput = {
-	// Whether to publish (and encode) this rendition. When false the rendition drops out of the
+	// Whether to publish (and encode) this rendition. Defaults to true. When false the rendition drops out of the
 	// catalog and stops encoding, but stays registered so a subscriber still gets an idle track.
 	enabled: Getter<boolean>;
 
@@ -73,9 +73,9 @@ export type EncoderInput = {
 	// The capture pipeline supplying frames and the source track.
 	capture: Getter<Capture | undefined>;
 
-	// Estimated send bandwidth cap in bits/sec. Caps the bitrate (with a safety margin) only when no
-	// explicit maxBitrate is set.
-	bandwidth: Getter<number | undefined>;
+	// The connection's bandwidth allocator. The encoder reserves its ceiling and
+	// follows the grant instead of the whole-session estimate.
+	bandwidth: Getter<Moq.Bandwidth.Handle | undefined>;
 };
 
 /** Constructor options: the wired inputs plus the live-editable {@link Config} tuning knobs. */
@@ -112,6 +112,16 @@ export class Encoder {
 	/** The live-editable encoder tuning knobs (codec, dimensions, bitrate, frame rate). */
 	config: Signal<Config | undefined>;
 
+	/**
+	 * The capture supplying this rendition, or undefined while none is wired.
+	 *
+	 * A snapshot. Read {@link in}.capture through an effect instead when you need to react to it
+	 * being swapped.
+	 */
+	get capture(): Capture | undefined {
+		return this.in.capture.peek();
+	}
+
 	readonly #out: EncoderOutput = {
 		catalog: new Signal<Catalog.VideoConfig | undefined>(undefined),
 		resolved: new Signal<VideoEncoderConfig | undefined>(undefined),
@@ -126,16 +136,27 @@ export class Encoder {
 	// The codec the browser will actually encode with, tagged with the inputs it was probed against.
 	#codec = new Signal<Detected | undefined>(undefined);
 
+	// Uncapped target bitrate (pixels, maxBitrate), the reservation's ceiling.
+	#ceiling = new Signal<number | undefined>(undefined);
+
+	// This rendition's claim on the connection, held while a track is live.
+	#reservation = new Signal<Moq.Bandwidth.Reservation | undefined>(undefined);
+
 	// Only the codec prefix the user asked for, narrowed out of `config` so tuning any other knob
 	// doesn't re-probe the hardware.
 	#codecFilter: Computed<string>;
 
 	#signals = new Effect();
+	#stalled = new Catalog.Stalled.Detector();
+	#firstCaptured?: Time.Micro;
+	#lastCaptured?: Time.Micro;
+	#lastAccepted?: Time.Micro;
+	#lastCaptureWall?: number;
 
 	constructor(name: string, props?: EncoderProps) {
 		this.name = name;
 		this.in = {
-			enabled: getter(props?.enabled ?? false),
+			enabled: getter(props?.enabled ?? true),
 			broadcast: getter(props?.broadcast),
 			capture: getter(props?.capture),
 			bandwidth: getter(props?.bandwidth),
@@ -167,19 +188,59 @@ export class Encoder {
 			const enabled = effect.get(this.in.enabled);
 			const track = effect.get(rendition.track);
 			effect.set(this.#out.active, enabled && !!track, false);
-			if (!enabled || !track) return;
+			if (!enabled || !track) {
+				this.#observe({ demand: false, idle: true });
+				return;
+			}
 
 			this.#encode(track, effect);
+		});
+
+		// Reserve against the connection for as long as this track is live. Wait
+		// for a ceiling so we never claim 0 and starve siblings for a tick. The
+		// allocator ignores an idle track, and closing the reservation hands the
+		// room to siblings.
+		effect.run((effect) => {
+			const enabled = effect.get(this.in.enabled);
+			const track = effect.get(rendition.track);
+			const allocator = effect.get(this.in.bandwidth);
+			if (!enabled || !track || !allocator) return;
+
+			let reservation: Moq.Bandwidth.Reservation | undefined;
+			effect.subscribe(this.#ceiling, (ceiling) => {
+				if (ceiling === undefined) return;
+				if (!reservation) {
+					reservation = allocator.reserve(track, ceiling);
+					this.#reservation.set(reservation);
+				} else {
+					reservation.update(ceiling);
+				}
+			});
+			effect.cleanup(() => {
+				reservation?.close();
+				if (this.#reservation.peek() === reservation) this.#reservation.set(undefined);
+			});
 		});
 	}
 
 	// Encode captured frames into the track producer, reconfiguring when the resolved config changes.
 	#encode(track: Moq.Track.Producer, effect: Effect): void {
 		const capture = effect.get(this.in.capture);
-		if (!capture) return;
+		if (!capture) {
+			this.#observe({ demand: true, idle: true });
+			return;
+		}
 
-		const producer = new Container.Legacy.Producer(track);
-		effect.cleanup(() => producer.close());
+		this.#observe({ demand: false, idle: true });
+		this.#lastCaptureWall = performance.now();
+
+		const producer = new Container.Legacy.Producer(track, new Container.Legacy.Format("video"));
+		// The broadcast owns this static track across demand gaps. End only the current
+		// group when demand disappears so a later subscriber can resume on the same track.
+		// A fatal encoder error still aborts the track through producer.close(err) below.
+		effect.cleanup(() => {
+			if (track.closed.peek() === undefined) producer.cut();
+		});
 
 		let lastKeyframe: Time.Micro | undefined;
 		let lastEncoded: Time.Micro | undefined;
@@ -199,6 +260,8 @@ export class Encoder {
 					}));
 
 					producer.encode(frame, frame.timestamp as Time.Micro, key);
+					this.#lastAccepted = frame.timestamp as Time.Micro;
+					this.#observe({ demand: true, idle: false, frame: true });
 				},
 				error: (err: Error) => {
 					producer.close(err);
@@ -215,35 +278,96 @@ export class Encoder {
 			});
 
 			effect.run((effect) => {
-				const frame = effect.get(capture.out.frame);
-				if (!frame) return;
+				const fanout = effect.get(capture.out.frames);
+				if (!fanout) return;
 
-				if (encoder.state !== "configured") return;
+				// Our own stream off the shared capture, so the preview or another rendition reading
+				// slowly can't take frames from this one.
+				const reader = fanout.subscribe(effect).getReader();
+				effect.cleanup(() => {
+					reader.cancel().catch(() => {});
+				});
 
-				// This doesn't need to be reactive.
-				const config = this.config.peek();
+				effect.spawn(async () => {
+					for (;;) {
+						const next = await Promise.race([reader.read(), effect.cancel]);
+						if (!next?.value) break;
 
-				// Pace to the target frame rate by dropping frames that arrive too soon.
-				// Allow half an interval of slack so jittery capture timestamps don't drop a frame we meant to keep.
-				// The shared frame Signal owner closes frames, so we just skip encoding here.
-				const targetFrameRate = config?.frameRate;
-				if (targetFrameRate && lastEncoded !== undefined) {
-					const minGap = Time.Micro.fromSecond((1 / targetFrameRate) as Time.Second);
-					if (frame.timestamp - lastEncoded < minGap - minGap / 2) return;
-				}
-				lastEncoded = frame.timestamp as Time.Micro;
+						// Ours now: every path below has to close it.
+						const frame = next.value;
+						try {
+							if (encoder.state !== "configured") continue;
 
-				const interval = config?.keyframeInterval ?? Time.Milli.fromSecond(2 as Time.Second);
+							// This doesn't need to be reactive.
+							const config = this.config.peek();
 
-				// Force a keyframe if this is the first frame (no group yet), or GOP elapsed.
-				const keyFrame = !lastKeyframe || lastKeyframe + Time.Micro.fromMilli(interval) <= frame.timestamp;
-				if (keyFrame) {
-					lastKeyframe = frame.timestamp as Time.Micro;
-				}
+							// Pace to the target frame rate by dropping frames that arrive too soon.
+							// Allow half an interval of slack so jittery capture timestamps don't drop
+							// a frame we meant to keep.
+							const targetFrameRate = config?.frameRate;
+							if (targetFrameRate && lastEncoded !== undefined) {
+								const minGap = Time.Micro.fromSecond((1 / targetFrameRate) as Time.Second);
+								if (frame.timestamp - lastEncoded < minGap - minGap / 2) continue;
+							}
+							lastEncoded = frame.timestamp as Time.Micro;
+							const captured = frame.timestamp as Time.Micro;
+							this.#firstCaptured ??= captured;
+							this.#lastCaptured = captured;
+							this.#lastCaptureWall = performance.now();
+							this.#observe({ demand: true, idle: false });
 
-				encoder.encode(frame, { keyFrame });
+							const interval = config?.keyframeInterval ?? Time.Milli.fromSecond(2 as Time.Second);
+
+							// Force a keyframe if this is the first frame (no group yet), or GOP elapsed.
+							const keyFrame =
+								!lastKeyframe || lastKeyframe + Time.Micro.fromMilli(interval) <= frame.timestamp;
+							if (keyFrame) {
+								lastKeyframe = frame.timestamp as Time.Micro;
+							}
+
+							encoder.encode(frame, { keyFrame });
+						} finally {
+							frame.close();
+						}
+					}
+				});
 			});
 		});
+
+		effect.interval(() => this.#observe({ demand: true, idle: false }), 50);
+	}
+
+	#observe(state: { demand: boolean; idle: boolean; frame?: boolean }): void {
+		if (state.idle) {
+			this.#firstCaptured = undefined;
+			this.#lastCaptured = undefined;
+			this.#lastAccepted = undefined;
+			this.#lastCaptureWall = undefined;
+		}
+		const catalog = this.#out.catalog.peek();
+		const mediaLag = ((): Time.Micro => {
+			if (this.#lastCaptured === undefined || this.#firstCaptured === undefined) return 0 as Time.Micro;
+			const accepted = this.#lastAccepted ?? this.#firstCaptured;
+			return Math.max(0, this.#lastCaptured - accepted) as Time.Micro;
+		})();
+		const quiet =
+			this.#lastCaptureWall === undefined
+				? (0 as Time.Micro)
+				: Time.Micro.fromMilli((performance.now() - this.#lastCaptureWall) as Time.Milli);
+		if (
+			!this.#stalled.observe({
+				frame: state.frame ?? false,
+				mediaLag,
+				quiet,
+				interval: Catalog.Stalled.intervalFromFps(catalog?.framerate ?? this.out.resolved.peek()?.framerate),
+				demand: state.demand,
+				idle: state.idle,
+			})
+		) {
+			return;
+		}
+		if (!catalog) return;
+		this.#out.catalog.set({ ...catalog, stalled: this.#stalled.flag() });
 	}
 
 	// Returns the catalog for the configured settings, or undefined while disabled / unresolved.
@@ -265,6 +389,7 @@ export class Encoder {
 			container: { kind: "legacy" } as const,
 			// Each frame is flushed immediately, so the jitter is one frame duration.
 			jitter: config.framerate ? Catalog.u53(Math.ceil(1000 / config.framerate)) : undefined,
+			stalled: this.#stalled.flag(),
 		};
 
 		effect.set(this.#out.catalog, catalog);
@@ -318,14 +443,11 @@ export class Encoder {
 		if (detected.width !== dimensions.width || detected.height !== dimensions.height) return;
 
 		const { codec, hardwareAcceleration } = detected;
-
-		const settings = source.getSettings();
-
 		// Get the user provided config.
 		const user = effect.get(this.config) ?? {};
 
 		// Prefer the explicitly requested rate; the encode loop drops frames to enforce it.
-		const framerate = user.frameRate ?? settings.frameRate ?? 30;
+		const framerate = user.frameRate ?? sourceFrameRate(source) ?? 30;
 
 		const maxPixels = user.maxPixels ?? dimensions.width * dimensions.height;
 		const bitrateScale = user.bitrateScale ?? 0.07;
@@ -354,14 +476,16 @@ export class Encoder {
 
 		bitrate = Math.round(Math.min(bitrate, user.maxBitrate || bitrate));
 
-		// If no explicit maxBitrate, cap to the estimated send bandwidth (with 90% safety margin).
-		if (!user.maxBitrate) {
-			const estimate = effect.get(this.in.bandwidth);
-			if (estimate != null) {
-				// Reserve ~10% for audio and protocol overhead.
-				const cap = Math.round(estimate * 0.9);
-				bitrate = Math.min(bitrate, cap);
-			}
+		// The reservation's ceiling is what we can ever send, not the grant: a
+		// grant that followed our own output would hand the room away on a still
+		// picture and not have it back when the picture moved.
+		effect.set(this.#ceiling, bitrate);
+
+		const reservation = effect.get(this.#reservation);
+		if (reservation) {
+			const grant = reservation.peek();
+			effect.get(reservation.grant);
+			if (grant != null) bitrate = Math.min(bitrate, grant);
 		}
 
 		const config: VideoEncoderConfig = {
@@ -384,18 +508,24 @@ export class Encoder {
 		const capture = effect.get(this.in.capture);
 		if (!capture) return;
 
-		const frame = effect.get(capture.out.frame);
-		if (!frame) return;
+		// The captured size, rather than a frame: this only needs the dimensions, and holding a frame
+		// here would mean owning and closing it.
+		const display = effect.get(capture.out.display);
+		if (!display) return;
 
 		const source = effect.get(capture.in.source);
 		if (!source) return;
 
 		const user = effect.get(this.config);
 
-		const sourcePixels = frame.codedWidth * frame.codedHeight;
+		const sourcePixels = display.width * display.height;
 
 		// maxPixels caps absolutely; maxScale caps relative to the source. The smaller cap wins.
-		let maxPixels = user?.maxPixels ?? sourceConstraintPixels(source) ?? sourcePixels;
+		let maxPixels =
+			user?.maxPixels ??
+			sourceConstraintPixels(source) ??
+			(user?.maxScale === undefined ? scaledPixels(source, display.scale) : undefined) ??
+			sourcePixels;
 		if (user?.maxScale !== undefined) {
 			if (!Number.isFinite(user.maxScale) || user.maxScale <= 0) {
 				throw new Error(`maxScale must be a finite number greater than 0: ${user.maxScale}`);
@@ -407,8 +537,8 @@ export class Encoder {
 
 		// Make sure width/height is a power of 16
 		// TODO should this be on a per-codec basis?
-		const width = 16 * Math.floor((frame.codedWidth * ratio) / 16);
-		const height = 16 * Math.floor((frame.codedHeight * ratio) / 16);
+		const width = 16 * Math.floor((display.width * ratio) / 16);
+		const height = 16 * Math.floor((display.height * ratio) / 16);
 
 		effect.set(this.#dimensions, { width, height });
 	}
@@ -474,20 +604,14 @@ export class Encoder {
 			// This likely won't work because of licensing issues.
 			"hev1.1.6.L93.B0",
 			"hev1", // Browser's choice
-
-			// AV1
-			// Super expensive to encode so it's our last choice.
-			"av01.0.08M.08",
-			"av01",
 		];
 
 		// Try hardware encoding first.
-		// We can't reliably detect hardware encoding on Firefox: https://github.com/w3c/webcodecs/issues/896
 		// Safari accepts every codec under `prefer-hardware` and echoes the hint straight back, but
 		// VideoToolbox only hardware-encodes H.264 and HEVC. Skip the hardware pass and let it fall
 		// through to the software pass, which is H.264 first, since Safari routes that through
 		// VideoToolbox anyway regardless of the hint.
-		if (!Util.Hacks.isFirefox && !Util.Hacks.isSafari) {
+		if (hardwareReliable()) {
 			for (const codec of HARDWARE_CODECS) {
 				if (!codec.startsWith(required)) continue;
 
@@ -538,6 +662,12 @@ export class Encoder {
 	}
 }
 
+// The source's nominal frame rate: what the capture device settled on, or what a frame stream
+// declared. Undefined when nothing reports one.
+function sourceFrameRate(source: Source): number | undefined {
+	return "frames" in source ? source.frameRate : normalizeSource(source).track.getSettings().frameRate;
+}
+
 // A hardware probe result, carrying the inputs it ran against so a consumer can tell whether it
 // still applies.
 type Detected = {
@@ -563,11 +693,29 @@ function codecBitrateScale(codec: string): number {
 }
 
 function sourceConstraintPixels(source: Source): number | undefined {
-	const constraints = source.getConstraints();
+	// Only a capture track has constraints; a frame stream is whatever size it produces.
+	if ("frames" in source) return undefined;
+
+	const constraints = normalizeSource(source).track.getConstraints();
 	const width = constraintMax(constraints.width);
 	const height = constraintMax(constraints.height);
 
 	return width !== undefined && height !== undefined ? width * height : undefined;
+}
+
+function scaledPixels(source: Source, scale: number | undefined): number | undefined {
+	if ("frames" in source) return;
+	const { track } = normalizeSource(source);
+	if (scale === undefined) return;
+	if (!Number.isFinite(scale) || scale <= 0)
+		throw new Error(`scale must be a finite number greater than 0: ${scale}`);
+
+	// Cap against the native surface, not the current frame, which may already be downscaled.
+	const capabilities = track.getCapabilities();
+	const width = capabilities.width?.max;
+	const height = capabilities.height?.max;
+	if (!width || !height) return;
+	return (width * height) / scale ** 2;
 }
 
 function constraintMax(value: MediaTrackConstraints["width"]): number | undefined {

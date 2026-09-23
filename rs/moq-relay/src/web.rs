@@ -1,17 +1,15 @@
 use std::{
-	future::Future,
 	net,
 	path::PathBuf,
-	pin::Pin,
 	sync::{Arc, atomic::AtomicU64},
-	task::{Context, Poll, ready},
+	task::{Context, Poll},
 };
 
 use anyhow::Context as _;
 use axum::{
 	Router,
 	body::Body,
-	extract::{Extension, Path, Query, State},
+	extract::{ConnectInfo, Extension, Path, Query, State},
 	http::{self, Method, StatusCode},
 	response::{Html, IntoResponse, Response},
 	routing::get,
@@ -21,64 +19,99 @@ use axum_server::{
 	tls_rustls::{RustlsAcceptor, RustlsConfig},
 };
 use bytes::Bytes;
-use clap::Parser;
 use futures::{FutureExt, future::BoxFuture};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_rustls::server::TlsStream;
-use tower_http::cors::{Any, CorsLayer};
 use tower_service::Service;
 
-use crate::{Auth, AuthParams, Cluster};
+use crate::{auth, cluster};
 
 /// Configuration for the HTTP/HTTPS web server.
-#[derive(Parser, Clone, Debug, serde::Deserialize, serde::Serialize, Default)]
+#[derive(usage::Args, Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[usage(unknown_flags = "error", args_override_self = false)]
 #[serde(deny_unknown_fields, default)]
 #[non_exhaustive]
-pub struct WebConfig {
+pub struct Config {
 	/// Plain HTTP listener settings.
-	#[command(flatten)]
+	#[usage(flatten)]
 	#[serde(default)]
-	pub http: HttpConfig,
+	pub http: Http,
 
 	/// HTTPS listener settings with TLS.
-	#[command(flatten)]
+	#[usage(flatten)]
 	#[serde(default)]
-	pub https: HttpsConfig,
+	pub https: Https,
 
 	/// If true (default), expose a WebTransport compatible WebSocket polyfill.
-	#[arg(long = "web-ws", env = "MOQ_WEB_WS", default_value = "true")]
-	#[serde(default = "default_true")]
+	#[usage(
+		long = "web-ws",
+		env = "MOQ_WEB_WS",
+		setting = "web.ws",
+		default = "true",
+		bool_value
+	)]
 	pub ws: bool,
 }
 
+impl Default for Config {
+	fn default() -> Self {
+		Self {
+			http: Http::default(),
+			https: Https::default(),
+			ws: true,
+		}
+	}
+}
+
+impl Config {
+	/// Whether the WebSocket polyfill is served.
+	pub fn resolved_ws(&self) -> bool {
+		self.ws
+	}
+}
+
 /// Plain HTTP listener configuration.
-#[derive(clap::Args, Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[derive(usage::Args, Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[usage(unknown_flags = "error", args_override_self = false)]
 #[serde(deny_unknown_fields, default)]
 #[non_exhaustive]
-pub struct HttpConfig {
+pub struct Http {
 	/// Socket address to bind the HTTP listener to.
-	#[arg(long = "web-http-listen", id = "http-listen", env = "MOQ_WEB_HTTP_LISTEN")]
+	#[usage(
+		long = "web-http-listen",
+		name = "http-listen",
+		env = "MOQ_WEB_HTTP_LISTEN",
+		setting = "web.http.listen"
+	)]
 	pub listen: Option<net::SocketAddr>,
 }
 
 /// HTTPS listener configuration with TLS certificates and keys.
 #[serde_with::serde_as]
-#[derive(clap::Args, Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[derive(usage::Args, Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[usage(unknown_flags = "error", args_override_self = false)]
 #[serde(deny_unknown_fields, default)]
 #[non_exhaustive]
-pub struct HttpsConfig {
+pub struct Https {
 	/// Socket address to bind the HTTPS listener to.
-	#[arg(long = "web-https-listen", id = "web-https-listen", env = "MOQ_WEB_HTTPS_LISTEN", requires_all = ["web-https-cert", "web-https-key"])]
+	#[usage(
+		long = "web-https-listen",
+		name = "web-https-listen",
+		env = "MOQ_WEB_HTTPS_LISTEN",
+		setting = "web.https.listen",
+		requires("--web-https-cert", "--web-https-key")
+	)]
 	pub listen: Option<net::SocketAddr>,
 
 	/// Load the given certificate chain files from disk.
 	///
 	/// In config files, accepts either a single string or a TOML array.
-	#[arg(
+	#[usage(
 		long = "web-https-cert",
-		id = "web-https-cert",
-		value_delimiter = ',',
-		env = "MOQ_WEB_HTTPS_CERT"
+		name = "web-https-cert",
+		delimiter = ',',
+		env = "MOQ_WEB_HTTPS_CERT",
+		setting = "web.https.cert"
 	)]
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	#[serde_as(as = "serde_with::OneOrMany<_>")]
@@ -88,11 +121,12 @@ pub struct HttpsConfig {
 	///
 	/// Each key is paired with the certificate chain at the same index.
 	/// In config files, accepts either a single string or a TOML array.
-	#[arg(
+	#[usage(
 		long = "web-https-key",
-		id = "web-https-key",
-		value_delimiter = ',',
-		env = "MOQ_WEB_HTTPS_KEY"
+		name = "web-https-key",
+		delimiter = ',',
+		env = "MOQ_WEB_HTTPS_KEY",
+		setting = "web.https.key"
 	)]
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	#[serde_as(as = "serde_with::OneOrMany<_>")]
@@ -101,17 +135,18 @@ pub struct HttpsConfig {
 	/// PEM file(s) of root CAs for validating optional client certificates (mTLS).
 	///
 	/// When set, clients *may* present a certificate during the TLS handshake.
-	/// A verified peer is granted full publish/subscribe access scoped to the
-	/// URL path without a JWT, mirroring the QUIC server's `--server-tls-root`
-	/// behavior. Clients that don't present a cert continue through the normal
-	/// JWT path.
+	/// A verified peer is reported to the auth source as [`MtlsPeer`], a fact for
+	/// the server behind `--auth-url` to weigh; it grants nothing on its own, and
+	/// under `--auth-public` the peer gets what any anonymous session gets. Same
+	/// as the QUIC listener's `--listen-tls-root`.
 	///
 	/// In config files, accepts either a single string or a TOML array.
-	#[arg(
+	#[usage(
 		long = "web-https-root",
-		id = "web-https-root",
-		value_delimiter = ',',
-		env = "MOQ_WEB_HTTPS_ROOT"
+		name = "web-https-root",
+		delimiter = ',',
+		env = "MOQ_WEB_HTTPS_ROOT",
+		setting = "web.https.root"
 	)]
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	#[serde_as(as = "serde_with::OneOrMany<_>")]
@@ -122,41 +157,112 @@ pub struct HttpsConfig {
 /// build a [`Web`] from its parts via [`Web::new`] rather than constructing this.
 pub(crate) struct WebState {
 	/// The authenticator for verifying incoming requests.
-	pub(crate) auth: Auth,
+	pub(crate) auth: auth::Auth,
 	/// The cluster state for resolving origins.
-	pub(crate) cluster: Cluster,
+	pub(crate) cluster: cluster::Cluster,
 	/// TLS certificate information served at `/certificate.sha256`.
-	pub(crate) certificates: moq_native::tls::Certificates,
+	pub(crate) certificates: moq_tokio::tls::Certificates,
 	/// Monotonically increasing connection counter for WebSocket sessions.
 	#[cfg_attr(not(feature = "websocket"), allow(dead_code))]
 	pub(crate) conn_id: AtomicU64,
+	/// Relay-wide shutdown broadcast; WebSocket sessions drain with a GOAWAY
+	/// when it fires. Defaults to a handle that never fires.
+	#[cfg_attr(not(feature = "websocket"), allow(dead_code))]
+	pub(crate) shutdown: crate::shutdown::Observer,
+	/// Live sessions on this node, so a WebSocket session is listed and nudged
+	/// like a QUIC one.
+	#[cfg_attr(not(feature = "websocket"), allow(dead_code))]
+	pub(crate) sessions: crate::session::Registry,
+}
+
+/// The bound addresses of the public web listeners.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct Addrs {
+	/// The plain HTTP listener, if configured.
+	pub http: Option<net::SocketAddr>,
+	/// The HTTPS listener, if configured.
+	pub https: Option<net::SocketAddr>,
 }
 
 /// Run a HTTP server using Axum
 pub struct Web {
 	state: Arc<WebState>,
-	config: WebConfig,
+	config: Config,
 	versions: moq_net::Versions,
-	health: moq_native::accept::Health,
+	health: moq_tokio::accept::Health,
+	http_listener: Option<net::TcpListener>,
+	https_listener: Option<net::TcpListener>,
+	https_tls: Option<RustlsConfig>,
+	addrs: Addrs,
 }
 
 impl Web {
 	/// Build a web server from its parts. `certificates` is the relay's TLS
 	/// certificate handle (e.g. `server.certificates()`), whose fingerprints are
 	/// served at `/certificate.sha256`.
-	pub fn new(auth: Auth, cluster: Cluster, certificates: moq_native::tls::Certificates, config: WebConfig) -> Self {
+	pub fn new(
+		auth: auth::Auth,
+		cluster: cluster::Cluster,
+		certificates: moq_tokio::tls::Certificates,
+		config: Config,
+	) -> Self {
 		let state = Arc::new(WebState {
 			auth,
 			cluster,
 			certificates,
 			conn_id: AtomicU64::new(0),
+			shutdown: crate::shutdown::Observer::disabled(),
+			sessions: crate::session::Registry::new(),
 		});
 		Self {
 			state,
 			config,
 			versions: moq_net::Versions::all(),
-			health: moq_native::accept::Health::new("web"),
+			health: moq_tokio::accept::Health::new("web"),
+			http_listener: None,
+			https_listener: None,
+			https_tls: None,
+			addrs: Addrs::default(),
 		}
+	}
+
+	/// Bind configured web sockets now, so an embedder can read ephemeral ports.
+	pub(crate) fn bind(mut self) -> anyhow::Result<Self> {
+		if self.https_tls.is_none() && self.config.https.listen.is_some() {
+			let tls = build_https_config(&self.config.https.cert, &self.config.https.key, &self.config.https.root)?;
+			self.https_tls = Some(RustlsConfig::from_config(tls));
+		}
+		if let Some(listen) = self.config.http.listen
+			&& self.http_listener.is_none()
+		{
+			let listener = moq_tokio::bind::tcp(listen).context("failed to bind HTTP listener")?;
+			let addr = listener.local_addr().context("failed to resolve HTTP bind address")?;
+			self.addrs.http = Some(addr);
+			tracing::info!(%addr, kind = "http", "listening");
+			self.http_listener = Some(listener);
+		}
+		if let Some(listen) = self.config.https.listen
+			&& self.https_listener.is_none()
+		{
+			let listener = moq_tokio::bind::tcp(listen).context("failed to bind HTTPS listener")?;
+			let addr = listener.local_addr().context("failed to resolve HTTPS bind address")?;
+			self.addrs.https = Some(addr);
+			tracing::info!(%addr, kind = "https", "listening");
+			self.https_listener = Some(listener);
+		}
+		Ok(self)
+	}
+
+	/// The actual bound addresses after [`crate::Relay::load`].
+	pub fn addrs(&self) -> Addrs {
+		self.addrs
+	}
+
+	/// Current served fingerprints, for a programmatic test fixture.
+	#[cfg(feature = "test-support")]
+	pub(crate) fn certificate_fingerprints(&self) -> Vec<String> {
+		self.state.certificates.fingerprints()
 	}
 
 	/// Restrict which MoQ versions WebSocket sessions accept, in preference order.
@@ -166,7 +272,7 @@ impl Web {
 	}
 
 	/// A live handle to the accept-loop health of the HTTP/HTTPS listeners, for an
-	/// embedder that publishes it (see [`moq_native::accept`]).
+	/// embedder that publishes it (see [`moq_tokio::accept`]).
 	///
 	/// This is the one signal that leaves the process when the public listener goes
 	/// dark: [`serve`](Self::serve) never gives up, so a node can be unable to accept
@@ -181,25 +287,42 @@ impl Web {
 	/// on are process- or host-wide (out of descriptors, out of kernel memory), so an
 	/// HTTP accept that succeeds is real evidence that the HTTPS one is not stalled
 	/// either.
-	pub fn accept_health(&self) -> Option<moq_native::accept::Health> {
+	pub fn accept_health(&self) -> Option<moq_tokio::accept::Health> {
 		let configured = self.config.http.listen.is_some() || self.config.https.listen.is_some();
 		configured.then(|| self.health.clone())
 	}
 
+	/// Attach the relay-wide shutdown broadcast so WebSocket sessions drain with
+	/// a GOAWAY when it fires. Without it they are cut off on process exit.
+	pub fn with_shutdown(mut self, shutdown: crate::shutdown::Observer) -> Self {
+		let state = Arc::get_mut(&mut self.state).expect("with_shutdown called after routes were built");
+		state.shutdown = shutdown;
+		self
+	}
+
+	/// Register WebSocket sessions in the node's live table so they can be listed
+	/// and nudged. Without it they are served but do not appear.
+	pub fn with_sessions(mut self, sessions: crate::session::Registry) -> Self {
+		let state = Arc::get_mut(&mut self.state).expect("with_sessions called after routes were built");
+		state.sessions = sessions;
+		self
+	}
+
 	/// Build the default web router with `state` applied, returning a
 	/// state-erased [`Router`] an embedder can extend (`merge`/`nest` extra
-	/// routes) before handing it to [`serve`](Self::serve).
+	/// routes) before handing it to [`crate::Relay::with_web`] or
+	/// [`serve`](Self::serve).
 	///
 	/// This is the public-facing router (customer media routes plus a liveness
 	/// probe). `/metrics` is deliberately NOT here: node traffic counters ride
-	/// the separate internal listener ([`Internal`](crate::Internal)) so they're
+	/// the separate internal listener ([`internal::Internal`](crate::internal::Internal)) so they're
 	/// never exposed on the public listener.
 	///
 	/// Includes the WebSocket polyfill catch-all (`/{*path}`, when
-	/// `config.ws`) and CORS scoped to its own GET routes, but NOT the
+	/// `config.ws`), but NOT the
 	/// landing-page fallback (that is global, so [`serve`](Self::serve) sets it
-	/// once across the merged router). Extra routes a caller merges in keep their
-	/// own layers and bring their own CORS as needed (e.g. a WHIP POST endpoint).
+	/// once across the merged router). GET CORS is applied to the complete router by [`Self::serve`],
+	/// including any routes the embedder merges in without their own policy.
 	pub fn routes(&self) -> Router {
 		let app = Router::new()
 			.route("/health", get(serve_health))
@@ -216,7 +339,7 @@ impl Web {
 		// through to the landing page, and the client's WS fallback is silently
 		// dead.
 		#[cfg(feature = "websocket")]
-		let app = if self.config.ws {
+		let app = if self.config.resolved_ws() {
 			app.route("/", axum::routing::any(crate::websocket::serve_ws))
 				.route("/{*path}", axum::routing::any(crate::websocket::serve_ws))
 		} else {
@@ -224,7 +347,6 @@ impl Web {
 		};
 
 		app.layer(Extension(self.versions.clone()))
-			.layer(CorsLayer::new().allow_origin(Any).allow_methods([Method::GET]))
 			.with_state(self.state.clone())
 	}
 
@@ -234,46 +356,39 @@ impl Web {
 	/// informational page rather than a bare 404) and owns the listener +
 	/// TLS machinery: optional mTLS client-cert extraction and hot cert
 	/// reload. The caller builds `app` from [`routes`](Self::routes) plus any
-	/// extra routes it merged in.
+	/// extra routes it merged in. An embedder driving a [`crate::Relay`]
+	/// passes that router to [`crate::Relay::with_web`] instead of calling this.
 	pub async fn serve(self, app: Router) -> anyhow::Result<()> {
-		let config = self.config;
-		let app = app.fallback(serve_landing).into_make_service();
+		let Web {
+			config,
+			health,
+			http_listener,
+			https_listener,
+			https_tls,
+			..
+		} = self.bind()?;
+		let app = app
+			.fallback(serve_landing)
+			.layer(axum::middleware::from_fn(get_cors))
+			.into_make_service_with_connect_info::<crate::listener::Peer>();
+		let ws = config.resolved_ws();
 
-		let http = if let Some(listen) = config.http.listen {
-			// Dual-stack so the cert endpoint + WebSocket fallback answer over IPv4
-			// too, even on Windows where `[::]` is IPv6-only by default.
-			let listener = moq_native::bind::tcp(listen).context("failed to bind HTTP listener")?;
-			log_bound("http", &listener);
-			// Same socket capture the HTTPS path gets from `MtlsAcceptor`: without it
-			// a `ws://` session reaches qmux with no descriptor and reports no RTT.
-			let server =
-				crate::listener::server(listener, self.health.clone())?.acceptor(SocketAcceptor { ws: config.ws });
+		let http = if let Some(listener) = http_listener {
+			let server = crate::listener::server(listener, health.clone(), WebAcceptor::plain(ws))?;
 			Some(server.serve(app.clone()))
 		} else {
 			None
 		};
 
-		let https = if let Some(listen) = config.https.listen {
-			let cert = config.https.cert.clone();
-			let key = config.https.key.clone();
-			let root = config.https.root.clone();
-
-			let rustls = build_https_config(&cert, &key, &root)?;
-			let rustls_config = RustlsConfig::from_config(rustls);
-
-			tokio::spawn(reload_https_config(rustls_config.clone(), cert, key, root));
-
-			// MtlsAcceptor surfaces a verified peer cert as a request extension.
-			// When no client CA is configured, the inner verifier is `NoClientAuth`
-			// and `peer_certificates()` always returns None — the wrapper is then
-			// a near-no-op, but keeping a single path simplifies reload + serve.
-			let acceptor = MtlsAcceptor {
-				inner: RustlsAcceptor::new(rustls_config),
-				ws: config.ws,
-			};
-			let listener = moq_native::bind::tcp(listen).context("failed to bind HTTPS listener")?;
-			log_bound("https", &listener);
-			let server = crate::listener::server(listener, self.health.clone())?.acceptor(acceptor);
+		let https = if let Some(listener) = https_listener {
+			let rustls_config = https_tls.expect("HTTPS config was built before binding");
+			tokio::spawn(reload_https_config(
+				rustls_config.clone(),
+				config.https.cert,
+				config.https.key,
+				config.https.root,
+			));
+			let server = crate::listener::server(listener, health.clone(), WebAcceptor::tls(rustls_config, ws))?;
 			Some(server.serve(app))
 		} else {
 			None
@@ -297,18 +412,43 @@ impl Web {
 	}
 }
 
-/// Log the address a web listener actually bound, matching the QUIC `listening`
-/// line in [`Relay::load`](crate::Relay::load).
-///
-/// The configured address is not the bound one when the port is 0, and the TCP
-/// port is chosen independently of the QUIC port, so without this the only way to
-/// learn where the relay is serving HTTP is to already know. Best-effort: a
-/// `local_addr` that fails is a diagnostic, never a reason to refuse to serve.
-fn log_bound(kind: &str, listener: &std::net::TcpListener) {
-	match listener.local_addr() {
-		Ok(addr) => tracing::info!(%addr, kind, "listening"),
-		Err(err) => tracing::warn!(%err, kind, "could not resolve the bound address"),
+// Public GET routes are readable cross-origin. Preserve an embedder's own
+// response policy and leave every other method to its router.
+async fn get_cors(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
+	let method = request.method().clone();
+	if method == Method::OPTIONS
+		&& request.headers().get(http::header::ACCESS_CONTROL_REQUEST_METHOD)
+			== Some(&http::HeaderValue::from_static("GET"))
+	{
+		let mut response = StatusCode::OK.into_response();
+		response.headers_mut().insert(
+			http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+			http::HeaderValue::from_static("*"),
+		);
+		response.headers_mut().insert(
+			http::header::ACCESS_CONTROL_ALLOW_METHODS,
+			http::HeaderValue::from_static("GET"),
+		);
+		if let Some(headers) = request.headers().get(http::header::ACCESS_CONTROL_REQUEST_HEADERS) {
+			response
+				.headers_mut()
+				.insert(http::header::ACCESS_CONTROL_ALLOW_HEADERS, headers.clone());
+		}
+		return response;
 	}
+
+	let mut response = next.run(request).await;
+	if method == Method::GET
+		&& !response
+			.headers()
+			.contains_key(http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+	{
+		response.headers_mut().insert(
+			http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+			http::HeaderValue::from_static("*"),
+		);
+	}
+	response
 }
 
 /// Build a [`rustls::ServerConfig`] for the HTTPS listener.
@@ -329,7 +469,7 @@ fn build_https_config(
 		"web.https.cert and web.https.key must have the same number of entries"
 	);
 
-	let mut tls = moq_native::tls::Server::default();
+	let mut tls = moq_tokio::tls::Listen::default();
 	tls.cert = cert.to_vec();
 	tls.key = key.to_vec();
 	tls.root = root.to_vec();
@@ -355,7 +495,7 @@ fn https_watch_paths(cert: &[PathBuf], key: &[PathBuf], root: &[PathBuf]) -> Vec
 async fn reload_https_config(config: RustlsConfig, cert: Vec<PathBuf>, key: Vec<PathBuf>, root: Vec<PathBuf>) {
 	let paths = https_watch_paths(&cert, &key, &root);
 
-	let mut watcher = match moq_native::watch::FileWatcher::new(&paths) {
+	let mut watcher = match moq_tokio::watch::Files::new(&paths) {
 		Ok(watcher) => watcher,
 		Err(err) => {
 			tracing::error!(%err, "failed to watch web certificate files; hot reload disabled");
@@ -394,25 +534,81 @@ pub(crate) struct SocketStats(pub(crate) qmux::SharedSocketStats);
 #[derive(Clone)]
 pub(crate) struct SocketStats(std::convert::Infallible);
 
-/// Marker inserted as a request extension after HTTPS mTLS verifies a client certificate.
+/// The client certificate HTTPS mTLS verified, inserted as a request extension.
 ///
 /// Embedded routes can extract `Option<Extension<MtlsPeer>>` to mirror the
-/// built-in relay handlers, then call [`Auth::verify_mtls`] with their route
-/// path when the marker is present.
+/// built-in relay handlers and report the identity in their auth request; it is a
+/// fact for the auth server to weigh, never a grant on its own.
 #[derive(Clone, Debug)]
-pub struct MtlsPeer;
+pub struct MtlsPeer(pub moq_tokio::tls::PeerIdentity);
 
-/// Wraps [`RustlsAcceptor`] so that, after the TLS handshake, we extract the
-/// peer cert presence from rustls's `ServerConnection` and attach it to every
-/// request on this connection as `Extension<Option<MtlsPeer>>`.
+/// Accepts a connection on a public web listener.
+///
+/// Captures the socket, then hands the stream to `inner`: [`DefaultAcceptor`] for
+/// `http://`, or [`RustlsAcceptor`] for `https://`, which also gives the connection
+/// a peer certificate to report. Both listeners wrap this same acceptor, so the
+/// capture cannot reach one and miss the other.
 #[derive(Clone)]
-struct MtlsAcceptor {
-	inner: RustlsAcceptor<DefaultAcceptor>,
-	/// As [`SocketAcceptor::ws`].
+struct WebAcceptor<A> {
+	inner: A,
+	/// Whether a WebSocket route exists to use the handle. The capture holds a
+	/// duplicated descriptor for the life of the connection, so doing it when
+	/// nothing can read it would cost every API, HLS, and health-check connection a
+	/// second descriptor for nothing.
 	ws: bool,
 }
 
-/// The connection [`MtlsAcceptor`] accepts: a byte stream, plus a descriptor to
+impl WebAcceptor<DefaultAcceptor> {
+	/// Accepts plain HTTP, which has no handshake of its own to run.
+	fn plain(ws: bool) -> Self {
+		Self {
+			inner: DefaultAcceptor::new(),
+			ws,
+		}
+	}
+}
+
+impl WebAcceptor<RustlsAcceptor<DefaultAcceptor>> {
+	/// Accepts HTTPS, running the TLS handshake and surfacing a verified peer
+	/// certificate as [`MtlsPeer`].
+	///
+	/// When no client CA is configured the inner verifier is `NoClientAuth` and
+	/// `peer_certificates()` always returns None, so the marker never appears.
+	fn tls(config: RustlsConfig, ws: bool) -> Self {
+		Self {
+			inner: RustlsAcceptor::new(config),
+			ws,
+		}
+	}
+}
+
+/// The mTLS marker a finished connection carries, if any.
+///
+/// Which streams can present a client certificate is a property of the stream type,
+/// not of the acceptor: only rustls has one to report, and a plain TCP connection
+/// never does.
+trait MtlsStream {
+	/// The marker for this connection's verified peer certificate.
+	fn mtls_peer(&self) -> Option<MtlsPeer>;
+}
+
+impl MtlsStream for tokio::net::TcpStream {
+	fn mtls_peer(&self) -> Option<MtlsPeer> {
+		None
+	}
+}
+
+impl<I> MtlsStream for TlsStream<I> {
+	fn mtls_peer(&self) -> Option<MtlsPeer> {
+		self.get_ref()
+			.1
+			.peer_certificates()
+			.filter(|certs| !certs.is_empty())
+			.map(|certs| MtlsPeer(moq_tokio::tls::PeerIdentity::from_chain(certs.to_vec())))
+	}
+}
+
+/// The connection [`WebAcceptor`] is handed: a byte stream, plus a descriptor to
 /// read socket statistics from on platforms that expose them.
 ///
 /// The concrete stream is always the `TcpStream` from [`crate::listener::Peer`], so
@@ -429,53 +625,17 @@ pub(crate) trait AcceptStream: AsyncRead + AsyncWrite + Unpin + Send + 'static {
 #[cfg(not(unix))]
 impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> AcceptStream for T {}
 
-/// Captures the socket for a plain-HTTP connection.
-///
-/// [`MtlsAcceptor`] does this for HTTPS on its way through the TLS handshake, but
-/// the HTTP listener has no acceptor of its own, so a `ws://` session would reach
-/// qmux with no descriptor and report no RTT. This is the same capture without the
-/// TLS half.
-#[derive(Clone, Copy)]
-struct SocketAcceptor {
-	/// Whether a WebSocket route exists to use the handle. The capture holds a
-	/// duplicated descriptor for the life of the connection, so doing it when
-	/// nothing can read it would cost every API, HLS, and health-check connection a
-	/// second descriptor for nothing.
-	ws: bool,
-}
-
-impl<I, S> Accept<I, S> for SocketAcceptor
+impl<I, S, A> Accept<I, S> for WebAcceptor<A>
 where
 	I: AcceptStream,
 	S: Send + 'static,
+	A: Accept<I, S>,
+	A::Stream: MtlsStream + Send + 'static,
+	A::Service: Send + 'static,
+	A::Future: Send + 'static,
 {
-	type Stream = I;
-	type Service = SetConnectionExtensions<S>;
-	type Future = BoxFuture<'static, std::io::Result<(Self::Stream, Self::Service)>>;
-
-	fn accept(&self, stream: I, service: S) -> Self::Future {
-		let socket = self.ws.then(|| socket_stats(&stream)).flatten();
-		async move {
-			Ok((
-				stream,
-				SetConnectionExtensions {
-					inner: service,
-					peer: None,
-					socket,
-				},
-			))
-		}
-		.boxed()
-	}
-}
-
-impl<I, S> Accept<I, S> for MtlsAcceptor
-where
-	I: AcceptStream,
-	S: Send + 'static,
-{
-	type Stream = TlsStream<I>;
-	type Service = SetConnectionExtensions<S>;
+	type Stream = A::Stream;
+	type Service = SetConnectionExtensions<A::Service>;
 	type Future = BoxFuture<'static, std::io::Result<(Self::Stream, Self::Service)>>;
 
 	fn accept(&self, stream: I, service: S) -> Self::Future {
@@ -484,15 +644,10 @@ where
 		let socket = self.ws.then(|| socket_stats(&stream)).flatten();
 		let inner = self.inner.accept(stream, service);
 		async move {
-			let (tls, service) = inner.await?;
-			let peer = tls
-				.get_ref()
-				.1
-				.peer_certificates()
-				.filter(|certs| !certs.is_empty())
-				.map(|_| MtlsPeer);
+			let (stream, service) = inner.await?;
+			let peer = stream.mtls_peer();
 			Ok((
-				tls,
+				stream,
 				SetConnectionExtensions {
 					inner: service,
 					peer,
@@ -591,9 +746,8 @@ async fn serve_fingerprint(State(state): State<Arc<WebState>>) -> Response {
 	// The first certificate in configuration order, deliberately. The endpoint
 	// exists so an `http://` client can pin a self-signed development
 	// certificate, where there is exactly one. With several configured there is
-	// no single answer: quinn and noq select by SNI at handshake, so those
-	// clients use `https://`, while quiche serves the first pair to everyone and
-	// the rest need an explicit `--client-tls-fingerprint` pin.
+	// no single answer: clients use `https://` so SNI selects the matching
+	// certificate at the handshake.
 	match state.certificates.fingerprints().into_iter().next() {
 		Some(fingerprint) => fingerprint.into_response(),
 		// A stream-only relay has no certificate to pin.
@@ -638,11 +792,64 @@ impl<'de> serde::Deserialize<'de> for FetchGroup {
 	}
 }
 
+/// The host this request was addressed to, reported to the auth server as the
+/// session's `server_name` so it can route by hostname. These handlers build their
+/// request from a path rather than a URL, so it has to come off the request headers.
+fn request_host(uri: &http::Uri, headers: &http::HeaderMap) -> Option<String> {
+	// HTTP/2 carries the host in `:authority`, which hyper surfaces on the URI and
+	// usually WITHOUT a `Host` header. The HTTPS listener advertises h2, so reading
+	// the header alone loses the tenant for ordinary clients.
+	uri.authority()
+		.map(|authority| authority.host().to_string())
+		.or_else(|| {
+			headers
+				.get(http::header::HOST)
+				.and_then(|host| host.to_str().ok())
+				// Parsed rather than split on the last colon, which would truncate a
+				// bracketed IPv6 literal (`[2001:db8::1]`) at its own separator.
+				.and_then(|host| host.parse::<http::uri::Authority>().ok())
+				.map(|authority| authority.host().to_string())
+		})
+		.map(|host| host.to_ascii_lowercase())
+		.filter(|host| !host.is_empty())
+}
+
+/// Admit a one-shot HTTP request as a session of its own: the auth server sees the
+/// path, the raw query, the host it was addressed to, the peer, and any certificate.
+async fn admit_http(
+	state: &WebState,
+	path: String,
+	query: AuthQuery,
+	uri: &http::Uri,
+	headers: &http::HeaderMap,
+	remote: crate::listener::Peer,
+	mtls: Option<Extension<MtlsPeer>>,
+) -> Result<auth::Lease, auth::Error> {
+	// The public request API represents a missing or root path as empty; the
+	// contract says what was dialed, and a URL always starts with `/`.
+	let mut request = state
+		.auth
+		.request(moq_auth::Transport::Http, format!("/{}", path.trim_start_matches('/')));
+	request.query = uri
+		.query()
+		.map(str::to_owned)
+		.or_else(|| query.jwt.map(|jwt| format!("jwt={jwt}")));
+	request.server_name = request_host(uri, headers);
+	request.remote = Some(remote.0);
+	request.tls = mtls.and_then(|Extension(MtlsPeer(identity))| auth::peer(&identity));
+	state.auth.admit(request).await
+}
+
 /// Serve the announced broadcasts for a given prefix.
+// The `Err` is axum's own `ErrorResponse`, so there is nothing here to box.
+#[expect(clippy::result_large_err, reason = "the error type is axum's, not ours")]
 async fn serve_announced(
 	path: Option<Path<String>>,
 	Query(query): Query<AuthQuery>,
 	mtls: Option<Extension<MtlsPeer>>,
+	ConnectInfo(remote): ConnectInfo<crate::listener::Peer>,
+	uri: http::Uri,
+	headers: http::HeaderMap,
 	State(state): State<Arc<WebState>>,
 ) -> axum::response::Result<String> {
 	let prefix = match path {
@@ -650,34 +857,21 @@ async fn serve_announced(
 		None => String::new(),
 	};
 
-	let params = AuthParams {
-		path: prefix,
-		jwt: query.jwt,
-		..Default::default()
-	};
-	let token = if mtls.is_some() {
-		// mTLS peers: the API returns the canonical root and the billing tier.
-		state.auth.verify_mtls(&params.path, params.transport).await?
-	} else {
-		state.auth.verify(&params).await?
-	};
-	let Some(origin) = state.cluster.subscriber(&token) else {
+	let lease = admit_http(&state, prefix, query, &uri, &headers, remote, mtls).await?;
+	let Some(origin) = state.cluster.subscriber(lease.token()) else {
 		return Err(StatusCode::UNAUTHORIZED.into());
 	};
 
 	let mut announced = origin.consume().announced();
 	let mut broadcasts = Vec::new();
 
-	while let Some(moq_net::announce::Update {
-		path: suffix,
-		broadcast,
-	}) = announced.try_next()
-	{
-		if broadcast.is_some() {
-			broadcasts.push(suffix);
+	while let Some(update) = announced.try_next() {
+		if update.kind.is_active() {
+			broadcasts.push(update.prefix);
 		}
 	}
 
+	lease.close("done", moq_auth::Bytes::default());
 	Ok(broadcasts
 		.iter()
 		.map(ToString::to_string)
@@ -686,10 +880,15 @@ async fn serve_announced(
 }
 
 /// Serve the given group for a given track
+// The `Err` is axum's own `ErrorResponse`, so there is nothing here to box.
+#[expect(clippy::result_large_err, reason = "the error type is axum's, not ours")]
 async fn serve_fetch(
 	Path(path): Path<String>,
 	Query(params): Query<FetchParams>,
 	mtls: Option<Extension<MtlsPeer>>,
+	ConnectInfo(remote): ConnectInfo<crate::listener::Peer>,
+	uri: http::Uri,
+	headers: http::HeaderMap,
 	State(state): State<Arc<WebState>>,
 ) -> axum::response::Result<ServeGroup> {
 	// The path containts a broadcast/track
@@ -701,21 +900,11 @@ async fn serve_fetch(
 		return Err(StatusCode::BAD_REQUEST.into());
 	}
 
-	let auth = AuthParams {
-		path: path.join("/"),
-		jwt: params.auth.jwt,
-		..Default::default()
-	};
-	let token = if mtls.is_some() {
-		// mTLS peers: the API returns the canonical root and the billing tier.
-		state.auth.verify_mtls(&auth.path, auth.transport).await?
-	} else {
-		state.auth.verify(&auth).await?
-	};
+	let lease = admit_http(&state, path.join("/"), params.auth, &uri, &headers, remote, mtls).await?;
 	// The token's root is the canonical (alias-resolved) broadcast path.
-	let broadcast = token.root.to_string();
+	let broadcast = lease.token().root.to_string();
 
-	let Some(origin) = state.cluster.subscriber(&token) else {
+	let Some(origin) = state.cluster.subscriber(lease.token()) else {
 		return Err(StatusCode::UNAUTHORIZED.into());
 	};
 
@@ -723,15 +912,14 @@ async fn serve_fetch(
 
 	let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
 
+	// The lease outlives this handler: the body streams after it returns, so the
+	// response holds the lease and ends it when the last frame is served.
 	let result = tokio::time::timeout_at(deadline, async {
 		// NOTE: The auth token is already scoped to the broadcast.
-		// Block until the broadcast has been announced (within the fetch deadline) so
+		// Block until a route covers the broadcast (within the fetch deadline) so
 		// freshly-connected subscribers don't get a spurious 404 before gossip arrives.
-		let broadcast = origin
-			.consume()
-			.announced_broadcast("")
-			.await
-			.ok_or(StatusCode::NOT_FOUND)?;
+		let consumer = origin.consume();
+		let broadcast = consumer.routed_broadcast("").await.map_err(|_| StatusCode::NOT_FOUND)?;
 		let group = match params.group {
 			// "latest" needs a live subscription to learn the newest sequence, since a
 			// fetch can only retrieve a sequence you already know. Once it's known, fetch
@@ -762,74 +950,82 @@ async fn serve_fetch(
 
 		tracing::info!(%track, group = %group.sequence, "serving group");
 
-		Ok(ServeGroup { group, deadline })
+		Ok(group)
 	})
 	.await;
 
 	match result {
-		Ok(Ok(serve)) => Ok(serve),
-		Ok(Err(status)) => Err(status.into()),
-		Err(_) => Err(StatusCode::GATEWAY_TIMEOUT.into()),
+		Ok(Ok(group)) => Ok(ServeGroup {
+			group,
+			deadline,
+			lease: Some(lease),
+		}),
+		Ok(Err(status)) => {
+			lease.close(status.to_string(), moq_auth::Bytes::default());
+			Err(status.into())
+		}
+		Err(_) => {
+			lease.close("timeout", moq_auth::Bytes::default());
+			Err(StatusCode::GATEWAY_TIMEOUT.into())
+		}
 	}
 }
 
+/// A group streamed as the response body, holding the fetch's lease until the
+/// last frame is served so a refusal or expiry mid-transfer cuts it off and the
+/// `end` event carries the outcome.
 struct ServeGroup {
 	group: moq_net::group::Consumer,
 	deadline: tokio::time::Instant,
+	/// Taken when the body ends, so the reason is reported once.
+	lease: Option<auth::Lease>,
 }
 
 impl ServeGroup {
 	async fn next(&mut self) -> moq_net::Result<Option<Bytes>> {
-		match tokio::time::timeout_at(self.deadline, self.group.read_frame()).await {
-			Ok(res) => Ok(res?.map(|frame| frame.payload)),
-			Err(_) => Err(moq_net::Error::Timeout),
+		let Some(lease) = self.lease.as_mut() else {
+			return Ok(None);
+		};
+		tokio::select! {
+			res = tokio::time::timeout_at(self.deadline, self.group.read_frame()) => match res {
+				Ok(res) => Ok(res?.map(|frame| frame.payload)),
+				Err(_) => Err(moq_net::Error::Timeout),
+			},
+			why = lease.ended() => {
+				tracing::info!(%why, "lease ended, closing fetch");
+				Err(moq_net::Error::Unauthorized)
+			}
+		}
+	}
+
+	/// End the lease with the body's outcome.
+	fn end(&mut self, reason: &str) {
+		if let Some(lease) = self.lease.take() {
+			lease.close(reason, moq_auth::Bytes::default());
 		}
 	}
 }
 
 impl IntoResponse for ServeGroup {
 	fn into_response(self) -> Response {
-		Response::new(Body::new(self))
-	}
-}
-
-impl http_body::Body for ServeGroup {
-	type Data = Bytes;
-	type Error = ServeGroupError;
-
-	fn poll_frame(
-		self: Pin<&mut Self>,
-		cx: &mut Context<'_>,
-	) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
-		let this = self.get_mut();
-
-		// Use `poll_fn` to turn the async function into a Future
-		let future = this.next();
-		tokio::pin!(future);
-
-		match ready!(future.poll(cx)) {
-			Ok(Some(data)) => {
-				let frame = http_body::Frame::data(data);
-				Poll::Ready(Some(Ok(frame)))
+		// One stream owns the body for its whole life, so the waiters `next`
+		// registers with the group and the lease survive between polls.
+		let frames = futures::stream::unfold(Some(self), async |serve| {
+			let mut serve = serve?;
+			match serve.next().await {
+				Ok(Some(data)) => Some((Ok(data), Some(serve))),
+				Ok(None) => {
+					serve.end("done");
+					None
+				}
+				Err(err) => {
+					serve.end(&err.to_string());
+					Some((Err(err), None))
+				}
 			}
-			Ok(None) => Poll::Ready(None),
-			Err(e) => Poll::Ready(Some(Err(ServeGroupError(e)))),
-		}
+		});
+		Response::new(Body::from_stream(frames))
 	}
-}
-
-#[derive(Debug, thiserror::Error)]
-#[error(transparent)]
-struct ServeGroupError(moq_net::Error);
-
-impl IntoResponse for ServeGroupError {
-	fn into_response(self) -> Response {
-		(StatusCode::INTERNAL_SERVER_ERROR, self.0.to_string()).into_response()
-	}
-}
-
-fn default_true() -> bool {
-	true
 }
 
 #[cfg(test)]
@@ -846,7 +1042,7 @@ mod tests {
 	/// Generate a CA + server cert/key on disk and return the temp paths.
 	/// Modeled after `auth.rs::mtls_fixture`.
 	fn make_named_certs(dir: &TempDir, name: &str, hostname: &str) -> (PathBuf, PathBuf, PathBuf) {
-		let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+		let _ = moq_tokio::crypto::install_default();
 
 		let ca_kp = KeyPair::generate().unwrap();
 		let mut ca_params = CertificateParams::new(vec![]).unwrap();
@@ -887,6 +1083,42 @@ mod tests {
 			vec![b"h2".to_vec(), b"http/1.1".to_vec()],
 			"ALPN must advertise h2 and http/1.1",
 		);
+	}
+
+	/// HTTP/2 puts the host in `:authority` and usually sends no `Host` header, and
+	/// the HTTPS listener advertises h2 - so a header-only read loses the tenant.
+	#[test]
+	fn request_host_prefers_the_uri_authority() {
+		let uri: http::Uri = "https://customer.example.com/announced".parse().unwrap();
+		assert_eq!(
+			request_host(&uri, &http::HeaderMap::new()),
+			Some("customer.example.com".to_string())
+		);
+	}
+
+	/// HTTP/1.1 leaves no authority on the URI, so the header is the only source. A
+	/// port is stripped either way, so both paths agree on the host.
+	#[test]
+	fn request_host_falls_back_to_the_header() {
+		let uri: http::Uri = "/announced".parse().unwrap();
+		let mut headers = http::HeaderMap::new();
+		headers.insert(http::header::HOST, "Customer.Example.com:4443".parse().unwrap());
+		assert_eq!(request_host(&uri, &headers), Some("customer.example.com".to_string()));
+		assert_eq!(request_host(&uri, &http::HeaderMap::new()), None);
+	}
+
+	/// A bracketed IPv6 literal carries its own colons, so splitting on the last
+	/// one truncates the address instead of stripping a port.
+	#[test]
+	fn request_host_keeps_ipv6_literals_intact() {
+		let uri: http::Uri = "/announced".parse().unwrap();
+		let host = |value: &str| {
+			let mut headers = http::HeaderMap::new();
+			headers.insert(http::header::HOST, value.parse().unwrap());
+			request_host(&uri, &headers)
+		};
+		assert_eq!(host("[2001:db8::1]"), Some("[2001:db8::1]".to_string()));
+		assert_eq!(host("[2001:db8::1]:4443"), Some("[2001:db8::1]".to_string()));
 	}
 
 	#[test]
@@ -972,15 +1204,12 @@ mod tests {
 
 	/// A real accepted socket must reach the request as an extension.
 	///
-	/// This is the whole point of the plain-HTTP path: `MtlsAcceptor` captures the
-	/// descriptor on its way through the TLS handshake, and `SocketAcceptor` has to
-	/// do the same for `ws://`. Without a capture the handle is `None`, qmux gets no
-	/// socket, and the session advertises no Probe capability -- silently, which is
-	/// why this drives an actual `TcpStream` rather than constructing the service by
-	/// hand.
+	/// Without a capture the handle is `None`, qmux gets no socket, and the session
+	/// advertises no Probe capability -- silently, which is why this drives an actual
+	/// `TcpStream` rather than constructing the service by hand.
 	#[cfg(all(unix, feature = "websocket"))]
 	#[tokio::test]
-	async fn socket_acceptor_surfaces_the_accepted_socket() {
+	async fn web_acceptor_surfaces_the_accepted_socket() {
 		use axum::http::Request;
 		use std::convert::Infallible;
 
@@ -1006,7 +1235,7 @@ mod tests {
 		let (accepted, _) = listener.accept().await.unwrap();
 		let _client = connecting.await.unwrap();
 
-		let (stream, mut service) = Accept::<_, EchoSocket>::accept(&SocketAcceptor { ws: true }, accepted, EchoSocket)
+		let (stream, mut service) = Accept::<_, EchoSocket>::accept(&WebAcceptor::plain(true), accepted, EchoSocket)
 			.await
 			.unwrap();
 
@@ -1044,14 +1273,14 @@ mod tests {
 	/// descriptors a relay can spend on connections, for nothing.
 	#[cfg(all(unix, feature = "websocket"))]
 	#[tokio::test]
-	async fn socket_acceptor_skips_capture_without_websockets() {
+	async fn web_acceptor_skips_capture_without_websockets() {
 		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
 		let addr = listener.local_addr().unwrap();
 		let connecting = tokio::spawn(async move { tokio::net::TcpStream::connect(addr).await.unwrap() });
 		let (accepted, _) = listener.accept().await.unwrap();
 		let _client = connecting.await.unwrap();
 
-		let (stream, service) = Accept::<_, ()>::accept(&SocketAcceptor { ws: false }, accepted, ())
+		let (stream, service) = Accept::<_, ()>::accept(&WebAcceptor::plain(false), accepted, ())
 			.await
 			.unwrap();
 
@@ -1061,6 +1290,133 @@ mod tests {
 		);
 
 		drop(stream);
+	}
+
+	/// Reports whether the connection's socket reached the request.
+	#[cfg(all(unix, feature = "websocket"))]
+	async fn report_socket(socket: Option<Extension<SocketStats>>) -> &'static str {
+		match socket {
+			Some(_) => "captured",
+			None => "missing",
+		}
+	}
+
+	/// Two ports the kernel just handed out, released together so neither bind can
+	/// be handed the other's.
+	#[cfg(all(unix, feature = "websocket"))]
+	fn free_ports() -> (u16, u16) {
+		let http = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+		let https = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+		(http.local_addr().unwrap().port(), https.local_addr().unwrap().port())
+	}
+
+	/// Connect to `port`, waiting for [`Web::serve`] to finish binding.
+	#[cfg(all(unix, feature = "websocket"))]
+	async fn connect(port: u16) -> tokio::net::TcpStream {
+		let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+		loop {
+			match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+				Ok(stream) => return stream,
+				Err(err) if std::time::Instant::now() >= deadline => {
+					panic!("web listener never came up on port {port}: {err}")
+				}
+				Err(_) => tokio::time::sleep(std::time::Duration::from_millis(25)).await,
+			}
+		}
+	}
+
+	/// `GET /socket` over `io`, returning the body the handler produced.
+	///
+	/// Hand-rolled rather than reached through an HTTP client so the same request
+	/// works over TLS and plain TCP. `Connection: close` is what ends the read.
+	#[cfg(all(unix, feature = "websocket"))]
+	async fn get_socket<S: AsyncRead + AsyncWrite + Unpin>(mut io: S) -> String {
+		use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+		io.write_all(b"GET /socket HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+			.await
+			.unwrap();
+
+		let mut response = String::new();
+		// An unclean TLS shutdown is an error even after a complete response, so the
+		// body decides whether the exchange worked, not the read.
+		let _ = io.read_to_string(&mut response).await;
+		response
+			.split_once("\r\n\r\n")
+			.unwrap_or_else(|| panic!("no HTTP response body in {response:?}"))
+			.1
+			.to_string()
+	}
+
+	/// A TLS client trusting only `ca`, so the handshake also proves the relay
+	/// served the certificate it was configured with.
+	#[cfg(all(unix, feature = "websocket"))]
+	fn tls_connector(ca: &std::path::Path) -> tokio_rustls::TlsConnector {
+		use rustls::pki_types::{CertificateDer, pem::PemObject};
+
+		let pem = std::fs::read(ca).unwrap();
+		let mut roots = rustls::RootCertStore::empty();
+		for cert in CertificateDer::pem_slice_iter(&pem) {
+			roots.add(cert.unwrap()).unwrap();
+		}
+
+		let mut config = rustls::ClientConfig::builder()
+			.with_root_certificates(roots)
+			.with_no_client_auth();
+		// The listener advertises h2 first, and this speaks HTTP/1.1 by hand.
+		config.alpn_protocols = vec![b"http/1.1".to_vec()];
+
+		tokio_rustls::TlsConnector::from(Arc::new(config))
+	}
+
+	/// [`Web::serve`] must install the capturing acceptor on every listener it opens.
+	///
+	/// The tests above cover the acceptor; this covers its installation. A listener
+	/// that skips it hands qmux a session with no descriptor, which stays on the
+	/// fallback jitter buffer while the other listener still looks correct, so both
+	/// run here and each is asked whether the capture reached the request.
+	#[cfg(all(unix, feature = "websocket"))]
+	#[tokio::test]
+	async fn serve_captures_the_socket_on_every_listener() {
+		let dir = TempDir::new().unwrap();
+		let (ca, cert, key) = make_certs(&dir);
+		let (http, https) = free_ports();
+
+		let mut config = Config::default();
+		config.http.listen = Some(format!("127.0.0.1:{http}").parse().unwrap());
+		config.https.listen = Some(format!("127.0.0.1:{https}").parse().unwrap());
+		config.https.cert = vec![cert.clone()];
+		config.https.key = vec![key];
+
+		// The probed route is the test's own, so auth never runs; it just has to be
+		// configured with something for `Web` to build.
+		let auth_config = crate::auth::Config {
+			public_subscribe: vec![moq_auth::Pattern::all()],
+			..Default::default()
+		};
+		let auth = auth_config.init("test", &moq_tokio::tls::Connect::default()).unwrap();
+		let cluster = cluster::Cluster::new(crate::cluster::Options::default()).unwrap();
+		let certificates = moq_tokio::tls::Certificates::from_pem(&std::fs::read(&cert).unwrap()).unwrap();
+
+		let web = Web::new(auth, cluster, certificates, config);
+		let serving = tokio::spawn(web.serve(Router::new().route("/socket", get(report_socket))));
+
+		assert_eq!(
+			get_socket(connect(http).await).await,
+			"captured",
+			"the HTTP listener must install the capturing acceptor"
+		);
+
+		let tcp = connect(https).await;
+		let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+		let tls = tls_connector(&ca).connect(name, tcp).await.expect("TLS handshake");
+		assert_eq!(
+			get_socket(tls).await,
+			"captured",
+			"the HTTPS listener must install the capturing acceptor"
+		);
+
+		serving.abort();
 	}
 
 	/// Confirm `SetConnectionExtensions` injects the marker into request extensions
@@ -1090,7 +1446,7 @@ mod tests {
 		// per-connection service but is independent of it.
 		let mut with_peer = SetConnectionExtensions {
 			inner: EchoExt,
-			peer: Some(MtlsPeer),
+			peer: Some(MtlsPeer(moq_tokio::tls::PeerIdentity::from_chain(Vec::new()))),
 			socket: None,
 		};
 		let mut no_peer = SetConnectionExtensions {

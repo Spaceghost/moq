@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Rename the crate to `moq-tokio`. This release intentionally produces a compile error with migration instructions.
+
 ## [0.19.19](https://github.com/moq-dev/moq/compare/moq-native-v0.19.18...moq-native-v0.19.19) - 2026-09-17
 
 ### Added
@@ -150,7 +152,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
-- add Client::with_peer_origin for peers that declare no identity ([#2577](https://github.com/moq-dev/moq/pull/2577))
+- add Client::with_peer_hop for peers that declare no identity ([#2577](https://github.com/moq-dev/moq/pull/2577))
 
 ## [0.19.5](https://github.com/moq-dev/moq/compare/moq-native-v0.19.4...moq-native-v0.19.5) - 2026-07-31
 

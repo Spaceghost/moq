@@ -31,41 +31,39 @@ use crate::container::Frame;
 /// frames a [`Split`](super::Split) produced via [`decode`](Self::decode). The
 /// catalog rendition fills in lazily once the codec config is known (hvcC via
 /// [`initialize`](Self::initialize) for hvc1, the first SPS for hev1).
-pub struct Import<E: CatalogExt = ()> {
+pub struct Import {
 	/// True for the hvc1 shape: the codec config is out-of-band (hvcC), so
 	/// frame payloads are length-prefixed rather than Annex-B and are never scanned.
 	hvc1: bool,
-	track: crate::container::Producer<crate::catalog::hang::Container>,
-	rendition: crate::catalog::VideoTrack<E>,
+	track: crate::container::Producer<crate::catalog::hang::Container, hang::catalog::VideoConfig>,
 	catalog: crate::codec::video::Catalog,
 	last_sps: Option<Bytes>,
 }
 
-impl<E: CatalogExt> Import<E> {
+impl Import {
 	/// Publish on an existing track producer, seeding the rendition from `hint` (pass
 	/// [`VideoHint::default`](crate::catalog::VideoHint) for none).
 	///
 	/// A hint carrying a codec publishes the catalog rendition up front (the VPS/SPS/PPS still refine
 	/// it in band on the first keyframe).
-	pub fn new(
+	pub fn new<E: CatalogExt>(
 		track: moq_net::track::Producer,
 		reserved: crate::catalog::Reserved<E>,
 		hint: crate::catalog::VideoHint,
 	) -> crate::Result<Self> {
-		let rendition = reserved.video(track.name());
 		// The hint names the container; the writer is built from that same value so the wire
 		// cannot disagree with what the rendition advertises.
-		let wire = crate::catalog::hang::Container::try_from(&hint.container)?;
-		let catalog = crate::codec::video::Catalog::new(&reserved, track.name(), hint)?;
+		let wire = crate::catalog::hang::Container::try_from(&hint)?;
+		let catalog = crate::codec::video::Catalog::new(hint);
+		let track = reserved.video(track, wire, None)?;
 		let mut import = Self {
 			hvc1: false,
-			track: reserved.producer().media_producer(track, wire)?,
-			rendition,
+			track,
 			catalog,
 			last_sps: None,
 		};
 		if let Some(config) = import.catalog.initial_config() {
-			import.apply_config(config);
+			import.apply_config(config)?;
 		}
 		Ok(import)
 	}
@@ -94,7 +92,7 @@ impl<E: CatalogExt> Import<E> {
 		// importer in hev1 mode where inline-SPS keyframes still self-initialize.
 		let config = super::config_from_hvcc(hvcc_bytes)?;
 		self.hvc1 = true;
-		self.apply_config(config);
+		self.apply_config(config)?;
 		Ok(())
 	}
 
@@ -128,7 +126,6 @@ impl<E: CatalogExt> Import<E> {
 	/// Finish the track, flushing the current group.
 	pub fn finish(&mut self) -> Result<()> {
 		self.track.finish()?;
-		self.estimate();
 		Ok(())
 	}
 
@@ -140,39 +137,32 @@ impl<E: CatalogExt> Import<E> {
 
 	/// Publish what the track measured (bitrate, jitter) into the catalog rendition, filling only
 	/// the fields its config didn't supply.
-	fn estimate(&mut self) {
-		self.rendition.estimate(self.track.estimate());
-	}
-
 	/// Cut the current group at `end` without finishing the track.
 	pub fn cut(&mut self, end: Option<moq_net::Timestamp>) -> Result<()> {
 		self.track.cut(end)?;
-		self.estimate();
 		Ok(())
 	}
 
-	/// Mark a break in the timeline by publishing an empty group. To bound the closing
+	/// Mark a break in the timeline by publishing a marker group. To bound the closing
 	/// group's final frame first, [`cut(end)`](Self::cut) before this. See
 	/// [`Producer::discontinuity`](crate::container::Producer::discontinuity).
 	pub fn discontinuity(&mut self) -> Result<()> {
 		self.track.discontinuity()?;
-		self.estimate();
 		Ok(())
 	}
 
 	/// Close the current group and open the next one at `sequence`.
 	pub fn seek(&mut self, sequence: u64) -> Result<()> {
 		self.track.seek(sequence)?;
-		self.estimate();
 		Ok(())
 	}
 
 	/// Record a frame's reorder delay (`PTS - DTS`) so the catalog `jitter` reflects the
 	/// B-frame reorder depth (the decode buffer a transmuxer/player must hold). The
 	/// container supplies this since the elementary stream alone carries no decode time.
-	pub fn observe_reorder(&mut self, reorder: moq_net::Timestamp) {
+	pub fn observe_reorder(&mut self, reorder: moq_net::Timestamp) -> crate::Result<()> {
 		self.track.reorder(reorder);
-		self.estimate();
+		Ok(())
 	}
 
 	/// Resolve the config from an inline SPS, updating the rendition in place on a
@@ -183,7 +173,7 @@ impl<E: CatalogExt> Import<E> {
 		}
 		let config = config_from_sps(sps_nal)?;
 		self.last_sps = Some(sps_nal.clone());
-		self.apply_config(config);
+		self.apply_config(config)?;
 		Ok(())
 	}
 
@@ -191,8 +181,8 @@ impl<E: CatalogExt> Import<E> {
 	///
 	/// A changed config just re-mirrors the rendition; there are no fixed tracks to reject a
 	/// reconfiguration.
-	fn apply_config(&mut self, config: hang::catalog::VideoConfig) {
-		self.catalog.publish(&mut self.rendition, config);
+	fn apply_config(&mut self, config: hang::catalog::VideoConfig) -> crate::Result<()> {
+		self.catalog.publish(&mut self.track, config)
 	}
 
 	/// Write split frames to the track, resolving the config from the first
@@ -217,10 +207,27 @@ impl<E: CatalogExt> Import<E> {
 			// A pre-keyframe delta has no group to anchor it: the producer returns
 			// MissingKeyframe, which the caller (e.g. a TS mid-stream join) skips.
 			self.track.write(frame)?;
+			let demand = self.track.track().is_used();
+			self.catalog.on_frame(&mut self.track, demand)?;
 		}
-
-		self.estimate();
 		Ok(())
+	}
+
+	/// Re-evaluate stall from source silence.
+	pub fn tick(&mut self) -> crate::Result<()> {
+		let demand = self.track.track().is_used();
+		self.catalog.tick(&mut self.track, demand)
+	}
+
+	/// The source is gone; this rendition is never stalled while idle.
+	pub fn idle(&mut self) -> crate::Result<()> {
+		self.catalog.idle(&mut self.track)
+	}
+
+	/// Record the encode duration before publishing its frames so the catalog can report a stall.
+	pub fn observe_lag(&mut self, lag: std::time::Duration) -> crate::Result<()> {
+		let demand = self.track.track().is_used();
+		self.catalog.observe_lag(&mut self.track, demand, lag)
 	}
 
 	/// Publish split frames, resolving the config from the first keyframe's inline
@@ -350,8 +357,10 @@ mod tests {
 
 	fn setup(name: &str) -> (moq_net::track::Producer, crate::catalog::Producer) {
 		let mut broadcast = moq_net::broadcast::Info::new().produce();
-		let catalog = crate::catalog::Producer::new(&mut broadcast).unwrap();
-		let track = broadcast.create_track(name, hang::container::track_info()).unwrap();
+		let catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
+		let track = broadcast
+			.create_track(name, hang::container::track_info(hang::catalog::PRIORITY.video))
+			.unwrap();
 		(track, catalog)
 	}
 

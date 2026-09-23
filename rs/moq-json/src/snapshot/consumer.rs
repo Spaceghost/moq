@@ -4,8 +4,20 @@ use std::task::Poll;
 
 use serde::de::DeserializeOwned;
 
-use super::{ConsumerConfig, Decoder};
-use crate::Result;
+use super::Decoder;
+use crate::{Compression, Result};
+
+/// Track-owning options for a [`Consumer`].
+///
+/// Build from [`Default`] and override fields (the struct is `#[non_exhaustive]`, so new options
+/// stay additive).
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct Config {
+	/// How the frames are compressed. Must match the encoder's
+	/// [`Config::compression`](super::Config::compression). Defaults to [`Compression::None`].
+	pub compression: Compression,
+}
 
 /// Consumes a JSON value from a track, reconstructing it from snapshots and deltas.
 ///
@@ -13,7 +25,7 @@ use crate::Result;
 /// yields the reconstructed value. When something else already owns the track, use the [`Decoder`]
 /// directly.
 pub struct Consumer<T> {
-	track: moq_net::track::Subscriber,
+	track: moq_net::track::Ordered,
 	group: Option<moq_net::group::Consumer>,
 	decoder: Decoder<T>,
 	frames_read: usize,
@@ -22,11 +34,11 @@ pub struct Consumer<T> {
 impl<T: DeserializeOwned> Consumer<T> {
 	/// Create a consumer reading from the given track subscriber.
 	///
-	/// Set [`ConsumerConfig::compression`] to read a track written by a producer with
-	/// [`ProducerConfig::compression`](super::ProducerConfig::compression) on.
-	pub fn new(track: moq_net::track::Subscriber, config: ConsumerConfig) -> Self {
+	/// Set [`Config::compression`] to read a track written by a producer with the same
+	/// [`compression`](super::Config::compression).
+	pub fn new(track: moq_net::track::Subscriber, config: Config) -> Self {
 		Self {
-			track,
+			track: track.ordered(),
 			group: None,
 			decoder: Decoder::new(config),
 			frames_read: 0,
@@ -50,6 +62,10 @@ impl<T: DeserializeOwned> Consumer<T> {
 	/// Frames must still be decoded in order (the DEFLATE window and merge patches are sequential);
 	/// only the per-frame deserialize and yield are skipped. Switching to a newer group discards the
 	/// older one.
+	///
+	/// A group the transport can no longer serve is discarded the same way, not reported: on a
+	/// snapshot track its content is superseded by definition, so the reader waits for the
+	/// replacement. Only a failure of the track itself ends the stream.
 	pub fn poll_next(&mut self, waiter: &kio::Waiter) -> Poll<Result<Option<T>>> {
 		// Drain to the newest group, resetting reconstruction state whenever we switch.
 		let track_finished = loop {
@@ -71,14 +87,30 @@ impl<T: DeserializeOwned> Consumer<T> {
 		let mut advanced = false;
 		let mut group_pending = false;
 		while let Some(group) = &mut self.group {
-			match group.poll_read_frame(waiter)? {
-				Poll::Ready(Some(frame)) => {
+			match group.poll_read_frame(waiter) {
+				Poll::Ready(Ok(Some(frame))) => {
 					self.apply(&frame.payload)?;
 					advanced = true;
 				}
 				// The current group is exhausted; wait for a newer one.
-				Poll::Ready(None) => {
+				Poll::Ready(Ok(None)) => {
 					self.group = None;
+					break;
+				}
+				// The transport can no longer serve the rest of this group: it was superseded and
+				// reclaimed (`Old`), dropped under memory pressure (`Evicted`), or read past the
+				// drift budget (`Lagged`). A snapshot reader only ever wants the newest value, so a
+				// group whose content is gone is never fatal: drop it and wait for its replacement.
+				// A track- or session-level failure still arrives through `poll_next_group` above.
+				Poll::Ready(Err(err)) => {
+					let sequence = group.sequence;
+					self.group = None;
+					tracing::warn!(
+						track = self.track.name(),
+						group = sequence,
+						error = ?err,
+						"snapshot group lost; waiting for a newer one"
+					);
 					break;
 				}
 				// The group is still open but has nothing buffered yet.

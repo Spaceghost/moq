@@ -1,6 +1,7 @@
 use std::{
 	ffi::c_char,
 	future::Future,
+	ops::Bound,
 	pin::Pin,
 	task::{Poll, ready},
 };
@@ -15,6 +16,11 @@ use crate::{
 struct ConsumeCatalog {
 	broadcast: moq_net::broadcast::Consumer,
 
+	/// The origin `broadcast` was resolved through, if any. A rendition may name a sibling
+	/// broadcast, and only an origin can fetch one; a broadcast handed over without one (a
+	/// local producer) leaves such a rendition unresolvable rather than silently wrong.
+	origin: Option<moq_net::origin::Consumer>,
+
 	// Carries the untyped `Extra` extension so application catalog sections survive
 	// into `moq_catalog_section_*` instead of being dropped on parse.
 	catalog: moq_mux::catalog::hang::Catalog<moq_mux::catalog::hang::Extra>,
@@ -26,6 +32,38 @@ struct ConsumeCatalog {
 	/// Section names and their JSON, serialized on the heap so the section iterator
 	/// and direct-lookup APIs can hand C borrowed pointers into stable storage.
 	sections: Vec<(String, String)>,
+}
+
+/// A broadcast handed to C, plus the origin cursor that named it.
+///
+/// The origin is what lets a catalog rendition reference a sibling broadcast: only an origin
+/// can fetch one, and it must be the cursor that named this broadcast, since the reference
+/// resolves against the path that cursor stamped. A broadcast that never came from an origin
+/// has none, which makes such a rendition unresolvable rather than silently wrong.
+#[derive(Clone)]
+struct ConsumeBroadcast {
+	broadcast: moq_net::broadcast::Consumer,
+	origin: Option<moq_net::origin::Consumer>,
+}
+
+/// The broadcast serving a rendition, honoring its catalog `broadcast` reference.
+///
+/// An absent or empty reference names the catalog's own broadcast, which the caller already
+/// holds; anything else resolves against that broadcast's path through the origin, which
+/// deduplicates the subscription the catalog itself already holds. Awaited inside the track
+/// task, never under the state lock, so `origin` is cloned out rather than borrowed.
+async fn resolve(
+	broadcast: moq_net::broadcast::Consumer,
+	origin: Option<moq_net::origin::Consumer>,
+	reference: Option<moq_net::path::RelativeOwned>,
+) -> Result<moq_net::broadcast::Consumer, Error> {
+	let Some(reference) = reference.filter(|reference| !reference.is_empty()) else {
+		return Ok(broadcast);
+	};
+
+	let origin = origin.ok_or_else(|| Error::UnresolvableBroadcast(reference.as_str().to_string()))?;
+	let source = moq_mux::Source::new(origin, &broadcast.info().path);
+	Ok(source.resolve(Some(&reference.borrow())).await?)
 }
 
 /// A spawned task entry: `close` signals shutdown, `callback` delivers status.
@@ -59,7 +97,7 @@ enum RawStep<T> {
 #[derive(Default)]
 pub struct Consume {
 	/// Active broadcast consumers.
-	broadcast: NonZeroSlab<moq_net::broadcast::Consumer>,
+	broadcast: NonZeroSlab<ConsumeBroadcast>,
 
 	/// Active catalog consumers and their broadcast references.
 	catalog: NonZeroSlab<ConsumeCatalog>,
@@ -93,12 +131,19 @@ pub struct Consume {
 }
 
 impl Consume {
-	pub fn start(&mut self, broadcast: moq_net::broadcast::Consumer) -> Result<Id, Error> {
-		self.broadcast.insert(broadcast)
+	/// Buffer a broadcast the origin handed out, keeping the cursor that named it so a catalog
+	/// rendition referencing a sibling broadcast resolves through the same origin.
+	pub fn start(
+		&mut self,
+		broadcast: moq_net::broadcast::Consumer,
+		origin: Option<moq_net::origin::Consumer>,
+	) -> Result<Id, Error> {
+		self.broadcast.insert(ConsumeBroadcast { broadcast, origin })
 	}
 
 	pub fn catalog(&mut self, broadcast: Id, on_catalog: OnStatus) -> Result<Id, Error> {
-		let broadcast = self.broadcast.get(broadcast).ok_or(Error::BroadcastNotFound)?.clone();
+		let ConsumeBroadcast { broadcast, origin } =
+			self.broadcast.get(broadcast).ok_or(Error::BroadcastNotFound)?.clone();
 
 		let channel = oneshot::channel();
 		let entry = TaskEntry {
@@ -115,7 +160,7 @@ impl Consume {
 					.track(hang::catalog::Catalog::DEFAULT_NAME)?
 					.subscribe(hang::catalog::Catalog::default_subscription())
 					.await?;
-				Self::run_catalog(on_catalog, broadcast.clone(), catalog.into(), channel.1).await
+				Self::run_catalog(on_catalog, broadcast.clone(), origin, catalog.into(), channel.1).await
 			}
 			.await;
 
@@ -133,6 +178,7 @@ impl Consume {
 	async fn run_catalog(
 		callback: OnStatus,
 		broadcast: moq_net::broadcast::Consumer,
+		origin: Option<moq_net::origin::Consumer>,
 		mut catalog: moq_mux::catalog::hang::Consumer<moq_mux::catalog::hang::Extra>,
 		mut close: oneshot::Receiver<()>,
 	) -> Result<(), Error> {
@@ -167,12 +213,14 @@ impl Consume {
 			// Serialize the untyped application sections to owned strings so the
 			// C section APIs can borrow stable pointers from the snapshot.
 			let sections = update
-				.sections()
+				.ext
+				.iter()
 				.map(|(name, value)| (name.clone(), value.to_string()))
 				.collect();
 
 			let snapshot = ConsumeCatalog {
 				broadcast: broadcast.clone(),
+				origin: origin.clone(),
 				catalog: update,
 				audio_codec,
 				video_codec,
@@ -208,17 +256,15 @@ impl Consume {
 				.map(|desc| desc.as_ptr())
 				.unwrap_or(std::ptr::null()),
 			description_len: config.description.as_ref().map(|desc| desc.len()).unwrap_or(0),
-			coded_width: config
-				.coded_width
-				.as_ref()
-				.map(|width| width as *const u32)
-				.unwrap_or(std::ptr::null()),
-			coded_height: config
-				.coded_height
-				.as_ref()
-				.map(|height| height as *const u32)
-				.unwrap_or(std::ptr::null()),
+			coded_width: config.coded_width.unwrap_or(0),
+			coded_height: config.coded_height.unwrap_or(0),
 			container: crate::api::borrow_container(&config.container),
+			label: config
+				.label
+				.as_ref()
+				.map(|label| label.as_ptr() as *const c_char)
+				.unwrap_or(std::ptr::null()),
+			label_len: config.label.as_ref().map_or(0, String::len),
 		};
 
 		Ok(())
@@ -281,6 +327,12 @@ impl Consume {
 			sample_rate: config.sample_rate,
 			channel_count: config.channel_count,
 			container: crate::api::borrow_container(&config.container),
+			label: config
+				.label
+				.as_ref()
+				.map(|label| label.as_ptr() as *const c_char)
+				.unwrap_or(std::ptr::null()),
+			label_len: config.label.as_ref().map_or(0, String::len),
 		};
 
 		Ok(())
@@ -350,7 +402,7 @@ impl Consume {
 		&mut self,
 		catalog: Id,
 		index: usize,
-		latency: std::time::Duration,
+		max_age: std::time::Duration,
 		on_frame: OnStatus,
 	) -> Result<Id, Error> {
 		let consume = self.catalog.get(catalog).ok_or(Error::CatalogNotFound)?;
@@ -365,8 +417,12 @@ impl Consume {
 		// Consume with the container the catalog actually advertises (Legacy / Cmaf / Loc)
 		// instead of assuming Legacy, otherwise CMAF/fMP4 sources (e.g. ffmpeg moqenc,
 		// browser @moq/publish) are misread as raw frames.
-		let container = moq_mux::catalog::hang::Container::try_from(&config.container)?;
+		let container = moq_mux::catalog::hang::Container::try_from(config)?;
+		// The rendition may live in a sibling broadcast, so resolve its reference rather than
+		// assuming the catalog's own broadcast serves the track.
+		let reference = config.broadcast.clone();
 		let broadcast = consume.broadcast.clone();
+		let origin = consume.origin.clone();
 
 		let channel = oneshot::channel();
 		let entry = TaskEntry {
@@ -378,11 +434,16 @@ impl Consume {
 		// `subscribe` blocks on SUBSCRIBE_OK, so run it inside the task.
 		tokio::spawn(async move {
 			let res = async move {
+				let broadcast = resolve(broadcast, origin, reference).await?;
 				let track = broadcast
 					.track(&name)?
-					.subscribe(moq_net::track::Subscription::default().with_priority(hang::catalog::PRIORITY.video))
+					.subscribe(
+						moq_net::track::Subscription::default()
+							.with_priority(hang::catalog::PRIORITY.video)
+							.with_max_age(max_age),
+					)
 					.await?;
-				let track = moq_mux::container::Consumer::new(track, container).with_latency(latency);
+				let track = moq_mux::container::Consumer::new(track, container);
 				Self::run_track(on_frame, track, channel.1).await
 			}
 			.await;
@@ -402,7 +463,7 @@ impl Consume {
 		&mut self,
 		catalog: Id,
 		index: usize,
-		latency: std::time::Duration,
+		max_age: std::time::Duration,
 		on_frame: OnStatus,
 	) -> Result<Id, Error> {
 		let consume = self.catalog.get(catalog).ok_or(Error::CatalogNotFound)?;
@@ -414,8 +475,10 @@ impl Consume {
 			.nth(index)
 			.ok_or(Error::NoIndex)?;
 		let name = name.clone();
-		let container = moq_mux::catalog::hang::Container::try_from(&config.container)?;
+		let container = moq_mux::catalog::hang::Container::try_from(config)?;
+		let reference = config.broadcast.clone();
 		let broadcast = consume.broadcast.clone();
+		let origin = consume.origin.clone();
 
 		let channel = oneshot::channel();
 		let entry = TaskEntry {
@@ -427,11 +490,16 @@ impl Consume {
 		// `subscribe` blocks on SUBSCRIBE_OK, so run it inside the task.
 		tokio::spawn(async move {
 			let res = async move {
+				let broadcast = resolve(broadcast, origin, reference).await?;
 				let track = broadcast
 					.track(&name)?
-					.subscribe(moq_net::track::Subscription::default().with_priority(hang::catalog::PRIORITY.audio))
+					.subscribe(
+						moq_net::track::Subscription::default()
+							.with_priority(hang::catalog::PRIORITY.audio)
+							.with_max_age(max_age),
+					)
 					.await?;
-				let track = moq_mux::container::Consumer::new(track, container).with_latency(latency);
+				let track = moq_mux::container::Consumer::new(track, container);
 				Self::run_track(on_frame, track, channel.1).await
 			}
 			.await;
@@ -522,7 +590,12 @@ impl Consume {
 		subscription: Option<moq_net::track::Subscription>,
 		on_frame: OnStatus,
 	) -> Result<Id, Error> {
-		let broadcast = self.broadcast.get(broadcast).ok_or(Error::BroadcastNotFound)?.clone();
+		let broadcast = self
+			.broadcast
+			.get(broadcast)
+			.ok_or(Error::BroadcastNotFound)?
+			.broadcast
+			.clone();
 		let name = name.to_string();
 
 		let channel = oneshot::channel();
@@ -537,7 +610,7 @@ impl Consume {
 		// `subscribe` blocks on SUBSCRIBE_OK, so run it inside the task.
 		tokio::spawn(async move {
 			let res = async move {
-				let mut track = broadcast.track(&name)?.subscribe(subscription.clone()).await?;
+				let mut track = broadcast.track(&name)?.subscribe(subscription.clone()).await?.ordered();
 				Self::apply_raw_subscription(&mut track, subscription);
 				Self::run_raw(on_frame, track, channel.1, updates).await
 			}
@@ -554,22 +627,22 @@ impl Consume {
 		Ok(id)
 	}
 
-	fn apply_raw_subscription(
-		track: &mut moq_net::track::Subscriber,
-		subscription: Option<moq_net::track::Subscription>,
-	) {
+	fn apply_raw_subscription(track: &mut moq_net::track::Ordered, subscription: Option<moq_net::track::Subscription>) {
 		let subscription = subscription.unwrap_or_default();
-		if let Some(start) = subscription.group_start.or_else(|| track.latest()) {
-			track.start_at(start);
-		}
-		track.end_at(subscription.group_end);
+		let start = subscription.start.map(|start| start.group).or_else(|| track.latest());
+		track.set_groups((
+			start.map_or(Bound::Unbounded, Bound::Included),
+			subscription
+				.end
+				.map_or(Bound::Unbounded, moq_net::track::Position::group_end),
+		));
 		// A closed track makes the update meaningless; the reader already sees the close.
 		let _ = track.update(subscription);
 	}
 
 	async fn run_raw(
 		callback: OnStatus,
-		mut track: moq_net::track::Subscriber,
+		mut track: moq_net::track::Ordered,
 		mut close: oneshot::Receiver<()>,
 		mut updates: mpsc::UnboundedReceiver<Option<moq_net::track::Subscription>>,
 	) -> Result<(), Error> {
@@ -634,7 +707,7 @@ impl Consume {
 	fn poll_raw_control(
 		close: &mut oneshot::Receiver<()>,
 		updates: &mut mpsc::UnboundedReceiver<Option<moq_net::track::Subscription>>,
-		track: &mut moq_net::track::Subscriber,
+		track: &mut moq_net::track::Ordered,
 		waiter: &moq_net::kio::Waiter,
 	) -> bool {
 		let mut cx = std::task::Context::from_waker(waiter.waker());
@@ -708,7 +781,12 @@ impl Consume {
 	/// `on_datagram` is called with a datagram ID for each datagram in arrival order;
 	/// each must be released with [`Self::datagram_close`].
 	pub fn datagram_track(&mut self, broadcast: Id, name: &str, on_datagram: OnStatus) -> Result<Id, Error> {
-		let broadcast = self.broadcast.get(broadcast).ok_or(Error::BroadcastNotFound)?.clone();
+		let broadcast = self
+			.broadcast
+			.get(broadcast)
+			.ok_or(Error::BroadcastNotFound)?
+			.broadcast
+			.clone();
 		let name = name.to_string();
 
 		let channel = oneshot::channel();
@@ -819,10 +897,15 @@ impl Consume {
 		&mut self,
 		broadcast: Id,
 		name: &str,
-		config: moq_json::snapshot::ConsumerConfig,
+		config: moq_json::snapshot::consumer::Config,
 		on_value: OnStatus,
 	) -> Result<Id, Error> {
-		let broadcast = self.broadcast.get(broadcast).ok_or(Error::BroadcastNotFound)?.clone();
+		let broadcast = self
+			.broadcast
+			.get(broadcast)
+			.ok_or(Error::BroadcastNotFound)?
+			.broadcast
+			.clone();
 		let name = name.to_string();
 
 		let channel = oneshot::channel();
@@ -883,10 +966,15 @@ impl Consume {
 		&mut self,
 		broadcast: Id,
 		name: &str,
-		config: moq_json::stream::ConsumerConfig,
+		config: moq_json::stream::Config,
 		on_value: OnStatus,
 	) -> Result<Id, Error> {
-		let broadcast = self.broadcast.get(broadcast).ok_or(Error::BroadcastNotFound)?.clone();
+		let broadcast = self
+			.broadcast
+			.get(broadcast)
+			.ok_or(Error::BroadcastNotFound)?
+			.broadcast
+			.clone();
 		let name = name.to_string();
 
 		let channel = oneshot::channel();

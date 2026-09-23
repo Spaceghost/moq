@@ -14,7 +14,8 @@ public final class TrackConsumer: AsyncSequence, Sendable {
     }
 
     /// The next group in sequence order, skipping forward on fall-behind. `nil`
-    /// once the track ends.
+    /// once the track ends. Shares the sequence cursor with `readFrame`: a group
+    /// one method has already taken is not returned by the other.
     public func nextGroup() async throws -> GroupConsumer? {
         (try await ffi.nextGroup()).map(GroupConsumer.init)
     }
@@ -26,7 +27,9 @@ public final class TrackConsumer: AsyncSequence, Sendable {
     }
 
     /// Read the first timestamped frame of the next group. Convenience for
-    /// one-frame-per-group tracks (status/command style). `nil` once the track ends.
+    /// one-frame-per-group tracks (status/command style). Completed empty groups
+    /// are skipped. `nil` only once the track ends. Cancelling one call keeps
+    /// the current group so a later `readFrame` or `nextGroup` still sees it.
     public func readFrame() async throws -> Frame? {
         try await ffi.readFrame()
     }
@@ -123,7 +126,7 @@ public final class TrackProducer: Sendable {
     }
 
     /// A read handle for this track (local pub/sub, no origin needed).
-    /// `subscription` tunes delivery priority, group ordering priority, and group range; omit for defaults.
+    /// `subscription` tunes delivery priority, group range, and staleness; omit for defaults.
     public func consume(subscription: Subscription? = nil) throws -> TrackConsumer {
         TrackConsumer(try ffi.consume(subscription: subscription))
     }

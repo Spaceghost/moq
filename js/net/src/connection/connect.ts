@@ -1,18 +1,26 @@
 import Session, { type Version as QmuxVersion } from "@moq/qmux";
+import { error, fromClose } from "../error.ts";
 import * as Ietf from "../ietf/index.ts";
 import * as Lite from "../lite/index.ts";
+import type { Consumer as OriginConsumer, Producer as OriginProducer } from "../origin.ts";
 import { Stream } from "../stream.ts";
+import * as Time from "../time.ts";
 import * as Hex from "../util/hex.ts";
 import { dev, redact } from "../util/log.ts";
 import { isWebTransportSupported } from "./browser.ts";
 import type { Established } from "./established.ts";
+import { forwardAnnounced } from "./forward.ts";
 import { exchangeSetup } from "./handshake.ts";
 
 // Default head start for WebTransport before attempting the WebSocket fallback.
-const DEFAULT_WEBSOCKET_DELAY_MS = 500;
+const DEFAULT_WEBSOCKET_DELAY_MS = Time.Milli(500);
+
+// RESET_STREAM and CONNECTION_CLOSE are separate transport notifications. Give the latter
+// time to surface its authoritative code without letting a reset-only peer stall SETUP forever.
+const SETUP_CLOSE_GRACE_MS = 100;
 
 /** Tuning for the WebSocket fallback used when WebTransport is unavailable or loses the connect race. */
-export interface WebSocketOptions {
+export interface WebSocketProps {
 	/** Enable the WebSocket fallback. Defaults to `true`. */
 	enabled?: boolean;
 
@@ -23,7 +31,7 @@ export interface WebSocketOptions {
 	 * The delay in milliseconds before attempting the WebSocket fallback (default: 500).
 	 * If WebSocket won the previous race for a given URL, this is 0.
 	 */
-	delay?: DOMHighResTimeStamp;
+	delay?: Time.Milli;
 }
 
 /**
@@ -56,11 +64,14 @@ export interface WebTransportProps extends Omit<WebTransportOptions, "serverCert
 
 /** Options for {@link connect}. */
 export interface ConnectProps {
+	/** The relay URL. */
+	url: URL;
+
 	/** WebTransport options. */
 	webtransport?: WebTransportProps;
 
 	/** WebSocket (fallback) options. */
-	websocket?: WebSocketOptions;
+	websocket?: WebSocketProps;
 
 	/**
 	 * Use a pre-existing WebTransport session instead of connecting; skips the
@@ -73,9 +84,31 @@ export interface ConnectProps {
 
 	/**
 	 * Whether the relay supports broadcast discovery; see {@link Established.discovery}.
-	 * Defaults to true, except for relays known to lack it.
+	 * Defaults to true.
 	 */
 	discovery?: boolean;
+
+	/**
+	 * The origin whose broadcasts the session announces and serves to the peer. Omit to
+	 * publish nothing.
+	 *
+	 * The origin is borrowed, not owned: closing the session leaves its broadcasts alone,
+	 * and the same origin can back several sessions (or successive reconnects), each
+	 * announcing the table for as long as it lasts.
+	 */
+	publish?: OriginConsumer;
+
+	/**
+	 * The origin the session feeds with the peer's announced broadcasts. Omit to discover
+	 * nothing.
+	 *
+	 * Everything the peer announces appears in the origin's table for the session's
+	 * lifetime, consumable by path; the entries retract when the session dies. Pass the
+	 * producer behind {@link ConnectProps.publish} to route both directions through one
+	 * origin: a locally published path is then served back to local consumers directly, and
+	 * the session still never announces the peer's own broadcasts back to it.
+	 */
+	consume?: OriginProducer;
 
 	/**
 	 * Aborts the connection attempt with the signal's reason. An already-aborted
@@ -85,15 +118,11 @@ export interface ConnectProps {
 	signal?: AbortSignal;
 }
 
-// Relays that don't implement broadcast discovery (SUBSCRIBE_NAMESPACE), so `announced()` would
-// never yield and a consumer waiting on an announcement would hang forever. Override with the
-// `discovery` option. Drop a host once its relay ships discovery.
-const NO_DISCOVERY_HOSTS = ["mediaoverquic.com"];
-
-/** Whether the relay at `url` is expected to support broadcast discovery. */
-function defaultDiscovery(url: URL): boolean {
-	return !NO_DISCOVERY_HOSTS.some((host) => url.hostname.endsWith(host));
-}
+/** The per-session wiring shared by every negotiated protocol path. */
+type SessionProps = {
+	discovery: boolean;
+	publish?: OriginConsumer;
+};
 
 // Save if WebSocket won the last race, so we won't give QUIC a head start next time.
 const websocketWon = new Set<string>();
@@ -106,10 +135,10 @@ const NEVER_ABORTED = new AbortController().signal;
  *
  * @param url - The URL of the server to connect to
  * @param props - Connection options
- * @returns A promise that resolves to a Connection instance
+ * @returns A promise that resolves to an established session
  */
-export async function connect(url: URL, props?: ConnectProps): Promise<Established> {
-	const signal = props?.signal ?? NEVER_ABORTED;
+export async function connect({ url, ...props }: ConnectProps): Promise<Established> {
+	const signal = props.signal ?? NEVER_ABORTED;
 	signal.throwIfAborted();
 
 	// Resolves on abort so every in-flight transport tears itself down.
@@ -121,7 +150,10 @@ export async function connect(url: URL, props?: ConnectProps): Promise<Establish
 	try {
 		// A `pending` rejection propagates unless the abort beat it to the finish line.
 		const connection = await Promise.race([pending, abort.then(() => undefined)]);
-		if (connection && !signal.aborted) return connection;
+		if (connection && !signal.aborted) {
+			if (props.consume) forwardAnnounced(connection, props.consume);
+			return connection;
+		}
 
 		// Close a connection that settles after the abort.
 		pending.then((conn) => conn.close()).catch(() => {});
@@ -131,28 +163,31 @@ export async function connect(url: URL, props?: ConnectProps): Promise<Establish
 	}
 }
 
-async function connectInner(url: URL, props: ConnectProps | undefined, abort: Promise<void>): Promise<Established> {
-	const discovery = props?.discovery ?? defaultDiscovery(url);
+async function connectInner(url: URL, props: Omit<ConnectProps, "url">, abort: Promise<void>): Promise<Established> {
+	const wiring: SessionProps = {
+		discovery: props.discovery ?? true,
+		publish: props.publish,
+	};
 
-	if (props?.transport) {
+	if (props.transport) {
 		const transport = props.transport;
 		void abort.then(() => transport.close());
-		return connectTransport(url, transport, discovery);
+		return connectTransport(url, transport, wiring);
 	}
 
 	// Stop transports after one connects or the caller aborts.
 	const { promise: raced, resolve: done } = Promise.withResolvers<void>();
 	const cancel = Promise.race([raced, abort]);
 
-	const webtransport = isWebTransportSupported() ? connectWebTransport(url, cancel, props?.webtransport) : undefined;
+	const webtransport = isWebTransportSupported() ? connectWebTransport(url, cancel, props.webtransport) : undefined;
 
 	// Give QUIC a head start to connect before trying WebSocket, unless WebSocket has won in the past.
 	// NOTE that QUIC should be faster because it involves 1/2 fewer RTTs.
 	const headstart =
-		!webtransport || websocketWon.has(url.toString()) ? 0 : (props?.websocket?.delay ?? DEFAULT_WEBSOCKET_DELAY_MS);
+		!webtransport || websocketWon.has(url.toString()) ? 0 : (props.websocket?.delay ?? DEFAULT_WEBSOCKET_DELAY_MS);
 	const websocket =
-		props?.websocket?.enabled !== false
-			? connectWebSocket(props?.websocket?.url ?? url, headstart, cancel)
+		props.websocket?.enabled !== false
+			? connectWebSocket(props.websocket?.url ?? url, headstart, cancel)
 			: undefined;
 
 	if (!websocket && !webtransport) {
@@ -186,10 +221,39 @@ async function connectInner(url: URL, props: ConnectProps | undefined, abort: Pr
 	}
 
 	// The remaining setup is identical whether the transport was raced or supplied.
-	return await connectTransport(url, session as WebTransport, discovery);
+	return await connectTransport(url, session as WebTransport, wiring);
 }
 
-async function connectTransport(url: URL, session: WebTransport, discovery: boolean): Promise<Established> {
+async function connectTransport(url: URL, session: WebTransport, wiring: SessionProps): Promise<Established> {
+	const closed = session.closed.then(fromClose, error);
+	const terminal = closed.then((cause) => {
+		throw cause ?? new Error("session closed during SETUP");
+	});
+
+	try {
+		return await Promise.race([terminal, negotiate(url, session, wiring)]);
+	} catch (cause) {
+		// A session shutdown can reject its SETUP stream before `closed` publishes the
+		// peer's close code. Wait briefly without closing locally, since a local clean close
+		// could overwrite that code. A reset-only peer is cleaned up after the grace period.
+		const pending = Symbol("session close pending");
+		const final = await Promise.race([
+			closed,
+			new Promise<typeof pending>((resolve) => setTimeout(() => resolve(pending), SETUP_CLOSE_GRACE_MS)),
+		]);
+		if (final !== pending) {
+			if (final) throw final;
+			throw cause;
+		}
+
+		session.close();
+		throw cause;
+	}
+}
+
+// Negotiate the MoQ protocol over an established transport. The caller races this against
+// the session closing so a close code is not lost behind a failed or stalled SETUP stream.
+async function negotiate(url: URL, session: WebTransport, wiring: SessionProps): Promise<Established> {
 	// qmux Session exposes the negotiated protocol directly (as "" when there is none);
 	// native WebTransport doesn't have a standard .protocol property yet.
 	const protocol: string | undefined = (session as { protocol?: string }).protocol || undefined;
@@ -198,31 +262,33 @@ async function connectTransport(url: URL, session: WebTransport, discovery: bool
 	// Choose setup encoding based on negotiated WebTransport protocol (if any).
 	let setupVersion: Ietf.Version;
 	const modernVersion =
-		protocol === Ietf.ALPN.DRAFT_21
-			? Ietf.Version.DRAFT_21
-			: protocol === Ietf.ALPN.DRAFT_20
-				? Ietf.Version.DRAFT_20
-				: protocol === Ietf.ALPN.DRAFT_19
-					? Ietf.Version.DRAFT_19
-					: protocol === Ietf.ALPN.DRAFT_18
-						? Ietf.Version.DRAFT_18
-						: protocol === Ietf.ALPN.DRAFT_17
-							? Ietf.Version.DRAFT_17
-							: undefined;
+		protocol === Ietf.ALPN.DRAFT_22
+			? Ietf.Version.DRAFT_22
+			: protocol === Ietf.ALPN.DRAFT_21
+				? Ietf.Version.DRAFT_21
+				: protocol === Ietf.ALPN.DRAFT_20
+					? Ietf.Version.DRAFT_20
+					: protocol === Ietf.ALPN.DRAFT_19
+						? Ietf.Version.DRAFT_19
+						: protocol === Ietf.ALPN.DRAFT_18
+							? Ietf.Version.DRAFT_18
+							: protocol === Ietf.ALPN.DRAFT_17
+								? Ietf.Version.DRAFT_17
+								: undefined;
 	if (modernVersion !== undefined) {
-		return await handshakeAlpn(url, session, modernVersion, discovery);
+		return await handshakeAlpn(url, session, modernVersion, wiring);
 	} else if (protocol === Ietf.ALPN.DRAFT_16) {
 		setupVersion = Ietf.Version.DRAFT_16;
 	} else if (protocol === Ietf.ALPN.DRAFT_15) {
 		setupVersion = Ietf.Version.DRAFT_15;
 	} else if (protocol === Lite.ALPN_06_WIP) {
-		return new Lite.Connection({ url, quic: session, version: Lite.Version.DRAFT_06, discovery });
+		return new Lite.Connection({ url, quic: session, version: Lite.Version.DRAFT_06, ...wiring });
 	} else if (protocol === Lite.ALPN_05) {
-		return new Lite.Connection({ url, quic: session, version: Lite.Version.DRAFT_05, discovery });
+		return new Lite.Connection({ url, quic: session, version: Lite.Version.DRAFT_05, ...wiring });
 	} else if (protocol === Lite.ALPN_04) {
-		return new Lite.Connection({ url, quic: session, version: Lite.Version.DRAFT_04, discovery });
+		return new Lite.Connection({ url, quic: session, version: Lite.Version.DRAFT_04, ...wiring });
 	} else if (protocol === Lite.ALPN_03) {
-		return new Lite.Connection({ url, quic: session, version: Lite.Version.DRAFT_03, discovery });
+		return new Lite.Connection({ url, quic: session, version: Lite.Version.DRAFT_03, ...wiring });
 	} else if (protocol === Lite.ALPN || protocol === "" || protocol === undefined) {
 		setupVersion = Ietf.Version.DRAFT_14;
 	} else {
@@ -263,12 +329,12 @@ async function connectTransport(url: URL, session: WebTransport, discovery: bool
 			quic: session,
 			version: server.version as Lite.Version,
 			session: stream,
-			discovery,
+			...wiring,
 		});
 	} else if (Object.values(Ietf.Version).includes(server.version as Ietf.Version)) {
 		const maxRequestId = server.parameters.getVarint(Ietf.SetupOption.MaxRequestId) ?? 0n;
 		return new Ietf.Connection({
-			discovery,
+			...wiring,
 			client: true,
 			url,
 			quic: session,
@@ -290,12 +356,12 @@ async function handshakeAlpn(
 	url: URL,
 	session: WebTransport,
 	version: Ietf.IetfVersion,
-	discovery: boolean,
+	wiring: SessionProps,
 ): Promise<Established> {
 	const { control, solicit, cluster } = await exchangeSetup(session, version, "moq-lite-js");
 
 	return new Ietf.Connection({
-		discovery,
+		...wiring,
 		client: true,
 		url,
 		quic: session,
@@ -373,6 +439,7 @@ async function connectWebTransport(
 			Lite.ALPN_04,
 			Lite.ALPN_03,
 			Lite.ALPN,
+			Ietf.ALPN.DRAFT_22,
 			Ietf.ALPN.DRAFT_21,
 			Ietf.ALPN.DRAFT_20,
 			Ietf.ALPN.DRAFT_19,
@@ -458,6 +525,7 @@ async function connectWebSocket(url: URL, delay: number, cancel: Promise<void>):
 		[Lite.ALPN_04]: null,
 		[Lite.ALPN_03]: null,
 		[Lite.ALPN]: null,
+		[Ietf.ALPN.DRAFT_22]: "qmux-01",
 		[Ietf.ALPN.DRAFT_21]: "qmux-01",
 		[Ietf.ALPN.DRAFT_20]: "qmux-01",
 		[Ietf.ALPN.DRAFT_19]: "qmux-01",

@@ -5,7 +5,7 @@ The `/rs` Cargo workspace. Extends the root `CLAUDE.md`.
 One crate per component from the root list, named `moq-<component>` (`hang` and `libmoq` are the exceptions). Keep them modular; a crate does one thing. Beyond that list:
 
 - `kio`: "easy async" primitives everything else polls through.
-- `moq-native`: configures the QUIC backends (Quinn/Quiche/Noq/Iroh) and the fallback transports for native binaries.
+- `moq-tokio`: configures the QUIC backends (Quinn/Quiche/Noq/Iroh) and the fallback transports for native binaries, on tokio. `moq-sock` holds the socket plumbing it shares with `moq-uring`, the experimental thread-per-core io\_uring runtime.
 - `moq-cli` builds the `moq` binary and owns the CLI surface for the gateway crates. Binaries never carry a `-cli` suffix.
 
 `moq-net`, `moq-mux`, `moq-relay` (including the config conventions every binary shares), and `moq-ffi` have their own `CLAUDE.md`.
@@ -36,6 +36,7 @@ Prefer poll. New logic is a `poll_*` with an `async` helper, not the other way a
 - Take `&[T]` / `&str` for data the callee only reads; return owned values. Take `Vec<T>` only when storing it.
 - Typed units only: `std::time::Duration`, `moq_net::Timestamp`, never `f64` seconds or bare `u64` millis. `serde_as` converts at the edge.
 - `if let` / `let else` over a `match` whose only job is to bind. Keep `match` when both arms do work.
+- Derive `Serialize`/`Deserialize`; a hand-written impl is a second copy of the wire shape. Reach for `serde_with` for what the derive can't express.
 - Public modules with short names: `broadcast::Consumer`, not `BroadcastConsumer`. Keep `mod encoder` private and re-export flat as `encode::Encoder`.
 - Workspace members and shared dependency versions live in the root `Cargo.toml`; crates reference deps via `{ workspace = true }`.
 - Use newtypes and enums instead of untyped strings.
@@ -45,7 +46,7 @@ Prefer poll. New logic is a `poll_*` with an `async` helper, not the other way a
 
 - Don't add `#[non_exhaustive]` by default. It earns its keep on error enums, enums that will gain variants, and `Config`-style structs with `pub` fields plus a `Default`/constructor. Builders with private fields don't need it.
 - Append new variants to the end of a public fieldless enum with implicit discriminants; inserting reorders `as` values.
-- A deprecated item gets `#[doc(hidden)]` and `#[deprecated(note)]`; a deprecated flag becomes a hidden clap alias. Never advertise the dead name in docs or `--help`.
+- A deprecated item gets `#[doc(hidden)]` and `#[deprecated(note)]`; a deprecated flag becomes a hidden alias (`alias_hidden`; Usage advertises a plain `alias` in help and completions). Never advertise the dead name in docs or `--help`.
 
 # Testing
 

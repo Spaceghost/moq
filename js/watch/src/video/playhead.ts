@@ -46,3 +46,19 @@ export function caughtUp(props: CaughtUp): boolean {
 
 	return Time.Milli.add(props.playhead, SLACK) >= props.active;
 }
+
+/** The rendition delays that can be present during a track handoff. */
+export interface SwitchJitter {
+	/** The delay required by the rendition currently on screen. */
+	active?: Time.Milli;
+
+	/** The delay required by the rendition preparing to replace it. */
+	pending?: Time.Milli;
+}
+
+/** The delay Sync must cover while a rendition switch is in flight. */
+export function switchJitter(props: SwitchJitter): Time.Milli | undefined {
+	if (props.active === undefined) return props.pending;
+	if (props.pending === undefined) return props.active;
+	return Time.Milli.max(props.active, props.pending);
+}

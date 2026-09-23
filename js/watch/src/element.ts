@@ -9,10 +9,13 @@ import type * as Catalog from "@moq/hang/catalog";
 import type { Time } from "@moq/net";
 import * as Moq from "@moq/net";
 import { Effect, Signal } from "@moq/signals";
-import * as Audio from "./audio";
-import { Broadcast, type CatalogFormat, parseCatalogFormat } from "./broadcast";
-import { type Bound, type Latency, latencyBounds, latencyFromBounds, type Paced, Sync } from "./sync";
-import * as Video from "./video";
+import type * as Audio from "./audio";
+import { type Broadcast, CATALOG_FORMATS, type CatalogFormat } from "./broadcast";
+import { formatDuration, parseDuration } from "./duration";
+import { Player } from "./player";
+import type { Delay, Sync } from "./sync";
+import type * as Text from "./text";
+import type * as Video from "./video";
 
 const OBSERVED = [
 	"url",
@@ -21,12 +24,16 @@ const OBSERVED = [
 	"volume",
 	"muted",
 	"visible",
+	"announced",
+	"delay",
+	"buffer",
+	// Released spellings are observed only so assigning them can fail loudly instead of being ignored.
 	"reload",
 	"latency",
 	"latency-min",
-	"latency-max",
 	"jitter",
 	"catalog-format",
+	"captions",
 ] as const;
 type Observed = (typeof OBSERVED)[number];
 
@@ -43,10 +50,37 @@ function parseVisible(value: string | null): Video.Visible {
 	return "20%";
 }
 
+// Parse the `delay` attribute: "auto" (adaptive), "instant" (no buffer, no pacing), or a duration.
+function parseDelay(value: string | null): Delay {
+	const trimmed = value?.trim();
+	if (!trimmed || trimmed === "auto") return "auto";
+	if (trimmed === "instant") return "instant";
+	const parsed = parseDuration(trimmed);
+	if (parsed !== undefined) return parsed;
+	console.warn(`moq-watch: invalid delay="${value}", expected "auto", "instant", or a duration like "300ms"`);
+	return "auto";
+}
+
+// Parse the `buffer` attribute: a duration, or none when absent.
+function parseBuffer(value: string | null): Time.Milli {
+	const trimmed = value?.trim();
+	if (!trimmed) return Moq.Time.Milli.zero;
+	const parsed = parseDuration(trimmed);
+	if (parsed !== undefined) return parsed;
+	console.warn(`moq-watch: invalid buffer="${value}", expected a duration like "30s"`);
+	return Moq.Time.Milli.zero;
+}
+
+/** Parse the element's catalog-format attribute. */
+export function parseCatalogFormat(value: string | null): CatalogFormat | undefined {
+	if (value === null) return undefined;
+	return CATALOG_FORMATS.find((format) => format === value);
+}
+
 /**
  * Parse a boolean attribute: absent uses `defaultValue`, bare presence is true, and an explicit
  * `"false"`/`"0"` is false. Presence alone can't express false, and attributes that default to
- * true (`reload`) need to, so every boolean attribute accepts the explicit form.
+ * true (`announced`) need to, so every boolean attribute accepts the explicit form.
  */
 function parseBoolean(value: string | null, defaultValue: boolean): boolean {
 	if (value === null) return defaultValue;
@@ -64,7 +98,14 @@ export default class MoqWatch extends HTMLElement {
 	static observedAttributes = OBSERVED;
 
 	// The connection to the moq-relay server.
-	connection: Moq.Connection.Reload;
+	/**
+	 * The relay connection, shared with every other element on the page pointing at the
+	 * same URL. Its `origin` is where the broadcasts live.
+	 */
+	connection: Moq.Connection;
+
+	/** Headless playback pipeline behind this element. */
+	readonly player: Player;
 
 	// The broadcast being watched.
 	broadcast: Broadcast;
@@ -81,7 +122,13 @@ export default class MoqWatch extends HTMLElement {
 	/** Plays decoded samples through the speakers. */
 	emitter: Audio.Emitter;
 
-	/** Keeps audio and video playing at the target latency. */
+	/** Selects the caption track. `text.out.available` lists the renditions for a picker. */
+	text: Text.Source;
+
+	/** Renders the selected text cues into an overlay above the canvas. */
+	textRenderer: Text.Renderer;
+
+	/** Keeps audio and video playing at the configured delay. */
 	sync: Sync;
 
 	// The mutable user controls. As the top of the tree, this element owns the
@@ -93,34 +140,29 @@ export default class MoqWatch extends HTMLElement {
 		muted: new Signal(false),
 		// When video is downloaded relative to the canvas position. See {@link Video.Visible}.
 		visible: new Signal<Video.Visible>("20%"),
-		latency: new Signal<Latency>("real-time"),
+		// How far playback trails the live edge.
+		delay: new Signal<Delay>("auto"),
+		// Future-dated media held beyond the live edge before playback skips ahead.
+		buffer: new Signal<Time.Milli>(Moq.Time.Milli.zero),
 		// The desired video rendition (resolution/bitrate cap).
 		target: new Signal<Video.Target | undefined>(undefined),
+		// The selected caption track name, or undefined for off (the default; captions are opt-in).
+		captions: new Signal<string | undefined>(undefined),
 	};
 
 	// Broadcast configuration owned here and wired into `broadcast` as inputs.
 	#name = new Signal<Moq.Path.Valid>(Moq.Path.empty());
-	#reload = new Signal(true);
+	#announced = new Signal(true);
 	#catalogFormat = new Signal<CatalogFormat | undefined>(undefined);
 	#catalog = new Signal<Catalog.Root | undefined>(undefined);
 
 	// The canvas element to render into.
 	#canvas = new Signal<HTMLCanvasElement | undefined>(undefined);
 
-	// Whether to download. Driven by the renderer/emitter policy, read by the decoders.
-	#videoEnabled = new Signal(false);
-	#audioEnabled = new Signal(false);
-
-	// Set while this element writes the `latency` attribute itself, so attributeChangedCallback
-	// ignores the echo. Dropping a stale value would otherwise parse back as "real-time" and
-	// clobber the range that replaced it.
-	#reflectingLatency = false;
-
-	// Whether video paces off the clock, cleared while the latency is "instant".
-	#videoPaced = new Signal(true);
-
-	// The latency handed to Sync, which has no way to express "instant".
-	#syncLatency = new Signal<Paced>("real-time");
+	// The overlay element captions are drawn into, created lazily on connect (custom elements may not
+	// touch children in their constructor). Positioned to fill the element, above the canvas.
+	#captionsOverlay = new Signal<HTMLElement | undefined>(undefined);
+	#captionsOverlayEl?: HTMLDivElement;
 
 	// Set when the element is connected to the DOM.
 	#enabled = new Signal(false);
@@ -141,113 +183,32 @@ export default class MoqWatch extends HTMLElement {
 
 		cleanup.register(this, this.signals);
 
-		this.connection = new Moq.Connection.Reload({
+		this.connection = new Moq.Connection({
 			enabled: this.#enabled,
 		});
 		this.signals.cleanup(() => this.connection.close());
 
-		this.broadcast = new Broadcast({
-			connection: this.connection.established,
+		this.player = new Player({
+			origin: this.connection.origin,
+			probe: this.connection.probe,
 			enabled: this.#enabled,
 			name: this.#name,
-			reload: this.#reload,
+			announced: this.#announced,
 			catalogFormat: this.#catalogFormat,
 			catalog: this.#catalog,
-		});
-		this.signals.cleanup(() => this.broadcast.close());
-
-		// The decoders' support probes drive rendition selection: anything WebCodecs can't play is filtered out.
-		const videoSource = new Video.Source({
-			broadcast: this.broadcast,
-			target: this.controls.target,
-			supported: Video.Decoder.supported,
-		});
-		const audioSource = new Audio.Source({
-			broadcast: this.broadcast,
-			supported: Audio.Decoder.supported,
-		});
-		this.signals.cleanup(() => {
-			videoSource.close();
-			audioSource.close();
-		});
-
-		// Sources produce the per-rendition jitter that Sync reads, so they're created
-		// before Sync to avoid a construction cycle.
-		//
-		// Sync can't implement "instant" on its own: not pacing video and disabling audio happens
-		// here. Hand it a zero buffer instead.
-		this.signals.run((effect) => {
-			const latency = effect.get(this.controls.latency);
-			this.#syncLatency.set(latency === "instant" ? Moq.Time.Milli.zero : latency);
-		});
-
-		this.sync = new Sync({
-			latency: this.#syncLatency,
-			connection: this.connection.established,
-			video: videoSource.out.jitter,
-			audio: audioSource.out.jitter,
-		});
-		this.signals.cleanup(() => this.sync.close());
-
-		// `latency="instant"` stops video waiting on the clock, so frames paint the moment they
-		// decode. The clock stays wired: it still tracks receipts and rewinds.
-		this.signals.run((effect) => {
-			this.#videoPaced.set(effect.get(this.controls.latency) !== "instant");
-		});
-
-		this.video = new Video.Decoder(videoSource, this.sync, {
-			enabled: this.#videoEnabled,
-			paced: this.#videoPaced,
-		});
-		this.audio = new Audio.Decoder(audioSource, this.sync, { enabled: this.#audioEnabled });
-		this.signals.cleanup(() => {
-			this.video.close();
-			this.audio.close();
-		});
-
-		this.emitter = new Audio.Emitter(this.audio, {
-			volume: this.controls.volume,
-			muted: this.controls.muted,
-			paused: this.controls.paused,
-		});
-		this.renderer = new Video.Renderer(this.video, {
 			canvas: this.#canvas,
-			visible: this.controls.visible,
+			container: this.#captionsOverlay,
+			...this.controls,
 		});
-		this.signals.cleanup(() => {
-			this.emitter.close();
-			this.renderer.close();
-		});
-
-		// Audio download follows the emitter's enable policy (paused/muted), except an instant
-		// latency turns it off outright: the ring needs a target depth to avoid underrunning, and
-		// unpaced video has nothing pulling it back toward the audio clock.
-		this.signals.run((effect) => {
-			const enabled = effect.get(this.emitter.out.enabled);
-			this.#audioEnabled.set(enabled && effect.get(this.controls.latency) !== "instant");
-		});
-
-		// Stopping the download leaves the ring holding a floor's worth of PCM, and the emitter
-		// stays connected to drain it. Flush on the way in so audio stops now instead of playing
-		// against video that just jumped to the live edge.
-		this.signals.run((effect) => {
-			if (effect.get(this.controls.latency) !== "instant") return;
-			this.audio.reset();
-		});
-
-		// Video downloads while playing and on-screen. When paused, keep downloading only
-		// until a frame is on the canvas, then stop: a cold paused start still shows a poster
-		// instead of black, without streaming while paused. Read the rendered frame only in
-		// the paused branch so playback doesn't re-run this every painted frame.
-		this.signals.run((effect) => {
-			const visible = effect.get(this.renderer.out.visible);
-			if (!effect.get(this.controls.paused)) {
-				this.#videoEnabled.set(visible);
-				return;
-			}
-			const frame = effect.get(this.renderer.out.frame);
-			this.#videoEnabled.set(visible && !frame);
-		});
+		this.signals.cleanup(() => this.player.close());
+		this.broadcast = this.player.broadcast;
+		this.video = this.player.video;
+		this.audio = this.player.audio;
+		this.renderer = this.player.renderer;
+		this.emitter = this.player.emitter;
+		this.text = this.player.text;
+		this.textRenderer = this.player.textRenderer;
+		this.sync = this.player.sync;
 
 		// Mute/volume coupling. The element owns the writable volume/muted Signals, so
 		// the policy lives here: muting stashes and zeroes the volume; a zero volume
@@ -330,29 +291,15 @@ export default class MoqWatch extends HTMLElement {
 			this.setAttribute("visible", visible);
 		});
 
+		// Each knob is 1:1 with its attribute, so the echo back through attributeChangedCallback
+		// parses to the value already held and the effect settles.
 		this.signals.run((effect) => {
-			const latency = effect.get(this.controls.latency);
-			if (latency === "instant") {
-				this.#reflectLatency("instant");
-				return;
-			}
+			const delay = effect.get(this.controls.delay);
+			this.setAttribute("delay", typeof delay === "number" ? formatDuration(delay) : delay);
+		});
 
-			const { min, max } = latencyBounds(latency);
-			// Only reflect the collapsed `latency` sugar attribute when the range is actually
-			// collapsed. An open range is expressed via latency-min/latency-max, and writing
-			// `latency` here would round-trip back through attributeChangedCallback and collapse it.
-			if (min !== max) {
-				// Still drop a stale "instant": leaving it would advertise a mode the element is no
-				// longer in, and a clone would come back up in it.
-				if (this.getAttribute("latency") === "instant") this.#reflectLatency(undefined);
-				return;
-			}
-			if (min === "real-time") {
-				this.#reflectLatency("real-time");
-			} else {
-				const jitter = Math.floor(effect.get(this.sync.out.jitter));
-				this.#reflectLatency(jitter.toString());
-			}
+		this.signals.run((effect) => {
+			this.setAttribute("buffer", formatDuration(effect.get(this.controls.buffer)));
 		});
 
 		// Track the element's rendered size and feed it into the rendition picker,
@@ -387,40 +334,24 @@ export default class MoqWatch extends HTMLElement {
 		this.#enabled.set(true);
 		this.style.display = "block";
 		this.style.position = "relative";
+
+		// Create the caption overlay once, on first connect (the constructor may not add children).
+		if (!this.#captionsOverlayEl) {
+			const overlay = document.createElement("div");
+			overlay.style.position = "absolute";
+			overlay.style.inset = "0";
+			overlay.style.pointerEvents = "none";
+			// Above the canvas, which paints at the default stacking level.
+			overlay.style.zIndex = "1";
+			this.appendChild(overlay);
+			this.#captionsOverlayEl = overlay;
+			this.#captionsOverlay.set(overlay);
+		}
 	}
 
 	disconnectedCallback() {
 		// Stop everything but don't actually cleanup just in case we get added back to the DOM.
 		this.#enabled.set(false);
-	}
-
-	// Parse a single latency bound: absent or "real-time" is adaptive, otherwise a fixed ms value.
-	#parseBound(value: string | null): Bound {
-		if (!value || value === "real-time") return "real-time";
-		if (value === "instant") {
-			console.warn('moq-watch: "instant" is not a bound, use latency="instant"');
-			return "real-time";
-		}
-		const parsed = Number.parseFloat(value);
-		return Moq.Time.Milli(Number.isFinite(parsed) ? parsed : 100);
-	}
-
-	// Write the `latency` attribute (undefined removes it) without the echo coming back through
-	// attributeChangedCallback. Custom element reactions run before setAttribute/removeAttribute
-	// returns, so the flag still covers the callback.
-	#reflectLatency(value: string | undefined): void {
-		this.#reflectingLatency = true;
-		try {
-			if (value === undefined) this.removeAttribute("latency");
-			else this.setAttribute("latency", value);
-		} finally {
-			this.#reflectingLatency = false;
-		}
-	}
-
-	// Parse the `latency` attribute, which also accepts the range-replacing "instant".
-	#parseLatency(value: string | null): Latency {
-		return value?.trim() === "instant" ? "instant" : this.#parseBound(value);
 	}
 
 	attributeChangedCallback(name: Observed, oldValue: string | null, newValue: string | null) {
@@ -441,20 +372,21 @@ export default class MoqWatch extends HTMLElement {
 			this.controls.muted.set(parseBoolean(newValue, false));
 		} else if (name === "visible") {
 			this.controls.visible.set(parseVisible(newValue));
+		} else if (name === "announced") {
+			this.#announced.set(parseBoolean(newValue, true));
+		} else if (name === "delay") {
+			this.controls.delay.set(parseDelay(newValue));
+		} else if (name === "buffer") {
+			this.controls.buffer.set(parseBuffer(newValue));
 		} else if (name === "reload") {
-			this.#reload.set(parseBoolean(newValue, true));
-		} else if (name === "latency") {
-			// Sugar: collapse the floor and ceiling to a single value.
-			if (!this.#reflectingLatency) this.latency = this.#parseLatency(newValue);
-		} else if (name === "latency-min") {
-			this.latencyMin = this.#parseBound(newValue);
-		} else if (name === "latency-max") {
-			this.latencyMax = this.#parseBound(newValue);
-		} else if (name === "jitter") {
-			// Deprecated: use latency="<number>" instead.
-			this.latency = this.#parseBound(newValue);
+			console.warn("moq-watch: `reload` was renamed to `announced`");
+		} else if (name === "latency" || name === "latency-min" || name === "jitter") {
+			console.warn(`moq-watch: \`${name}\` is gone; use \`delay\` and \`buffer\``);
 		} else if (name === "catalog-format") {
 			this.#catalogFormat.set(parseCatalogFormat(newValue));
+		} else if (name === "captions") {
+			// The selected caption track name; absent or empty turns captions off.
+			this.controls.captions.set(newValue || undefined);
 		} else {
 			const exhaustive: never = name;
 			throw new Error(`Invalid attribute: ${exhaustive}`);
@@ -509,52 +441,72 @@ export default class MoqWatch extends HTMLElement {
 		this.controls.visible.set(value);
 	}
 
-	get reload(): boolean {
-		return this.#reload.peek();
+	get announced(): boolean {
+		return this.#announced.peek();
 	}
 
-	set reload(value: boolean) {
-		this.#reload.set(value);
+	set announced(value: boolean) {
+		this.#announced.set(value);
+	}
+
+	/** @internal */
+	set reload(_value: unknown) {
+		throw new Error("moq-watch: `reload` was renamed to `announced`");
 	}
 
 	/**
-	 * The latency target. Assign a scalar (or `"real-time"`) to minimize latency, or an object
-	 * `{ min, max }` to open a range and buffer future-dated frames. See {@link Latency}.
+	 * How far playback trails the live edge, in milliseconds. See {@link Delay}.
 	 *
-	 * `"instant"` drops the clock instead: video paints the moment it decodes and audio is
-	 * disabled. Assigning `latencyMin` or `latencyMax` leaves that mode, since both write a range.
+	 * `"auto"` (the default) sizes the jitter buffer from the connection RTT. `"instant"` drops the
+	 * clock instead: video paints the moment it decodes and audio is disabled.
 	 */
-	get latency(): Latency {
-		return this.controls.latency.peek();
+	get delay(): Delay {
+		return this.controls.delay.peek();
 	}
 
-	set latency(value: Latency) {
-		this.controls.latency.set(value);
-	}
-
-	/** The latency floor (jitter/startup buffer). Read-modify-writes `latency`, leaving the ceiling. */
-	get latencyMin(): Bound {
-		return latencyBounds(this.controls.latency.peek()).min;
-	}
-
-	set latencyMin(value: Bound) {
-		const { max } = latencyBounds(this.controls.latency.peek());
-		this.controls.latency.set(latencyFromBounds(value, max));
+	set delay(value: Delay) {
+		this.controls.delay.set(value);
 	}
 
 	/**
-	 * The latency ceiling: `"real-time"` (default) minimizes, a number caps at that many ms. A
-	 * ceiling above the floor enables buffered playback: build up a buffer from future-dated frames
-	 * (e.g. TTS written faster than real-time) and only skip ahead past the cap. Call `reset()` at
-	 * each utterance boundary. Read-modify-writes `latency`, leaving the floor untouched.
+	 * Future-dated media held beyond the live edge before playback skips ahead, in milliseconds.
+	 *
+	 * Zero (the default) minimizes latency. A larger value enables buffered playback: build up a
+	 * buffer from future-dated frames (e.g. TTS written faster than real-time) and only skip ahead
+	 * once they would sit further than `delay + buffer` past the playhead. Call `reset()` at each
+	 * utterance boundary.
 	 */
-	get latencyMax(): Bound {
-		return latencyBounds(this.controls.latency.peek()).max;
+	get buffer(): Time.Milli {
+		return this.controls.buffer.peek();
 	}
 
-	set latencyMax(value: Bound) {
-		const { min } = latencyBounds(this.controls.latency.peek());
-		this.controls.latency.set(latencyFromBounds(min, value));
+	set buffer(value: Time.Milli) {
+		this.controls.buffer.set(value);
+	}
+
+	/** @internal */
+	get latency(): Delay {
+		return this.controls.delay.peek();
+	}
+
+	set latency(_value: unknown) {
+		throw new Error("moq-watch: `latency` is gone; use `delay` and `buffer`");
+	}
+
+	/** @internal */
+	get latencyMin(): Delay {
+		return this.controls.delay.peek();
+	}
+
+	set latencyMin(_value: unknown) {
+		throw new Error("moq-watch: `latencyMin` is gone; use `delay` and `buffer`");
+	}
+
+	/** @internal */
+	set latencyMax(_value: unknown) {
+		throw new Error(
+			"moq-watch: `latencyMax` is gone. Use `buffer`, the media held beyond the live edge; the old ceiling included the floor, so it is `latencyMax - delay`.",
+		);
 	}
 
 	/** The jitter buffer in milliseconds. */
@@ -562,13 +514,16 @@ export default class MoqWatch extends HTMLElement {
 		return this.sync.out.jitter.peek();
 	}
 
+	set jitter(_value: unknown) {
+		throw new Error("moq-watch: `jitter` is a readout; set `delay` instead");
+	}
+
 	/**
 	 * Re-anchor playback at an utterance boundary in buffered mode: reset the sync reference
 	 * and flush the audio buffer so the next utterance plays from its own first frame.
 	 */
 	reset(): void {
-		this.sync.reset();
-		this.audio.reset();
+		this.player.reset();
 	}
 
 	get catalogFormat(): CatalogFormat | undefined {
@@ -589,6 +544,19 @@ export default class MoqWatch extends HTMLElement {
 
 	set catalog(value: Catalog.Root | undefined) {
 		this.#catalog.set(value);
+	}
+
+	/**
+	 * The selected caption track name, or `undefined` for off (the default). Captions are opt-in:
+	 * assign a track name from `text.out.available` to turn them on. See the `text` source for the
+	 * list of renditions the broadcast publishes.
+	 */
+	get captions(): string | undefined {
+		return this.controls.captions.peek();
+	}
+
+	set captions(value: string | undefined) {
+		this.controls.captions.set(value || undefined);
 	}
 }
 

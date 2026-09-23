@@ -9,9 +9,9 @@ version = "0.14.18"
 edition = "2024"
 # sysinfo 0.39 (cache governor cgroup limits) needs 1.95, above the 1.91
 # workspace floor. moq-relay is lib+bin, so this applies to its library target
-# too, but the crate is an application with no external consumers; keeping the
-# bump per-crate holds it off the libraries others build on rather than raising
-# the whole workspace.
+# too. Workspace applications that depend on it (moq-cli) declare 1.95 as well;
+# keeping the bump per-crate holds it off the libraries others build on rather
+# than raising the whole workspace.
 rust-version = "1.95"
 
 keywords = ["quic", "http3", "webtransport", "media", "live"]
@@ -23,20 +23,32 @@ path = "src/main.rs"
 doc = false
 
 [features]
-default = ["iroh", "noq", "websocket", "uds"]
-iroh = ["moq-native/iroh"]
-jemalloc = ["moq-native/jemalloc"]
-noq = ["moq-native/noq"]
-quinn = ["moq-native/quinn"]
-quiche = ["moq-native/quiche"]
-# qlog trace capture (`--server-quic-qlog <DIR>`). Off by default: it compiles the
+# A programmatic relay fixture with generated TLS and ephemeral ports.
+test-support = []
+default = ["iroh", "cluster-lan", "noq", "websocket", "uds"]
+iroh = ["moq-tokio/iroh"]
+# Discover cluster peers on the LAN with mDNS (`--cluster-lan`).
+cluster-lan = ["moq-tokio/mdns"]
+jemalloc = ["moq-tokio/jemalloc"]
+noq = ["_quic", "moq-tokio/noq"]
+# The tokio QUIC listener, and the thread-per-core worker group behind
+# `runtime.workers`. Not one to enable on its own: it names no backend, so
+# moq-tokio would have nothing to bind a socket with.
+_quic = []
+# qlog trace capture (`--quic-qlog <DIR>`). Off by default: it compiles the
 # qlog machinery into the enabled backends and is only wanted for debugging or
-# congestion-control testing.
-qlog = ["moq-native/qlog"]
-websocket = ["moq-native/websocket", "dep:qmux", "axum/ws"]
+# congestion-control testing. Covers the io_uring workers too, so one feature
+# means one thing whichever runtime is serving.
+qlog = ["moq-tokio/qlog", "moq-uring?/qlog"]
+websocket = ["moq-tokio/websocket", "dep:qmux", "axum/ws"]
 # Unix-domain-socket stream listener (`--server-unix-bind`), unix-only. In the
 # default set; drop via --no-default-features on platforms without Unix sockets.
-uds = ["moq-native/uds"]
+uds = ["moq-tokio/uds"]
+# Serve QUIC from io_uring workers (`--runtime-io-uring`), Linux-only.
+# This is off by default: the relay is useful without io_uring.
+io-uring = ["_uring", "moq-uring/noq"]
+# The listener machinery shared by the feature above.
+_uring = ["dep:moq-sock", "dep:moq-uring"]
 
 [dependencies]
 anyhow = { workspace = true, features = ["backtrace"] }
@@ -44,19 +56,14 @@ axum = { workspace = true }
 axum-server = { workspace = true }
 bytes = { workspace = true }
 bytesize = "2.4.2"
-clap = { workspace = true }
 futures = { workspace = true }
-http-body = "1"
 http-cache-reqwest = { version = "1.0.0-alpha.6", features = ["manager-moka", "reqwest-middleware", "url-standard"], default-features = false }
 humantime = { workspace = true }
-humantime-serde = { workspace = true }
-jsonwebtoken = { workspace = true }
-moq-native = { workspace = true, default-features = false, features = ["aws-lc-rs", "watch", "tcp"] }
+moq-auth = { workspace = true, features = ["client"] }
 moq-net = { workspace = true }
 moq-stats = { workspace = true }
-moq-token = { workspace = true, features = ["tokio"] }
+moq-tokio = { workspace = true, default-features = false, features = ["aws-lc-rs", "watch", "tcp"] }
 qmux = { workspace = true, features = ["ws"], optional = true }
-rand = { workspace = true }
 reqwest = { workspace = true, features = ["rustls"] }
 reqwest-middleware = "0.5"
 rustls = { version = "0.23", features = ["aws-lc-rs"], default-features = false }
@@ -68,16 +75,26 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tokio-rustls = { workspace = true }
 toml = { workspace = true }
-tower-http = { workspace = true }
 tower-service = "0.3"
 tracing = { workspace = true }
 url = { workspace = true, features = ["serde"] }
+usage = { workspace = true, features = ["completions", "config"] }
 web-transport-trait = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+moq-sock = { workspace = true, optional = true }
+moq-uring = { workspace = true, optional = true }
 
 [target.'cfg(unix)'.dependencies]
 sd-notify = { workspace = true }
 
 [dev-dependencies]
+moq-auth = { workspace = true, features = ["client", "serve"] }
 rcgen = "0.14"
 tempfile = { workspace = true }
-wiremock = "0.6"
+tokio = { workspace = true, features = ["test-util"] }
+
+# `raise(SIGINT)` at ourselves, so the shutdown test exercises the real signal
+# path rather than the trigger behind it.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"

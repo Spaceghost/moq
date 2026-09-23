@@ -3,55 +3,68 @@
 from __future__ import annotations
 
 from moq_ffi import (
-    MoqAnnounced,
+    MoqAnnounceConfig,
+    MoqAnnounceConsumer,
     MoqAnnouncedBroadcast,
-    MoqAnnouncement,
+    MoqAnnounceUpdate,
     MoqBroadcastRequest,
+    MoqOriginConfig,
     MoqOriginConsumer,
     MoqOriginDynamic,
-    MoqOriginOptions,
     MoqOriginProducer,
+)
+from moq_ffi import (
+    MoqRoute as Route,
 )
 
 from .publish import BroadcastProducer
 from .subscribe import BroadcastConsumer
 
 
-class Announcement:
-    """A single broadcast discovered via :meth:`OriginConsumer.announced`.
+class AnnounceUpdate:
+    """A route announcement (or retraction) from :meth:`OriginConsumer.announced`.
 
-    Read its :attr:`path` and get a :attr:`broadcast` consumer to subscribe to it.
+    A route claims that :attr:`prefix` and every path beneath it can be served; it
+    carries no broadcast. Resolve a specific path with :meth:`OriginConsumer.request_broadcast`.
+    By convention a publisher announces each broadcast's exact path, so
+    subscribers can enumerate broadcasts from routes.
     """
 
-    def __init__(self, inner: MoqAnnouncement) -> None:
+    def __init__(self, inner: MoqAnnounceUpdate) -> None:
         self._inner = inner
-        self._broadcast: BroadcastConsumer | None = None
 
     @property
-    def path(self) -> str:
-        """The path this broadcast is announced at."""
-        return self._inner.path()
+    def prefix(self) -> str:
+        """The covered prefix, relative to the origin."""
+        return self._inner.prefix()
 
     @property
-    def broadcast(self) -> BroadcastConsumer:
-        """The broadcast's consumer, one shared instance per announcement.
+    def captures(self) -> list[str] | None:
+        """What each filter wildcard matched, or ``None`` for a partial overlap."""
+        return self._inner.captures()
 
-        Cached so stateful accessors (like the ``route_changed`` cursor)
-        survive repeated property access.
+    @property
+    def active(self) -> bool:
+        """Whether the route is active (``True``) or was retracted (``False``).
+
+        A repeated active announcement for the same prefix is a metadata update.
         """
-        if self._broadcast is None:
-            self._broadcast = BroadcastConsumer(self._inner.broadcast())
-        return self._broadcast
+        return self._inner.active()
+
+    @property
+    def route(self) -> Route:
+        """The route serving the prefix: its relay hops and costs (warm `cost`, undiscounted `cold`)."""
+        return self._inner.route()
 
 
-class Announced:
-    """Async-iterable stream of :class:`Announcement` broadcasts as they appear.
+class AnnounceConsumer:
+    """Async-iterable stream of :class:`AnnounceUpdate` route updates as they arrive.
 
     Usable as an async context manager; iterate with ``async for`` and it keeps
-    yielding new broadcasts until cancelled.
+    yielding announcements and retractions until cancelled.
     """
 
-    def __init__(self, inner: MoqAnnounced) -> None:
+    def __init__(self, inner: MoqAnnounceConsumer) -> None:
         self._inner = inner
 
     async def __aenter__(self):
@@ -63,11 +76,11 @@ class Announced:
     def __aiter__(self):
         return self
 
-    async def __anext__(self) -> Announcement:
+    async def __anext__(self) -> AnnounceUpdate:
         result = await self._inner.next()
         if result is None:
             raise StopAsyncIteration
-        return Announcement(result)
+        return AnnounceUpdate(result)
 
     def cancel(self) -> None:
         """Stop iterating and release the underlying announcement stream."""
@@ -75,7 +88,7 @@ class Announced:
 
 
 class AnnouncedBroadcast:
-    """Awaitable that resolves when the broadcast at a specific path is announced.
+    """Awaitable that resolves once a route covers a specific path.
 
     ``await`` it (or call :meth:`available`) to get the :class:`BroadcastConsumer`
     once the broadcast becomes available. Usable as an async context manager.
@@ -91,7 +104,7 @@ class AnnouncedBroadcast:
         self.cancel()
 
     async def available(self) -> BroadcastConsumer:
-        """Await the broadcast becoming available and return its consumer."""
+        """Await a covering route and return the resolved broadcast consumer."""
         return BroadcastConsumer(await self._inner.available())
 
     def __await__(self):
@@ -117,16 +130,25 @@ class BroadcastRequest:
         """Serve the request with an unannounced broadcast."""
         self._inner.accept(broadcast._inner)
 
-    def abort(self, error_code: int) -> None:
-        """Abort the request with an application error code."""
-        self._inner.abort(error_code)
+    def reject(self, error_code: int) -> None:
+        """Reject the request with an application error code."""
+        self._inner.reject(error_code)
 
 
 class OriginDynamic:
-    """Async source of broadcasts requested by consumers."""
+    """A served route: advertises a prefix and yields requests beneath it.
+
+    Usable as an async context manager that cancels the route on exit.
+    """
 
     def __init__(self, inner: MoqOriginDynamic) -> None:
         self._inner = inner
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        self.cancel()
 
     def __aiter__(self):
         return self
@@ -138,8 +160,12 @@ class OriginDynamic:
         """Await the next broadcast a consumer requested but that isn't published yet."""
         return BroadcastRequest(await self._inner.requested_broadcast())
 
+    def update(self, route: Route) -> None:
+        """Re-price the route in place: replace its hops and costs."""
+        self._inner.update(route)
+
     def cancel(self) -> None:
-        """Stop serving dynamic requests and release the underlying handle."""
+        """Stop serving and retract the route."""
         self._inner.cancel()
 
 
@@ -154,21 +180,26 @@ class OriginConsumer:
     def __init__(self, inner: MoqOriginConsumer) -> None:
         self._inner = inner
 
-    def announced(self, prefix: str = "") -> Announced:
-        """Async-iterate broadcasts announced under ``prefix`` (empty matches all)."""
-        return Announced(self._inner.announced(prefix))
+    def announced(self, prefix: str = "", *, filter: str | None = None) -> AnnounceConsumer:
+        """Iterate routes in the literal ``prefix`` matching the optional pattern ``filter``."""
+        return AnnounceConsumer(self._inner.announced(MoqAnnounceConfig(prefix=prefix, filter=filter)))
 
     def announced_broadcast(self, path: str) -> AnnouncedBroadcast:
-        """Await announcement of the broadcast at exactly ``path``."""
+        """Await a route covering ``path``, then resolve the broadcast there.
+
+        A local broadcast appears on this origin's cursor when created, before
+        it is advertised to peers.
+        """
         return AnnouncedBroadcast(self._inner.announced_broadcast(path))
 
     async def request_broadcast(self, path: str) -> BroadcastConsumer:
         """Request a broadcast by path, resolving as soon as it can be served.
 
-        Returns an existing exact-path broadcast immediately, whether announced or
-        not, otherwise falls back to a dynamic handler on the origin (if any), or
-        raises if neither can serve it. Unlike `announced_broadcast`, this does not
-        wait indefinitely for a future announcement.
+        Resolution order: a local broadcast at the exact path, then the best
+        announced route covering the path (served on demand by the session that
+        announced it), then a dynamic handler on the origin (if any). Unlike
+        `announced_broadcast`, this answers for what is reachable now and raises
+        if nothing can serve the path.
         """
         return BroadcastConsumer(await self._inner.request_broadcast(path))
 
@@ -177,11 +208,13 @@ class OriginProducer:
     """The publishing side of an origin: announce broadcasts for consumers to discover.
 
     Call :meth:`create_broadcast` to publish at a path, :meth:`consume` for a
-    matching :class:`OriginConsumer`, or :meth:`dynamic` to serve on-demand requests.
+    matching :class:`OriginConsumer`, or :meth:`dynamic` to advertise a prefix
+    and serve on-demand requests. Create, :meth:`dynamic` if tracks are served
+    on demand, populate, then :meth:`BroadcastProducer.announce`.
     """
 
     def __init__(self, *, cache_capacity_bytes: int | None = None) -> None:
-        self._inner = MoqOriginProducer(MoqOriginOptions(cache_capacity_bytes=cache_capacity_bytes))
+        self._inner = MoqOriginProducer(MoqOriginConfig(cache_capacity_bytes=cache_capacity_bytes))
 
     @classmethod
     def _from_inner(cls, inner: MoqOriginProducer) -> OriginProducer:
@@ -194,17 +227,25 @@ class OriginProducer:
         """Create a consumer that discovers the broadcasts this origin publishes."""
         return OriginConsumer(self._inner.consume())
 
-    def dynamic(self) -> OriginDynamic:
-        """Serve broadcasts that consumers request without an announcement."""
-        return OriginDynamic(self._inner.dynamic())
+    def dynamic(self, prefix: str, route: Route | None = None) -> OriginDynamic:
+        """Advertise ``prefix`` and serve the requests beneath it.
+
+        A route claims ``prefix`` and every path beneath it (``""`` claims every
+        path). A service that only serves some of them rejects the rest as they
+        are requested. Hold the returned handle while the route should stay
+        advertised.
+        """
+        return OriginDynamic(self._inner.dynamic(prefix, route if route is not None else Route()))
 
     def create_broadcast(self, path: str) -> BroadcastProducer:
         """Create a broadcast at ``path``, returning the producer that feeds it.
 
-        The broadcast starts live: the origin announces the path so subscribers can
-        discover it, becoming visible shortly after this returns. Toggle
-        discoverability with :meth:`BroadcastProducer.set_announce`; ``finish()``
-        unpublishes immediately, while dropping the producer without finishing
-        lingers briefly so a replacement publisher can take over.
+        The broadcast appears on this origin's local announcement streams
+        immediately. Advertise it to peers with
+        :meth:`BroadcastProducer.announce` after populating tracks. Create,
+        :meth:`dynamic` if tracks are served on demand, populate, then announce.
+        ``finish()`` unpublishes immediately, while dropping the producer without
+        finishing also unpublishes but reads to subscribers as a failure rather
+        than a deliberate end.
         """
         return BroadcastProducer._from_inner(self._inner.create_broadcast(path))

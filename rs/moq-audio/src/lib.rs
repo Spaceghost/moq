@@ -33,9 +33,9 @@
 //!   these names are unlinked here too.
 //! - `aec` keeps the speaker out of the microphone, which is what a conference
 //!   on a laptop needs to not send itself back. `playback::Engine::canceller`
-//!   builds an `aec::Canceller` from the mix it is playing and
-//!   `capture::Config::aec` hands it to the microphone. Requires the `aec`
-//!   feature, which implies both of the above.
+//!   builds cloneable `aec::Control` handles from the mix it is playing and
+//!   `capture::Config::aec` attaches their adaptive state to one microphone at
+//!   a time. Requires the `aec` feature, which implies both of the above.
 //!
 //! [`Format`] mirrors WebCodecs `AudioData.format`; the helpers convert between
 //! any supported layout and the interleaved `f32` representation libopus
@@ -43,7 +43,7 @@
 //! [`Activity`] it was decoded from, which is how a caller tells coded audio
 //! from the frames an Opus sender withholds while its input is silent. PCM
 //! layout lives on the producer / consumer via [`encode::Input`] /
-//! [`decode::Config`], not on each frame, so callers can't drift between calls.
+//! [`decode::Output`], not on each frame, so callers can't drift between calls.
 
 #[cfg(feature = "aac")]
 mod aac;
@@ -51,6 +51,7 @@ mod activity;
 mod error;
 mod format;
 mod frame;
+mod layout;
 mod opus;
 mod pcm;
 mod resample;
@@ -69,4 +70,4 @@ pub use activity::Activity;
 pub use error::Error;
 pub use format::Format;
 pub use frame::Frame;
-pub use resample::Resampler;
+pub use layout::Layout;

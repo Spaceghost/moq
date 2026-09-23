@@ -149,19 +149,12 @@ impl ImageSignal {
 	}
 }
 
-// SAFETY: `AMediaCodec` and `AImageReader` are owned handles with no thread
-// affinity; the NDK only requires that calls on one of them are serialized,
-// which they are because every method here takes `&mut self` and one decode task
-// owns the backend outright. `Send` is what lets the boxed trait object satisfy
-// `Backend: Send`.
-unsafe impl Send for MediaCodec {}
-
 impl MediaCodec {
 	/// Open a decoder for `codec`.
 	///
 	/// `config` is accepted for signature parity: MediaCodec decodes at the
 	/// stream's native size and has no scaler to point
-	/// [`Config::resize`](crate::decode::Config) at.
+	/// [`Config::scale_hint`](crate::decode::Config) at.
 	pub(crate) fn open(codec: Codec, _config: &Config) -> Result<Box<dyn Backend>, Error> {
 		let mime = match codec {
 			Codec::H264 => MIME_H264,
@@ -546,23 +539,18 @@ mod tests {
 		use crate::encode::{Config as EncodeConfig, Kind as EncodeKind};
 
 		let size = crate::Size::new(320, 240);
-		let mut config = EncodeConfig::new(size.width, size.height, 30);
+		let mut config = EncodeConfig::new(size.width, size.height, crate::Rate::new(30, 1).unwrap());
 		config.kind = EncodeKind::Named(NAME.to_owned());
 		let mut encoder = crate::encode::Encoder::new(&config).expect("a MediaCodec encoder");
 
-		let i420 = crate::I420::new(
-			size.width,
-			size.height,
-			vec![0x80; crate::I420::len(size.width, size.height)],
-		)
-		.unwrap();
+		let i420 = crate::I420::new(size, vec![0x80; crate::I420::len(size).unwrap()]).unwrap();
 
 		let mut decoder = MediaCodec::open(Codec::H264, &Config::new()).expect("a MediaCodec decoder");
 		let mut frames = Vec::new();
 		for index in 0..30u64 {
 			let timestamp = Timestamp::from_micros(index * 33_333).unwrap();
 			let frame = Frame::new(Surface::I420(i420.clone()), timestamp);
-			encoder.keyframe();
+			encoder.cut().unwrap();
 			for encoded in encoder.encode(&frame).unwrap() {
 				frames.extend(decoder.decode(encoded.payload, encoded.timestamp, true).unwrap());
 			}
@@ -575,7 +563,7 @@ mod tests {
 		// A flush drains the previous stream and leaves the same decoder reusable.
 		let timestamp = Timestamp::from_micros(1_000_000).unwrap();
 		let frame = Frame::new(Surface::I420(i420.clone()), timestamp);
-		encoder.keyframe();
+		encoder.cut().unwrap();
 		for encoded in encoder.encode(&frame).unwrap() {
 			frames.extend(decoder.decode(encoded.payload, encoded.timestamp, true).unwrap());
 		}
@@ -596,8 +584,8 @@ mod tests {
 		// gets. Mid-gray in, mid-gray out.
 		let frames = frames.into_iter().next().expect("checked above");
 		let i420 = frames.surface.into_i420().expect("read back to I420");
-		assert_eq!(i420.len(), crate::I420::len(size.width, size.height));
-		let luma = &i420[..(size.width * size.height) as usize];
+		assert_eq!(i420.data().len(), crate::I420::len(size).unwrap());
+		let luma = i420.y();
 		assert!(
 			luma.iter().all(|byte| byte.abs_diff(0x80) <= 8),
 			"the read-back luma plane should still be mid-gray",

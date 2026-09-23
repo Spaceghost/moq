@@ -3,7 +3,6 @@ import { ContainerSchema } from "./container";
 import { hexSchema } from "./hex";
 import { u53Schema } from "./integers";
 import { RelativeBroadcastSchema } from "./path";
-import { TimelineSchema } from "./timeline";
 
 // Backwards compatibility: old track schema
 const TrackSchema = z.object({
@@ -19,6 +18,9 @@ export const AudioConfigSchema = z.object({
 	// relative to the broadcast that served this catalog (e.g. "./source").
 	// If unset, the track lives in the same broadcast as the catalog.
 	broadcast: z.optional(RelativeBroadcastSchema),
+
+	// Human-readable rendition name for track pickers.
+	label: z.optional(z.string()),
 
 	// Registered WebCodecs codec string, or Hang's "pcm" extension for
 	// interleaved little-endian IEEE-754 binary32 samples.
@@ -42,16 +44,21 @@ export const AudioConfigSchema = z.object({
 	// TODO: Support up to Number.MAX_SAFE_INTEGER
 	bitrate: z.optional(u53Schema),
 
-	// The maximum jitter before the next frame is emitted in milliseconds.
-	// The player's jitter buffer should be larger than this value.
+	// The maximum delay between a frame being ready and the publisher flushing it, in whole
+	// milliseconds rounded up. The player's jitter buffer should be larger than this value.
 	// If not provided, the player should assume each frame is flushed immediately.
 	//
+	// This is measured at the publisher (encoder latency, packet packing, reordering),
+	// never on the network a consumer sees. It only ever grows over the life of a stream.
+	//
 	// NOTE: The audio "frame" duration depends on the codec, sample rate, etc.
-	// ex: AAC often uses 1024 samples per frame, so at 44100Hz, this would be 1024/44100 = 23ms
-	jitter: z.optional(u53Schema),
-
-	// The companion timeline track indexing this rendition's groups, if the publisher offers one.
-	timeline: z.optional(TimelineSchema),
+	// ex: AAC often uses 1024 samples per frame, so at 44100Hz, this would be 1024/44100 = 24ms
+	jitter: z.optional(
+		z.pipe(
+			u53Schema,
+			z.transform((value) => (value === 0 ? undefined : value)),
+		),
+	),
 });
 
 /** Schema for the catalog audio section: a map of track name to rendition config. */

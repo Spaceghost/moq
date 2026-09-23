@@ -26,6 +26,8 @@ extern "C" {
 #include "moq.h"
 }
 
+#include "moq-settings.h"
+
 // ------------------------------------------------------------- libobs stubs
 
 namespace {
@@ -44,7 +46,7 @@ std::mutex g_signals_mutex;
 std::vector<RecordedSignal> g_signals;
 std::string g_last_error;
 std::atomic<int> g_begin_capture{0};
-std::atomic<int> g_client_result{0};
+std::atomic<bool> g_settings_ok{true};
 std::string g_rate_control = "CBR";
 moq_video_hint g_video_hint{};
 // Lets a test run something inside obs_output_signal_stop, standing in for a
@@ -172,9 +174,10 @@ long long obs_data_get_int(obs_data_t *, const char *)
 } // extern "C"
 
 namespace MoQSettings {
-int CreateClient(obs_data_t *)
+bool BuildConfig(obs_data_t *, Config *out)
 {
-	return g_client_result;
+	*out = Config{};
+	return g_settings_ok;
 }
 } // namespace MoQSettings
 
@@ -218,9 +221,14 @@ int32_t moq_origin_close(uint32_t)
 	return 0;
 }
 
-int32_t moq_origin_publish(uint32_t, const char *, size_t)
+int32_t moq_origin_create_broadcast(uint32_t, const char *, size_t)
 {
 	return 5;
+}
+
+int32_t moq_publish_announce(uint32_t, const moq_route *)
+{
+	return 0;
 }
 
 int32_t moq_publish_finish(uint32_t)
@@ -228,14 +236,14 @@ int32_t moq_publish_finish(uint32_t)
 	return 0;
 }
 
-int32_t moq_publish_media(uint32_t, const char *, size_t, const uint8_t *, size_t)
+int32_t moq_publish_video(uint32_t, const moq_video_init *config)
 {
+	g_video_hint = config->hint;
 	return 7;
 }
 
-int32_t moq_publish_media_hint(uint32_t, const char *, size_t, const uint8_t *, size_t, const moq_video_hint *hint)
+int32_t moq_publish_audio(uint32_t, const moq_audio_init *)
 {
-	g_video_hint = *hint;
 	return 7;
 }
 
@@ -249,8 +257,13 @@ int32_t moq_publish_media_frame(uint32_t, const uint8_t *, uintptr_t, uint64_t)
 	return 0;
 }
 
-int32_t moq_session_connect(const char *, size_t, uint32_t, uint32_t, void (*on_status)(void *, int32_t),
-			    void *user_data)
+int32_t moq_publish_media_cut(uint32_t)
+{
+	return 0;
+}
+
+int32_t moq_session_connect(const char *, size_t, const moq_client_config *, uint32_t, uint32_t,
+			    void (*on_status)(void *, int32_t), void *user_data)
 {
 	if (g_connect_rejected)
 		return -34;
@@ -274,17 +287,6 @@ int32_t moq_session_connect(const char *, size_t, uint32_t, uint32_t, void (*on_
 	return handle;
 }
 
-int32_t moq_client_connect(const char *url, size_t url_len, uint32_t, uint32_t origin_publish, uint32_t origin_consume,
-			   void (*on_status)(void *, int32_t), void *user_data)
-{
-	return moq_session_connect(url, url_len, origin_publish, origin_consume, on_status, user_data);
-}
-
-int32_t moq_client_close(uint32_t)
-{
-	return 0;
-}
-
 int32_t moq_session_close(uint32_t session)
 {
 	g_closed_handle = static_cast<int>(session);
@@ -304,10 +306,10 @@ int32_t moq_session_stats(uint32_t session, moq_connection_stats *dst)
 	if (g_stats_partial.load())
 		return 0;
 
-	dst->send_rate_bps = 2'500'000;
-	dst->send_rate_valid = true;
-	dst->recv_rate_bps = 120'000;
-	dst->recv_rate_valid = true;
+	dst->estimated_send_rate_bps = 2'500'000;
+	dst->estimated_send_rate_valid = true;
+	dst->estimated_recv_rate_bps = 120'000;
+	dst->estimated_recv_rate_valid = true;
 	dst->bytes_sent = 4'000'000;
 	dst->bytes_sent_valid = true;
 	dst->packets_sent = 100;
@@ -398,7 +400,7 @@ void reset()
 	g_on_status = nullptr;
 	g_closed_handle = 0;
 	g_begin_capture = 0;
-	g_client_result = 0;
+	g_settings_ok = true;
 	g_rate_control = "CBR";
 	g_video_hint = {};
 	g_start_gate = nullptr;
@@ -448,7 +450,7 @@ int main()
 	// Invalid advanced settings stop before a session or capture is created.
 	{
 		reset();
-		g_client_result = -40;
+		g_settings_ok = false;
 		MoQOutput o(nullptr, out);
 		CHECK(!o.Start());
 		CHECK(g_on_status == nullptr);
@@ -786,10 +788,10 @@ int main()
 		CHECK(o.TryGetConnectionStats(&stats));
 		CHECK(stats.rtt_valid);
 		CHECK(stats.rtt_ms > 12.4 && stats.rtt_ms < 12.6);
-		CHECK(stats.send_rate_valid);
-		CHECK(stats.send_rate_bps == 2'500'000.0);
-		CHECK(stats.recv_rate_valid);
-		CHECK(stats.recv_rate_bps == 120'000.0);
+		CHECK(stats.estimated_send_rate_valid);
+		CHECK(stats.estimated_send_rate_bps == 2'500'000.0);
+		CHECK(stats.estimated_recv_rate_valid);
+		CHECK(stats.estimated_recv_rate_bps == 120'000.0);
 		CHECK(stats.bytes_sent_valid);
 		CHECK(stats.bytes_sent == 4'000'000ULL);
 		CHECK(stats.loss_valid);
@@ -821,8 +823,8 @@ int main()
 		g_stats_partial = true;
 		CHECK(o.TryGetConnectionStats(&stats));
 		CHECK(stats.rtt_valid);
-		CHECK(!stats.send_rate_valid);
-		CHECK(!stats.recv_rate_valid);
+		CHECK(!stats.estimated_send_rate_valid);
+		CHECK(!stats.estimated_recv_rate_valid);
 		CHECK(!stats.bytes_sent_valid);
 		CHECK(!stats.loss_valid);
 		CHECK(stats.reconnects == 4);

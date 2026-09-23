@@ -162,11 +162,14 @@ ui.run((effect) => {
 	effect.set(source.constraints, cameraConstraints(readVideoTarget(effect)));
 });
 
-// Audio general settings (volume gain, output sample rate, channel mix).
+// Audio general settings. Volume is per-rendition; the capture format is shared by all of them,
+// so rate and channel mix live on the capture rather than the encoder.
 ui.run((effect) => {
 	publish.audio.volume.set(effect.get(volume));
-	publish.audio.sampleRate.set(effect.get(sampleRate));
-	publish.audio.channelCount.set(effect.get(channelCount));
+
+	const capture = publish.audio.capture;
+	capture?.sampleRate.set(effect.get(sampleRate));
+	capture?.channelCount.set(effect.get(channelCount));
 });
 
 // Mic processing constraints go to the capture itself (getUserMedia re-acquires the track on
@@ -360,8 +363,8 @@ ui.run((effect) => {
 
 // Report the transport negotiated by the live connection.
 ui.run((effect) => {
-	const conn = effect.get(publish.connection.established);
-	$("network-transport").textContent = conn ? (conn.transport === "websocket" ? "WebSocket" : "WebTransport") : "";
+	const transport = effect.get(publish.connection.transport);
+	$("network-transport").textContent = transport ? (transport === "websocket" ? "WebSocket" : "WebTransport") : "";
 });
 
 // Audio: the resolved audio config (codec / sample rate / channels / bitrate).
@@ -401,7 +404,7 @@ meta.run((effect) => {
 	if (!net) return;
 
 	// A day-long cache so a viewer joining long after the last edit still replays the value.
-	const track = net.createTrack(META_TRACK, { latencyMax: 86_400_000 });
+	const track = net.createTrack(META_TRACK, { maxAge: Net.Time.Milli(86_400_000) });
 	effect.cleanup(() => track.close());
 
 	const producer = new Json.Snapshot.Producer<unknown>({ track });
@@ -449,15 +452,33 @@ const rttGraph = graph(viz, "Round trip", { color: "#38bdf8", format: (v) => `${
 $("publish-graphs").append(captureGraph.el, uploadGraph.el, rttGraph.el);
 
 // Count captured frames; the publish API has no encoded-frame counter, so this
-// is the capture rate feeding the encoder (a good proxy for output fps).
+// is the capture rate feeding the encoder (a good proxy for output fps). Read off our own stream:
+// a signal coalesces a burst into one notification, which undercounts the rate.
 let frames = 0;
 viz.run((effect) => {
-	if (effect.get(publish.capture.out.frame)) frames++;
+	const capture = effect.get(publish.video.in.capture);
+	const fanout = capture ? effect.get(capture.out.frames) : undefined;
+	if (!fanout) return;
+
+	const reader = fanout.subscribe(effect).getReader();
+	effect.cleanup(() => {
+		reader.cancel().catch(() => {});
+	});
+
+	effect.spawn(async () => {
+		for (;;) {
+			const next = await Promise.race([reader.read(), effect.cancel]);
+			if (!next?.value) break;
+
+			frames++;
+			next.value.close();
+		}
+	});
 });
 
 let prevFrames = 0;
 let prevWhen = performance.now();
-viz.interval(async () => {
+viz.interval(() => {
 	const now = performance.now();
 	const elapsed = now - prevWhen;
 	captureGraph.push(elapsed > 0 ? ((frames - prevFrames) * 1000) / elapsed : undefined);
@@ -467,8 +488,13 @@ viz.interval(async () => {
 	const rtt = publish.connection.probe.peek()?.rtt as unknown as number | undefined;
 	rttGraph.push(rtt && rtt > 0 ? rtt : undefined);
 
-	const up = (await publish.connection.stats())?.estimatedSendRate;
-	uploadGraph.push(up && up > 0 ? up : undefined);
+	void publish.connection.stats().then(
+		(stats) => {
+			const up = stats?.estimatedSendRate;
+			uploadGraph.push(up && up > 0 ? up : undefined);
+		},
+		() => uploadGraph.push(undefined),
+	);
 }, 250);
 
 // Vite re-evaluates this module on hot reload, dropping the references to the

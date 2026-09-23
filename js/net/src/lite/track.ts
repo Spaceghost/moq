@@ -1,7 +1,8 @@
 import * as Path from "../path.ts";
 import type { Reader, Writer } from "../stream.ts";
+import { Timescale } from "../time.ts";
 import * as Message from "./message.ts";
-import { Version } from "./version.ts";
+import { hasGroupOrder, Version } from "./version.ts";
 
 // The Track Stream (0x6) is draft-05+ only.
 function guardTrack(version: Version) {
@@ -60,15 +61,10 @@ export class TrackInfo {
 	/** The publisher's tie-break priority for this track. */
 	priority: number;
 	/**
-	 * Whether groups are prioritized in sequence order. Groups may always arrive
-	 * out-of-order (or not at all) over the network.
-	 */
-	ordered: boolean;
-	/**
-	 * Publisher Max Latency: an upper bound (milliseconds) on how long the publisher
+	 * Publisher Max Age: an upper bound (milliseconds) on how long the publisher
 	 * caches a non-latest group past the arrival of a newer one.
 	 */
-	latencyMax: number;
+	maxAge: number;
 	/**
 	 * Per-frame timestamp scale (units per second). Mandatory on Lite05: a real
 	 * (non-zero) scale, and every frame on the wire is prefixed with a zigzag-delta
@@ -78,49 +74,56 @@ export class TrackInfo {
 
 	constructor({
 		priority = 0,
-		ordered = false,
-		latencyMax = 0,
-		timescale = 0,
+		maxAge = 0,
+		timescale = Timescale.MILLI,
 	}: {
 		priority?: number;
-		ordered?: boolean;
-		latencyMax?: number;
+		maxAge?: number;
 		timescale?: number;
 	}) {
+		if (!Number.isInteger(priority) || priority < 0 || priority > 255) {
+			throw new RangeError(`priority must be an integer in 0..=255: ${priority}`);
+		}
+		if (!Number.isSafeInteger(maxAge) || maxAge < 0) {
+			throw new RangeError(`maxAge must be a safe non-negative integer: ${maxAge}`);
+		}
 		this.priority = priority;
-		this.ordered = ordered;
-		this.latencyMax = latencyMax;
-		this.timescale = timescale;
+		this.maxAge = maxAge;
+		this.timescale = Timescale(timescale);
 	}
 
-	async #encode(w: Writer) {
+	async #encode(w: Writer, version: Version) {
 		await w.u8(this.priority);
-		await w.bool(this.ordered);
-		await w.u53(this.latencyMax);
+		// The retired `Ordered` byte: lite-05 keeps it in its layout, written as 0.
+		if (hasGroupOrder(version)) await w.bool(false);
+		await w.u53(this.maxAge);
 		await w.u53(this.timescale);
 	}
 
-	static async #decode(r: Reader): Promise<TrackInfo> {
+	static async #decode(r: Reader, version: Version): Promise<TrackInfo> {
 		const priority = await r.u8();
-		const ordered = await r.bool();
-		const latencyMax = await r.u53();
+		if (hasGroupOrder(version)) await r.bool();
+		const maxAge = await r.u53();
 		const timescale = await r.u53();
-		// Mandatory on Lite05: a zero scale is invalid (mirrors Rust's Timescale::new rejection),
-		// and would otherwise throw later when wrapped in Timescale().
-		if (timescale === 0) throw new Error("track timescale must be non-zero");
-		return new TrackInfo({ priority, ordered, latencyMax, timescale });
+		return new TrackInfo({ priority, maxAge, timescale });
 	}
 
 	async encode(w: Writer, version: Version): Promise<void> {
 		guardTrack(version);
-		// Reject a zero timescale on encode too, so an invalid TrackInfo fails fast on
-		// the sender rather than only at the peer's decoder.
-		if (this.timescale === 0) throw new Error("track timescale must be non-zero");
-		return Message.encode(w, (w) => this.#encode(w));
+		// Re-check after construction: fields are public, and a mutated value must not
+		// reach the length-prefixed writer.
+		if (!Number.isInteger(this.priority) || this.priority < 0 || this.priority > 255) {
+			throw new RangeError(`priority must be an integer in 0..=255: ${this.priority}`);
+		}
+		if (!Number.isSafeInteger(this.maxAge) || this.maxAge < 0) {
+			throw new RangeError(`maxAge must be a safe non-negative integer: ${this.maxAge}`);
+		}
+		Timescale(this.timescale);
+		return Message.encode(w, (w) => this.#encode(w, version));
 	}
 
 	static async decode(r: Reader, version: Version): Promise<TrackInfo> {
 		guardTrack(version);
-		return Message.decode(r, (r) => TrackInfo.#decode(r));
+		return Message.decode(r, (r) => TrackInfo.#decode(r, version));
 	}
 }

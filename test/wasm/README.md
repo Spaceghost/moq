@@ -27,6 +27,10 @@ build -p moq-relay` for the relay. Each relay reserves its own port (see
 `WASM_PROFILE` picks the relay's cargo profile, and `RELAY_BIN` points at a
 prebuilt relay instead.
 
+A failing run keeps its run directory, including a Playwright trace of the
+failing page, and CI uploads it; a passing run deletes its own. See
+[the harness contract](../README.md).
+
 ## Shape
 
 `run.sh` builds, starts the relays, and hands their URLs to `driver.ts`, which
@@ -53,8 +57,8 @@ One per protocol flavour, since negotiation is the part that broke:
 | name    | relay                            | negotiates                             |
 | ------- | -------------------------------- | -------------------------------------- |
 | `lite`  | defaults                         | `moq-lite-05`, over its own ALPN       |
-| `ietf`  | `--server-version moq-transport-19` | `moq-transport-19`, over its own ALPN  |
-| `setup` | `--server-version moq-lite-02`   | the `moql` ALPN, version chosen by SETUP |
+| `ietf`  | `--listen-version moq-transport-19` | `moq-transport-19`, over its own ALPN  |
+| `setup` | `--listen-version moq-lite-02`   | the `moql` ALPN, version chosen by SETUP |
 
 The `setup` relay is as close as a real relay gets to the SETUP fallback path.
 The branch that maps the browser's empty `protocol()` to `None` needs a server

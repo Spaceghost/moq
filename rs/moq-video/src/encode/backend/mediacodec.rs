@@ -44,7 +44,7 @@ use ndk::media::media_codec::{
 use ndk::media::media_format::MediaFormat;
 use ndk::media_error::MediaError;
 
-use super::super::encoder::{Codec, Config};
+use super::super::encoder::{Codec, Config, Gop};
 use super::{Backend, Encoded};
 use crate::{Color, Error, Frame, I420};
 
@@ -126,7 +126,7 @@ pub(crate) struct MediaCodec {
 	kind: Codec,
 	width: usize,
 	height: usize,
-	framerate: u32,
+	framerate: crate::Rate,
 	/// The parameter sets (SPS/PPS, plus VPS for H.265) as the codec-config
 	/// buffer delivered them: Annex-B, ahead of the first picture. Kept because
 	/// every keyframe has to carry them for a subscriber joining there.
@@ -148,12 +148,6 @@ pub(crate) struct MediaCodec {
 	/// it back, since a codec in that state refuses input.
 	ended: bool,
 }
-
-// SAFETY: `AMediaCodec` is an owned handle with no thread affinity; the NDK only
-// requires that calls on one codec are serialized, which they are because every
-// method here takes `&mut self` and the encode thread owns the backend outright.
-// `Send` is what lets the boxed trait object satisfy `Backend: Send`.
-unsafe impl Send for MediaCodec {}
 
 impl MediaCodec {
 	pub(crate) fn open(config: &Config) -> Result<Box<dyn Backend>, Error> {
@@ -184,7 +178,7 @@ impl MediaCodec {
 			kind: config.codec,
 			width: config.width as usize,
 			height: config.height as usize,
-			framerate: config.framerate.max(1),
+			framerate: config.framerate,
 			parameter_sets: None,
 			pending: VecDeque::new(),
 			last_timestamp: None,
@@ -201,7 +195,7 @@ impl MediaCodec {
 	/// timestamp rides alongside in `pending`, and this is the value the codec
 	/// echoes back on the matching output.
 	fn sample_time(&self) -> i64 {
-		self.frame_index * 1_000_000 / self.framerate as i64
+		self.frame_index * i64::from(self.framerate.denominator()) * 1_000_000 / i64::from(self.framerate.numerator())
 	}
 
 	/// Ask the codec to make the next picture an IDR.
@@ -215,8 +209,8 @@ impl MediaCodec {
 
 	/// Write one frame into a free input buffer, dropping it if the codec has
 	/// none.
-	fn submit(&mut self, frame: &Frame, keyframe: bool) -> Result<(), Error> {
-		if keyframe {
+	fn submit(&mut self, frame: &Frame, cut: bool) -> Result<(), Error> {
+		if cut {
 			// Keep the request pending until a frame is actually accepted. A full
 			// codec queue drops this input, but the next submitted picture still has
 			// to open the group with an IDR.
@@ -225,7 +219,7 @@ impl MediaCodec {
 		}
 
 		let i420 = frame.surface.to_i420()?;
-		let size = I420::len(self.width as u32, self.height as u32);
+		let size = I420::len(crate::Size::new(self.width as u32, self.height as u32))?;
 		let sample_time = self.sample_time();
 
 		let submitted = match self
@@ -376,13 +370,13 @@ impl MediaCodec {
 }
 
 impl Backend for MediaCodec {
-	fn encode(&mut self, frame: &Frame, keyframe: bool) -> Result<Vec<Encoded>, Error> {
+	fn encode(&mut self, frame: &Frame, cut: bool) -> Result<Vec<Encoded>, Error> {
 		let mut out = Vec::new();
 		// Collect whatever the codec finished while the caller was elsewhere, so
 		// the input buffer asked for below isn't stuck behind an output nobody
 		// picked up.
 		self.drain(OUTPUT_TIMEOUT, &mut out)?;
-		self.submit(frame, keyframe || self.keyframe_pending)?;
+		self.submit(frame, cut || self.keyframe_pending)?;
 		self.drain(OUTPUT_TIMEOUT, &mut out)?;
 		Ok(out)
 	}
@@ -419,7 +413,11 @@ impl Backend for MediaCodec {
 			.map_err(|e| codec_err("set the bitrate", e))
 	}
 
-	fn name(&self) -> &str {
+	fn can_cut(&self) -> bool {
+		true
+	}
+
+	fn name(&self) -> &'static str {
 		NAME
 	}
 }
@@ -431,14 +429,15 @@ fn encoder_format(config: &Config, mime: &str) -> MediaFormat {
 	format.set_i32(KEY_WIDTH, config.width as i32);
 	format.set_i32(KEY_HEIGHT, config.height as i32);
 	format.set_i32(KEY_COLOR_FORMAT, COLOR_FORMAT_NV12);
-	format.set_i32(KEY_BIT_RATE, clamp_i32(config.resolved_bitrate()));
+	format.set_i32(KEY_BIT_RATE, clamp_i32(config.resolved_bitrate().as_bps()));
 	format.set_i32(KEY_BITRATE_MODE, BITRATE_MODE_CBR);
-	format.set_i32(KEY_FRAME_RATE, config.framerate as i32);
+	format.set_i32(KEY_FRAME_RATE, config.framerate.rounded() as i32);
 	format.set_i32(KEY_PRIORITY, PRIORITY_REALTIME);
 	// MediaCodec takes the keyframe interval in seconds rather than frames, and
 	// reads it as a float, so a sub-second GOP survives instead of rounding to
 	// zero (which would mean an IDR on every frame).
-	format.set_f32(KEY_I_FRAME_INTERVAL, config.gop as f32 / config.framerate.max(1) as f32);
+	let Gop::Keyframe { interval } = config.gop;
+	format.set_f32(KEY_I_FRAME_INTERVAL, interval as f32 / config.framerate.as_f64() as f32);
 	// Ask for the shortest pipeline the device offers: output a frame after
 	// input, and no B-frames, whose reorder delay a live track has no use for.
 	// Both are hints an older device drops, which is why `flush` still drains the
@@ -501,7 +500,7 @@ fn fill_nv12(buffer: &mut [MaybeUninit<u8>], i420: &I420, width: usize, height: 
 	}
 
 	// NV12 interleaves the two chroma planes into one.
-	for ((pair, u), v) in chroma.chunks_exact_mut(2).zip(i420.u()).zip(i420.v()) {
+	for ((pair, u), v) in chroma.as_chunks_mut::<2>().0.iter_mut().zip(i420.u()).zip(i420.v()) {
 		pair[0].write(*u);
 		pair[1].write(*v);
 	}
@@ -669,11 +668,11 @@ mod tests {
 	#[test]
 	#[ignore = "needs an Android device with a MediaCodec H.264 encoder"]
 	fn encodes_a_keyframe_with_parameter_sets_inline() {
-		let config = Config::new(320, 240, 30);
+		let config = Config::new(320, 240, crate::Rate::new(30, 1).unwrap());
 		let mut backend = MediaCodec::open(&config).expect("a MediaCodec encoder");
 
 		let size = config.size();
-		let i420 = I420::new(size.width, size.height, vec![0x80; I420::len(size.width, size.height)]).unwrap();
+		let i420 = I420::new(size, vec![0x80; I420::len(size).unwrap()]).unwrap();
 		let frame = Frame::new(crate::Surface::I420(i420), timestamp(0));
 
 		let mut encoded = backend.encode(&frame, true).unwrap();

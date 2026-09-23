@@ -69,7 +69,7 @@ The simplest way to publish a stream:
 | `muted`     | boolean | false    | Mute audio capture              |
 | `invisible` | boolean | false    | Disable video capture           |
 | `preview`   | string  | `"source"` | What the preview renders: `"source"`, `"encoded"`, `"none"` |
-| `announce`  | string  | `"source"` | When to publish: `"always"`, `"never"`, `"source"` (once media is actually captured) |
+| `announce`  | string  | `"source"` | When to advertise: `"always"`, `"never"`, `"source"` (once media is actually captured). The broadcast is created while connected either way. |
 
 A nested `<video>` shows the raw capture; a `<canvas>` is drawn by the element.
 
@@ -79,16 +79,20 @@ For more control, `Broadcast` owns the network broadcast and the catalog. Rendit
 registered by the encoders themselves, one per track name, so simulcast is just
 more encoders:
 
+Standalone components start enabled when `enabled` is omitted. Camera and microphone sources may
+request permission immediately. Create an enabled screen source during the user gesture that
+authorizes screen capture, or pass a live input that is false until that gesture.
+
 ```typescript
 import * as Publish from "@moq/publish";
 
-const connection = new Publish.Net.Connection.Reload({
+const connection = new Publish.Net.Connection({
     url: new URL("https://relay.example.com/anon"),
     enabled: true,
 });
 
 const broadcast = new Publish.Broadcast({
-    connection: connection.established,
+    origin: connection.origin,
     enabled: true,
     name: Publish.Net.Path.from("room/alice.hang"),
 });
@@ -96,7 +100,8 @@ const broadcast = new Publish.Broadcast({
 // Capture, then encode. Each encoder registers its rendition on the broadcast
 // and encodes only while someone is subscribed.
 const camera = new Publish.Source.Camera({ enabled: true });
-const capture = new Publish.Video.Capture({ source: camera.out.source });
+const video = new Publish.Signals.Computed((effect) => effect.get(camera.out.source)?.video);
+const capture = new Publish.Video.Capture({ source: video });
 
 const hd = new Publish.Video.Encoder("video/hd", { broadcast, capture, enabled: true });
 const sd = new Publish.Video.Encoder("video/sd", { broadcast, capture, enabled: true, config: { maxScale: 0.25 } });
@@ -105,9 +110,22 @@ const sd = new Publish.Video.Encoder("video/sd", { broadcast, capture, enabled: 
 hd.config.set({ codec: "vp09.00.10.08", maxBitrate: 4_000_000 });
 
 const microphone = new Publish.Source.Microphone({ enabled: true });
-const audio = new Publish.Audio.Encoder("audio", { broadcast, source: microphone.out.source, enabled: true });
+const audioSource = new Publish.Signals.Computed((effect) => effect.get(microphone.out.source)?.audio);
+const audioCapture = new Publish.Audio.Capture({ source: audioSource });
+const audio = new Publish.Audio.Encoder("audio", { broadcast, capture: audioCapture, enabled: true });
 audio.volume.set(0.8);
 ```
+
+Video encoders prefer hardware encoding, including on Firefox 143 and newer. AV1 is only
+considered with hardware acceleration; software selection starts with H.264.
+Screen capture passes `{ track, get scale() { ... } }` as its video source, reading
+the current `screenPixelRatio` for each captured frame. Custom sources can use a
+fixed `scale: 2` or a live property getter.
+Encoders default to logical resolution when the browser supplies
+`screenPixelRatio` and native dimensions: a 5120×2880 surface at 2× encodes at
+2560×1440. Browsers without that metadata keep the captured resolution.
+Explicit `maxPixels`, `maxScale`, or source width/height limits override this
+default; `maxScale: 1` preserves the captured resolution.
 
 Serve application tracks alongside the media with `broadcast.net`, the
 underlying producer, and advertise them with `broadcast.catalog.mutate(...)`.

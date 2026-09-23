@@ -75,13 +75,13 @@ impl Rendition {
 		self.0.rung.size
 	}
 
-	/// The target bitrate, in bits per second.
-	pub fn bitrate(&self) -> u64 {
+	/// The target bitrate.
+	pub fn bitrate(&self) -> moq_net::bandwidth::Rate {
 		self.0.rung.bitrate
 	}
 
 	/// The output framerate, inherited from the source.
-	pub fn framerate(&self) -> u32 {
+	pub fn framerate(&self) -> Option<moq_video::Rate> {
 		self.0.rung.framerate
 	}
 
@@ -368,8 +368,8 @@ mod tests {
 			name: name.to_string(),
 			height,
 			size: moq_video::Size::new(height * 16 / 9, height),
-			bitrate: 100_000,
-			framerate: 30,
+			bitrate: moq_net::bandwidth::Rate::from_bps(100_000),
+			framerate: Some(moq_video::Rate::new(30, 1).unwrap()),
 		}
 	}
 

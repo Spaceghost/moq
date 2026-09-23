@@ -53,7 +53,7 @@ private media.
 ```bash
 # Publish a file, then open https://moq.dev/watch?name=<your-name>
 ffmpeg -re -i video.mp4 -c copy -f mpegts - | \
-    moq --client-connect https://cdn.moq.dev/anon --broadcast <your-name>.hang import ts
+    moq --connect https://cdn.moq.dev/anon --broadcast <your-name>.hang import ts
 ```
 
 Every client, in every language, connects the same way: a relay URL whose path

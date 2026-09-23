@@ -25,7 +25,7 @@ directly (see [Auth](#auth) below).
 ```rust
 let mut srt = moq_srt::Config::default();
 srt.listen = Some("0.0.0.0:9000".parse()?);
-srt.prefix = "live/".to_string();
+srt.prefix = "live".into();
 
 // `origin` is your relay's local origin (e.g. `cluster.origin.clone()`).
 tokio::select! {
@@ -71,7 +71,7 @@ a path, so any number of players can pull the same broadcast.
 `run` is unauthenticated: anyone who can reach the UDP port can publish or
 request any broadcast. Gate it with a host firewall or a private network, or
 bring your own auth by driving `Server` / `Request` directly, mirroring
-`moq-native`'s `Server` / `Request`:
+`moq-tokio`'s `Server` / `Request`:
 
 ```rust
 let mut server = moq_srt::Server::bind("0.0.0.0:9000".parse()?, None).await?;
@@ -86,8 +86,8 @@ while let Some(request) = server.accept().await {
             tokio::spawn(subscribe.accept(&consumer, "live/cam0"));
         }
     }
-    // ...or call `.reject()` on the `Publish` / `Subscribe` instead of `.accept()`
-    // to deny it.
+    // ...or call `.reject(moq_srt::Reject::Forbidden)` on the `Publish` /
+    // `Subscribe` instead of `.accept()` to deny it.
 }
 ```
 

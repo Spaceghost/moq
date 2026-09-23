@@ -15,13 +15,15 @@
 //! per connection and CPU per message (see the README).
 
 #[cfg(target_os = "linux")]
+mod duration;
+
+#[cfg(target_os = "linux")]
 mod linux {
 	use std::collections::HashMap;
 	use std::io::Write;
 	use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 	use anyhow::Context;
-	use clap::Parser;
 	use procfs::CurrentSI;
 	use procfs::process::Process;
 	use serde::Serialize;
@@ -29,39 +31,48 @@ mod linux {
 	/// Parse a duration and reject zero: a zero interval would busy-loop over
 	/// /proc and flood the output, which a sampler meant to sit on production
 	/// hosts must never do.
-	fn positive_duration(arg: &str) -> anyhow::Result<Duration> {
-		let duration = humantime::parse_duration(arg)?;
-		anyhow::ensure!(!duration.is_zero(), "must be greater than 0s");
-		Ok(duration)
+	#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+	struct PositiveDuration(Duration);
+
+	impl std::str::FromStr for PositiveDuration {
+		type Err = anyhow::Error;
+
+		fn from_str(arg: &str) -> Result<Self, Self::Err> {
+			let duration = humantime::parse_duration(arg)?;
+			anyhow::ensure!(!duration.is_zero(), "must be greater than 0s");
+			Ok(Self(duration))
+		}
 	}
 
 	/// Sample CPU, memory, and context-switch counters for a running process.
-	#[derive(Parser, Debug)]
-	#[command(version = env!("VERSION"))]
+	#[derive(usage::Cli, Debug)]
+	#[usage(unknown_flags = "error", args_override_self = false)]
+	#[usage(name = "moq-bench-host", version = env!("CARGO_PKG_VERSION"))]
+	#[usage(completion)]
 	pub struct Args {
 		/// Sample these PIDs. When set, --name is ignored.
-		#[arg(long)]
+		#[usage(long)]
 		pub pid: Vec<i32>,
 
 		/// Find target processes by name (/proc/<pid>/comm, 15 bytes max).
-		#[arg(long, default_value = "moq-relay")]
+		#[usage(long, default = "moq-relay")]
 		pub name: String,
 
 		/// How often to sample.
-		#[arg(long, value_parser = positive_duration, default_value = "1s")]
-		pub interval: Duration,
+		#[usage(long, default = "1s")]
+		interval: PositiveDuration,
 
 		/// Stop after this duration. Runs until interrupted (or the targets exit) otherwise.
-		#[arg(long, value_parser = humantime::parse_duration)]
-		pub duration: Option<Duration>,
+		#[usage(long)]
+		duration: Option<crate::duration::Duration>,
 
 		/// Write JSON lines to this file instead of stdout. Truncates on start.
-		#[arg(long)]
+		#[usage(long, value_hint = usage::ValueHint::FilePath, extensions("jsonl", "json"))]
 		pub output: Option<std::path::PathBuf>,
 
 		/// Include a per-thread breakdown in every sample. Costs one /proc read per
 		/// thread per interval, so leave it off for casual monitoring.
-		#[arg(long)]
+		#[usage(long)]
 		pub threads: bool,
 	}
 
@@ -261,7 +272,7 @@ mod linux {
 		eprintln!(
 			"sampling {} process(es) every {}: {}",
 			targets.len(),
-			humantime::format_duration(args.interval),
+			humantime::format_duration(args.interval.0),
 			targets
 				.iter()
 				.map(|t| t.proc.pid.to_string())
@@ -295,7 +306,11 @@ mod linux {
 			out.flush()?;
 
 			anyhow::ensure!(!targets.is_empty(), "all target processes exited");
-			let Some(delay) = next_delay(args.interval, args.duration, start.elapsed()) else {
+			let Some(delay) = next_delay(
+				args.interval.0,
+				args.duration.map(crate::duration::Duration::into_std),
+				start.elapsed(),
+			) else {
 				return Ok(());
 			};
 			std::thread::sleep(delay);
@@ -325,12 +340,14 @@ mod linux {
 		/// harmless on.
 		#[test]
 		fn zero_interval_rejected() {
-			let err = Args::try_parse_from(["moq-bench-host", "--interval", "0s"]).unwrap_err();
-			assert!(err.to_string().contains("greater than 0s"), "unexpected error: {err}");
+			let argv = [std::ffi::OsStr::new("--interval"), std::ffi::OsStr::new("0s")];
+			let err = Args::parse_from(&argv).unwrap_err();
+			let err = usage::render_failure(Args::spec(), &argv, &err);
+			assert!(err.contains("greater than 0s"), "unexpected error: {err}");
 
 			// Nonzero still parses, and the default holds.
-			let args = Args::try_parse_from(["moq-bench-host"]).unwrap();
-			assert_eq!(args.interval, Duration::from_secs(1));
+			let args = Args::parse_from(&[]).unwrap();
+			assert_eq!(args.interval, PositiveDuration(Duration::from_secs(1)));
 		}
 
 		/// A duration shorter than the interval must cap the sleep, not stretch the

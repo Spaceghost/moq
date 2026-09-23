@@ -25,8 +25,8 @@
 //! does the MFT offer an output type carrying the real frame size, so we set the
 //! NV12 output type (and read the size off it) right after that first input.
 //!
-//! Used only from the one decode task (the consumer's `read` loop), so the COM
-//! handles are wrapped in a thread-confined `Send` type.
+//! The backend is `!Send`: the COM handles must stay on the thread that created
+//! them, either the `Sink` worker thread or the thread owning a direct `Decoder`.
 
 use std::collections::VecDeque;
 use std::ffi::c_void;
@@ -98,10 +98,6 @@ pub(crate) struct MediaFoundation {
 	_manager: IMFDXGIDeviceManager,
 	_com: ComGuard,
 }
-
-// The MFT and its COM handles are only ever touched from the one decode task (the
-// consumer's single-threaded `read` loop).
-unsafe impl Send for MediaFoundation {}
 
 impl MediaFoundation {
 	/// `config` is accepted for signature parity; the decoder MFT emits frames
@@ -419,7 +415,10 @@ impl MediaFoundation {
 				.ContiguousCopyTo(&mut nv12)
 				.map_err(|e| mf_err("contiguous copy", e))?;
 		}
-		Ok(Surface::I420(I420::from_nv12(&nv12, self.width, self.height)?))
+		Ok(Surface::I420(I420::from_nv12(
+			&nv12,
+			crate::Size::new(self.width, self.height),
+		)?))
 	}
 }
 
@@ -456,6 +455,9 @@ impl Backend for MediaFoundation {
 			}
 		}
 		self.discontinuity = false;
+		// Read the stamp before the call: arguments evaluate left to right, so
+		// `&mut self.pending` would still hold the borrow when `sample_time`
+		// wants `&self`.
 		let sample_time = self.sample_time();
 		remember_timestamp(&mut self.pending, sample_time, timestamp);
 		self.sample_index += 1;

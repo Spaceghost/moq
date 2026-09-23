@@ -57,7 +57,7 @@ command -v cargo >/dev/null 2>&1 || {
 }
 command -v uniffi-bindgen-go >/dev/null 2>&1 || {
     echo "go stage: uniffi-bindgen-go not on PATH" >&2
-    echo "  install: cargo install uniffi-bindgen-go --git https://github.com/kixelated/uniffi-bindgen-go --rev 4f79e52bd8f518e5fa4d7acff9e586aee21e12a0 --locked" >&2
+    echo "  install: cargo install uniffi-bindgen-go --git https://github.com/kixelated/uniffi-bindgen-go --rev v0.9.0+v0.32.0 --locked" >&2
     exit 1
 }
 
@@ -168,7 +168,7 @@ bash "$SCRIPT_DIR/package-wrapper.sh" \
 WRAPPER_PKG="$STAGE_WRAPPER/moq-go-${WRAPPER_LINE}-wrapper"
 (
     cd "$WRAPPER_PKG"
-    go mod edit -replace="github.com/moq-dev/moq-go-ffi=$FFI_PKG"
+    go mod edit -replace="moq.dev/moq-ffi=$FFI_PKG"
 )
 
 printf '%s\n%s\n' "$FFI_PKG" "$WRAPPER_PKG"

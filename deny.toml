@@ -10,7 +10,7 @@ version = 2
 yanked = "deny"
 ignore = [
     # rsa 0.9.x Marvin Attack (RSA private-key timing sidechannel). The
-    # `rsa` crate is a direct dep of moq-token but is only used for keygen
+    # `rsa` crate is a direct dep of moq-auth but is only used for keygen
     # and PEM serialization of JWK components. JWT signing/verification
     # itself runs through `jsonwebtoken` backed by `aws-lc-rs` (constant
     # time), so the vulnerable code path is not exercised. Drop the ignore
@@ -18,8 +18,6 @@ ignore = [
     "RUSTSEC-2023-0071",
 
     # foundations (Cloudflare) pins serde_yaml 0.8 which uses yaml-rust 0.4.
-    # Reachable via tokio-quiche -> web-transport-quiche -> moq-native
-    # (quiche feature). Awaits upstream migration to serde_yaml 0.9+.
     "RUSTSEC-2024-0320",
 
     # gstreamer 0.23 pulls paste (proc-macro). gstreamer 0.25 drops it but

@@ -29,7 +29,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use moq_net::origin;
+use moq_net::{Path, PathOwned, origin};
 
 use crate::Result;
 use crate::server::{Request, Server};
@@ -47,21 +47,32 @@ pub struct Config {
 	/// gateway is disabled.
 	pub listen: Option<SocketAddr>,
 
-	/// Prefix prepended to every broadcast path, for both publish and request.
-	/// Lets one listener namespace all of its streams (e.g. `live/`).
-	pub prefix: String,
+	/// Path prefix prepended to every broadcast path, for both publish and request.
+	/// Lets one listener namespace all of its streams (e.g. `live`).
+	pub prefix: PathOwned,
 
 	/// SRT receive latency: the negotiated buffer that trades delay for loss
 	/// recovery.
 	pub latency: Duration,
+
+	/// How long relays keep a non-latest group of an ingested media track fetchable, or
+	/// `None` for hang's own default.
+	///
+	/// A retention budget, not a delivery one: it never makes a subscriber play further
+	/// behind live, it caps how far back a FETCH can still reach. The default suits a
+	/// segmented egress (HLS/DASH) reading the broadcast downstream, which may only
+	/// advertise segments that are still fetchable. Lower it when nothing reads history
+	/// and the memory matters. Only affects ingest (`m=publish`); egress ignores it.
+	pub max_age: Option<Duration>,
 }
 
 impl Default for Config {
 	fn default() -> Self {
 		Self {
 			listen: None,
-			prefix: String::new(),
+			prefix: Path::empty().to_owned(),
 			latency: crate::server::DEFAULT_LATENCY,
+			max_age: None,
 		}
 	}
 }
@@ -97,7 +108,8 @@ pub async fn run(origin: origin::Producer, config: Config) -> Result<()> {
 	// RTMP stream key) instead of being silently parked as a backup that could
 	// take over the path when the first publisher drops.
 	let active = ActivePaths::default();
-	let prefix = Arc::new(config.prefix);
+	let prefix = config.prefix;
+	let max_age = config.max_age;
 
 	while let Some(request) = server.accept().await {
 		let prefix = prefix.clone();
@@ -110,15 +122,15 @@ pub async fn run(origin: origin::Producer, config: Config) -> Result<()> {
 				// publishers.
 				tokio::spawn(async move {
 					let peer = publish.peer();
-					let path = format!("{prefix}{}", publish.resource());
+					let path = prefix.join(publish.resource());
 					// Claim the path before accepting; the guard releases it when the
 					// connection task ends (success, error, or panic).
-					let Some(_guard) = active.claim(&path) else {
+					let Some(_guard) = active.claim(path.as_str()) else {
 						tracing::warn!(%peer, %path, "rejecting SRT publish: path already being ingested");
-						let _ = publish.reject().await;
+						let _ = publish.reject(crate::Reject::Unavailable).await;
 						return;
 					};
-					if let Err(err) = publish.accept(&origin, &path).await {
+					if let Err(err) = publish.with_max_age(max_age).accept(&origin, &path).await {
 						tracing::warn!(%peer, %path, %err, "SRT ingest ended with error");
 					} else {
 						tracing::info!(%peer, %path, "SRT ingest ended");
@@ -131,7 +143,7 @@ pub async fn run(origin: origin::Producer, config: Config) -> Result<()> {
 				// don't claim an `ActivePaths` slot.
 				tokio::spawn(async move {
 					let peer = subscribe.peer();
-					let path = format!("{prefix}{}", subscribe.resource());
+					let path = prefix.join(subscribe.resource());
 					if let Err(err) = subscribe.accept(&consumer, &path).await {
 						tracing::warn!(%peer, %path, %err, "SRT request ended with error");
 					} else {
@@ -142,9 +154,7 @@ pub async fn run(origin: origin::Producer, config: Config) -> Result<()> {
 		}
 	}
 
-	Err(crate::Error::from(anyhow::anyhow!(
-		"SRT listener stopped accepting connections"
-	)))
+	Err(crate::Error::ListenerClosed)
 }
 
 /// The set of broadcast paths with a live ingest, used to reject duplicate

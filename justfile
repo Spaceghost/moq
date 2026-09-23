@@ -44,7 +44,13 @@ dev:
 # Benchmark the current tree, or compare it with a commit: `just bench origin/main`.
 bench $BASE="":
     #!/usr/bin/env bash
-    exec rs/scripts/bench.sh "$BASE"
+    exec just --justfile bench/justfile compare "$BASE"
+
+# Compare one multi-threaded Tokio runtime with the same number of independent
+# Tokio/epoll and io_uring workers. Defaults to every logical CPU.
+bench-runtime $ROUNDS="3" $WORKERS="":
+    #!/usr/bin/env bash
+    exec just --justfile bench/justfile runtime "$ROUNDS" "$WORKERS"
 
 # A linked worktree's Git metadata does not live under its own root: the
 # per-worktree directory is `--git-dir` and everything shared (objects, remote
@@ -358,7 +364,7 @@ _changed-test $LIMIT=changed_max:
     fail() { echo "changed: _changed-test: $1" >&2; exit 1; }
 
     # Synthetic sizes rather than whatever the working tree happens to hold: a
-    # clean checkout has no diff at all, and `check-all` runs there (cache.yml
+    # clean checkout has no diff at all, and `check --all` runs there (cache.yml
     # warms the cache from `main`), so a test keyed on the real list would take
     # down the one job allowed to write the shared Rust cache.
     [[ "$(printf 'aaaa' | just _changed-cap 3)" == ALL ]] || fail "over budget must print ALL"
@@ -418,7 +424,7 @@ _echo $VALUE:
 # Required per scope, mirroring what `check` actually dispatches for a given
 # diff: demanding gradle on a docs-only PR would fail a run that was never going
 # to invoke it. Takes the same file list as the dispatch, or `ALL` to require
-# everything (`check-all`).
+# everything (`check --all`).
 #
 # One deliberate absence: swift exists only on macOS, and `swift check` skips
 # off-macOS by design; swift.yml is its real gate.
@@ -434,7 +440,8 @@ _tools $FILES="":
 
     # `_check-common` runs on every invocation, so its tools are unconditional.
     tools=(actionlint bun jq nix nixfmt shellcheck shfmt taplo python3 nfpm dpkg-deb envsubst rpm)
-    scoped '^(quest/|rs/|Cargo\.(toml|lock)$|rust-toolchain\.toml$)' && tools+=(cargo envsubst)
+    scoped '^(drafts/|doc/\.vitepress/drafts\.ts$)' && tools+=(kramdown-rfc xml2rfc)
+    scoped '^(bench/|quest/|rs/|Cargo\.(toml|lock)$|rust-toolchain\.toml$)' && tools+=(cargo envsubst)
     scoped '^(py/|pyproject\.toml$|uv\.lock$|rs/moq-ffi/)'     && tools+=(uv)
     scoped '^(kt/|rs/moq-ffi/)'                                && tools+=(gradle java)
     # cargo because `go check` builds moq-ffi for the host, and skips on a
@@ -473,38 +480,59 @@ _tools $FILES="":
 # Lints and compiles only the packages the branch changed plus everything
 # depending on them, so several worktrees can build at once. This is also what
 # CI runs (with MOQ_STRICT=1), so there is no second, drifting definition of
-# "checked". Tests are the sibling `just test`; `check-all` is the unscoped suite.
+# "checked". Tests are the sibling `just test`; `check --all` is the unscoped suite.
 
 # Lint and compile what the branch changed since BASE, plus its dependents.
-check $BASE="":
+check $BASE="" *args:
     #!/usr/bin/env bash
     set -euo pipefail
 
-    files=$(just _changed "$BASE")
+    if [[ "$BASE" == --all ]]; then
+        files=ALL
+    else
+        files=$(just _changed "$BASE")
+    fi
 
     # `_changed` says ALL when the list outgrew what argv can carry. The unscoped
     # suite is the path that passes no list at all, so it is the one that works.
-    if [[ "$files" == ALL ]]; then
-    	just check-all
-    	exit 0
+    # The dispatch below lives in these two files, and neither matches any
+    # language scope, so a PR that rewrites how CI dispatches would otherwise
+    # validate none of it. Widen to the unscoped suite instead.
+    if [[ "$files" != ALL ]] && grep -qE '^(justfile|test/justfile)$' <<< "$files"; then
+        echo "check: root orchestration changed; checking everything." >&2
+        files=ALL
     fi
 
     just _tools "$files"
 
-    # The dispatch below lives in these two files, and neither matches any
-    # language scope, so a PR that rewrites how CI dispatches would otherwise
-    # validate none of it. Hand off to the unscoped suite instead.
-    if grep -qE '^(justfile|test/justfile)$' <<< "$files"; then
-    	echo "check: root orchestration changed; checking everything." >&2
-    	just check-all
-    	exit 0
-    fi
-
-    # An empty list means "force-run" to the per-lang recipes, which is the
-    # wrong semantic here, so don't dispatch at all.
-    if [[ -n "$files" ]]; then
+    if [[ "$files" == ALL ]]; then
+        just js check
+        just drafts check
+        just rs check --workspace --exclude moq-net-fuzz {{ args }}
+        just rs tokio-features
+        just --justfile bench/justfile check
+        cargo run --quiet --locked --package quest -- check
+        # Not covered by the line above: moq-wasm only exists on the wasm32 target.
+        just rs wasm
+        just py check
+        just kt check
+        just swift check
+        just go check
+        just dart check
+        just obs check
+        just obs compile
+        just _flake
+    elif [[ -n "$files" ]]; then
         just js check "$files"
         just rs check-changed "$files"
+        if echo "$files" | grep -q '^bench/'; then
+            just --justfile bench/justfile check
+        fi
+        # Draft sources render into the doc site and carry their own kramdown-rfc
+        # plus vector checks; a drafts-only diff would otherwise skip both.
+        if echo "$files" | grep -qE '^(drafts/|doc/\.vitepress/drafts\.ts$)'; then
+            just drafts check
+        fi
         # Quest documents form one graph, so validate the whole living tree when
         # either a quest or its validator changes.
         if echo "$files" | grep -qE '^(quest/|rs/quest/)'; then
@@ -515,12 +543,13 @@ check $BASE="":
         just swift check "$files"
         just go check "$files"
         just dart check "$files"
-    	# Type-checking the plugin needs only headers, so it runs here rather
-    	# than waiting for obs.yml to link it on Linux. libmoq is in scope
-    	# because the plugin calls through its generated C header, and flake.nix
-    	# because it owns the libobs headers this compiles against -- obs.yml
-    	# links against nixpkgs' obs-studio instead, so nothing else would notice
-    	# that package going bad.
+    	# Type-checking the plugin and its unit tests needs only headers, so it
+    	# runs here rather than waiting for obs.yml to link them on Linux. libmoq
+    	# is in scope because the plugin calls through its generated C header, and
+    	# the tests restate those entry points as stubs, so an ABI change breaks
+    	# both. flake.nix because it owns the libobs headers this compiles
+    	# against -- obs.yml links against nixpkgs' obs-studio instead, so nothing
+    	# else would notice that package going bad.
     	if echo "$files" | grep -qE '^(cpp/obs/|rs/libmoq/|flake\.nix$)'; then
     		just obs compile
     	fi
@@ -544,24 +573,6 @@ check $BASE="":
 
     just _check-common
 
-# Check every package in every language, plus moq-wasm.
-check-all *args:
-    just _tools ALL
-    just js check
-    just rs check --workspace --exclude moq-net-fuzz {{ args }}
-    cargo run --quiet --locked --package quest -- check
-    # Not covered by the line above: moq-wasm only exists on the wasm32 target.
-    just rs wasm
-    just py check
-    just kt check
-    just swift check
-    just go check
-    just dart check
-    just obs check
-    just obs compile
-    just _flake
-    just _check-common
-
 # Skips when nix is absent: the flake is not a precondition for working on the
 # repo, and `_tools` already makes it required under MOQ_STRICT.
 
@@ -570,7 +581,7 @@ check-all *args:
 _flake:
     @if command -v nix >/dev/null 2>&1; then nix flake check; fi
 
-# Repository-wide non-compiling checks shared by `check` and `check-all`.
+# Repository-wide non-compiling checks shared by scoped and unscoped `check`.
 # Optional shell, workflow, TOML, Nix, and justfile lints skip if missing.
 #
 # `bun install` because remark-cli lives in node_modules and `just js check` is
@@ -726,7 +737,7 @@ _markdown-test:
 
     echo "markdown: check/fix regression ok"
 
-# Repository-wide lints, shared by `check` and `check-all`.
+# Repository-wide lints, shared by scoped and unscoped `check`.
 [private]
 _check-common:
     just _changed-test
@@ -740,26 +751,31 @@ _check-common:
     just gh check
 
 # Scoped exactly like `check`, because `clippy --fix` compiles what it fixes.
-# `fix-all` is the unscoped version.
+# Pass `--all` for the unscoped version.
 
 # Auto-fix lint and formatting for what the branch changed since BASE.
 fix $BASE="":
     #!/usr/bin/env bash
     set -euo pipefail
 
-    files=$(just _changed "$BASE")
+    if [[ "$BASE" == --all ]]; then
+        files=ALL
+    else
+        files=$(just _changed "$BASE")
+    fi
 
     # Mirrors `check`: too long for argv means fix everything instead.
     if [[ "$files" == ALL ]]; then
-    	just fix-all
-    	exit 0
-    fi
-
-    if [[ -n "$files" ]]; then
+        just js fix
+        just rs fix --workspace --exclude moq-net-fuzz
+        just py fix
+        just dart fix
+        just obs fix
+    elif [[ -n "$files" ]]; then
     	just js fix "$files"
     	just rs fix-changed "$files"
     	just py fix "$files"
-    	just dart fix "$files"
+        just dart fix "$files"
     	if echo "$files" | grep -q '^cpp/obs/'; then
     		just obs fix
     	fi
@@ -769,19 +785,10 @@ fix $BASE="":
 
     just _fix-common
 
-# Auto-fix every JavaScript workspace and every default Rust member.
-fix-all:
-    just js fix
-    just rs fix --workspace --exclude moq-net-fuzz
-    just py fix
-    just dart fix
-    just obs fix
-    just _fix-common
-
 # Optional tools skip if missing locally. `bun install` for the same reason as
 # `_check-common`.
 
-# Repository-wide fixes, shared by `fix` and `fix-all`.
+# Repository-wide fixes, shared by scoped and unscoped `fix`.
 [private]
 _fix-common:
     bun install

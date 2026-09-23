@@ -7,4 +7,4 @@ module moq.dev/smoke
 
 go 1.23
 
-require github.com/moq-dev/moq-go v0.0.0
+require moq.dev/moq v0.0.0

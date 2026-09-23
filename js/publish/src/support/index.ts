@@ -4,9 +4,9 @@
  *
  * @module
  */
-import * as Util from "@moq/hang/util";
 import { Connection } from "@moq/net";
 import { workerSupported } from "../video/processor";
+import { probe } from "./video";
 
 export type Level = "full" | "partial" | "none";
 
@@ -64,34 +64,6 @@ async function audioEncoderSupported(codec: keyof typeof CODECS): Promise<boolea
 	return res.supported === true;
 }
 
-async function videoEncoderSupported(codec: keyof typeof CODECS): Promise<Codec> {
-	const software = await VideoEncoder.isConfigSupported({
-		codec: CODECS[codec],
-		width: 1280,
-		height: 720,
-		hardwareAcceleration: "prefer-software",
-	});
-
-	// We can't reliably detect hardware encoding on Firefox: https://github.com/w3c/webcodecs/issues/896
-	const hardware = await VideoEncoder.isConfigSupported({
-		codec: CODECS[codec],
-		width: 1280,
-		height: 720,
-		hardwareAcceleration: "prefer-hardware",
-	});
-
-	// Safari always echoes "prefer-hardware" back, so the hint tells us nothing. Treat it like
-	// Firefox and report hardware support as unknown rather than advertising hardware VP9/AV1 it
-	// doesn't have.
-	const unknown =
-		Util.Hacks.isFirefox || Util.Hacks.isSafari || hardware.config?.hardwareAcceleration !== "prefer-hardware";
-
-	return {
-		hardware: unknown ? undefined : hardware.supported === true,
-		software: software.supported === true,
-	};
-}
-
 export async function isSupported(): Promise<Full> {
 	return {
 		// Report "partial" when @moq/net forces the WebSocket fallback.
@@ -107,7 +79,6 @@ export async function isSupported(): Promise<Full> {
 			capture:
 				// Chrome has MediaStreamTrackProcessor on the window; Safari and Firefox only in a
 				// worker, which we hop through. Either way it's the native pipeline, so full points.
-				// @ts-expect-error No typescript types yet.
 				typeof MediaStreamTrackProcessor !== "undefined" || (await workerSupported())
 					? "full"
 					: // The fallback drives a <video> element via requestVideoFrameCallback, which is
@@ -118,11 +89,11 @@ export async function isSupported(): Promise<Full> {
 			encoding:
 				typeof VideoEncoder !== "undefined"
 					? {
-							h264: await videoEncoderSupported("h264"),
-							h265: await videoEncoderSupported("h265"),
-							vp8: await videoEncoderSupported("vp8"),
-							vp9: await videoEncoderSupported("vp9"),
-							av1: await videoEncoderSupported("av1"),
+							h264: await probe(CODECS.h264),
+							h265: await probe(CODECS.h265),
+							vp8: await probe(CODECS.vp8),
+							vp9: await probe(CODECS.vp9),
+							av1: await probe(CODECS.av1),
 						}
 					: undefined,
 		},

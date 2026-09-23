@@ -14,8 +14,8 @@ swapping or bumping a backend crate is not a breaking change.
 
 The opt-in `capture` feature exposes the device APIs and their per-platform
 backends. Enable it with `cargo add moq-video --features capture`; the default
-codec-only build accepts frames supplied by the caller without pulling Linux
-V4L2 and libclang build dependencies.
+codec-only build accepts frames supplied by the caller and compiles none of the
+device backends. Nothing is needed on the build host either way.
 
 Per-platform, picked at compile time:
 
@@ -45,8 +45,9 @@ let mut config = moq_video::capture::Config::default();
 config.source = moq_video::capture::Source::Display(None);
 
 let mut capture = moq_video::capture::open(&config).await?;
-while let Some(surface) = capture.read().await? {
-    // Encode, render, or inspect the newest captured surface.
+while let Some(frame) = capture.read().await? {
+    // Encode, render, or inspect the newest captured frame; `frame.surface`
+    // holds the pixels and `frame.timestamp` the capture time.
 }
 ```
 
@@ -64,7 +65,7 @@ choice (`Auto` / `Hardware` / `Software` / a named backend).
 
 | Codec | Software | macOS | Windows | Linux | Android |
 |---|---|---|---|---|---|
-| H.264 | openh264 (vendored, static) | VideoToolbox | Media Foundation | NVENC (feature `nvidia`), VAAPI (feature `vaapi`) | MediaCodec (feature `mediacodec`, API 26+) |
+| H.264 | OpenH264 (feature `openh264`, default) | VideoToolbox | Media Foundation | NVENC (feature `nvidia`), VAAPI (feature `vaapi`) | MediaCodec (feature `mediacodec`, API 26+) |
 | H.265 | none | VideoToolbox | Media Foundation | NVENC (feature `nvidia`) | MediaCodec (feature `mediacodec`, API 26+) |
 
 Every backend emits Annex-B with in-band parameter sets (SPS/PPS, plus VPS for
@@ -78,11 +79,17 @@ backend that buffers, which hands back an earlier frame's access unit while a
 later one goes in, and for the tail `finish()` drains. Bring your own pixels with
 `Surface::rgba(...)`, or feed a frame straight from capture or `decode`.
 
-Keyframes are automatic, at the `Config::gop` interval, so an application never
-has to think about them. `Encoder::keyframe()` asks for one at the next frame when
-something outside the encoder needs a decodable starting point there: opening a
-new group, or resuming after an idle gap. The request is held until a frame
-arrives, so it is safe to call before you have one.
+Group boundaries are automatic: `Config::gop` says how the stream is divided
+(`Gop::Keyframe { interval }` places a keyframe every so many frames, and an
+interval of zero is refused at open), so an application never has to think
+about them. `Encoder::cut()` opens a group at the next frame when something
+outside the encoder needs a decodable starting point there: a source group
+boundary, a scene change, a source switch. The request is held until a frame
+arrives, so it is safe to call before you have one. It fails with
+`Error::CutUnsupported` on a backend that cannot force a boundary (a V4L2
+driver without the force-keyframe control), and queues nothing then: groups
+keep falling where `Config::gop` puts them. `encode::Sink` answers the same
+way, awaited.
 
 Two public entry points:
 
@@ -92,12 +99,54 @@ Two public entry points:
 - `encode::Producer` publishes frames you encoded yourself (`publish(&[Encoded])`),
   handling the catalog and framing. Each is published at its own timestamp.
 
-The NVENC, VAAPI, and V4L2 M2M backends are Linux-only. `nvidia` is on by
-default: it `dlopen`s the driver at runtime and needs nothing at build time.
-`vaapi` and `v4l2` are opt-in because their bindgen needs libclang on the build
-host (plus the kernel headers for `v4l2`). None of them link a vendor library,
-so a binary carrying them still links on a GPU-less builder and still starts on
-a machine without the hardware, falling back to software.
+The default features are `openh264`, `nvidia`, and `mediacodec`. OpenH264 keeps
+a working software H.264 fallback but compiles vendored C++; disable defaults
+and select native features to omit it. `nvidia` is Linux-only, `dlopen`s the
+driver at runtime, and needs no build-time toolkit. `vaapi` is opt-in because
+its bindgen needs libclang on the build host, while `v4l2` is opt-in only by
+convention, since `moq-v4l` checks its bindings in. `render` is also opt-in so
+codec-only consumers do not compile wgpu.
+
+### Vulkan producers on NVIDIA
+
+`frame::vulkan::Importer` accepts dedicated optimal-tiling
+`VK_FORMAT_R8G8B8A8_UNORM` (`Image::rgba8`) or `VK_FORMAT_B8G8R8A8_UNORM`
+(`Image::bgra8`) images exported as opaque memory FDs. The producer
+also exports a timeline semaphore and supplies the Vulkan physical-device UUID;
+imports with another CUDA device, format, layout, allocation shape, or sync
+mechanism are refused. Vulkan signals `Timeline::ready` after writes and the
+transition to `VK_IMAGE_LAYOUT_GENERAL`. CUDA waits on that value and signals
+`Timeline::complete` after all readers queued on the frame stream.
+
+An imported `Slot<T>` owns the producer's `T`. `Slot::publish` consumes it and
+`Completion::wait` returns the same slot only after CUDA completion, so a pool
+cannot overwrite an in-flight image. Importer capacity bounds retained slots,
+and a dedicated worker drains completion after capture stops or a receiver is
+cancelled without blocking the producer thread. If the original application
+image is not exportable, copy it on Vulkan into a dedicated exportable slot;
+that is one GPU image copy, not zero-copy. There is no CPU mapping, download, or
+staging fallback for `Surface::Vulkan`.
+
+`frame::cuda::Converter` turns a published Vulkan frame into the NV12
+`Surface::Cuda` that NVENC encodes in place. It runs on the GPU in one declared
+color space (matrix and range), averages 4:2:0 chroma per 2x2 block, applies no
+transfer function, and draws every buffer from a pool sized at construction;
+`cuda::Frame::resize` scales a converted frame for a smaller rendition from the
+same pool. One captured frame feeding HD and SD therefore holds a fixed number
+of buffers, and a producer that outruns its encoder gets an error rather than
+unbounded device memory. Open the encoder with `encode::Kind::Named("nvenc")`
+and the same `encode::Config::color`: `Kind::Auto` could fall back to a software
+encoder that reads the frame back, and the portable `Surface::resize` downloads
+when the GPU scaler fails. Everything under `frame::cuda` and `frame::vulkan`
+runs on the device or returns an error.
+
+Run `just rs vulkan-cuda` for the opt-in native hardware exercise. It creates a
+Vulkan image independently of Unreal, imports it once into CUDA, checks repeated
+slot reuse and held-reader ordering, and tears down through cancellation; a
+second test converts RGBA and BGRA uploads to NV12, scales them, fills the pool,
+and encodes both renditions through NVENC. A third runs the target workload,
+three 1280x720 views at 30 fps, and prints per-stage latency and CPU time
+instead of asserting a threshold.
 
 ## Decode
 
@@ -108,11 +157,15 @@ same device keeps it there (the transcode path), while `into_i420()` downloads
 it. An encoder that can't take that surface (openh264, or a different device)
 downloads it through I420 for you. Every frame carries a `Surface`, a
 `#[non_exhaustive]` enum naming where the pixels live (`PixelBuffer` on macOS,
-`Texture` on Windows, `Cuda` on Linux, `HardwareBuffer` on Android, or CPU
-`I420`). Match it to take a zero-copy path for a representation you recognize, and fall back to
-`Surface::into_i420()`, which always works. On macOS `Surface::into_pixel_buffer()`
+`Texture` on Windows, `Vulkan` and `Cuda` on Linux, `HardwareBuffer` on Android,
+or CPU `I420`). Match
+it to take a GPU path for a representation you recognize, and fall back to
+`Surface::into_i420()` for readback-capable surfaces. GPU-only
+`Surface::Vulkan` refuses CPU conversion. On macOS `Surface::into_pixel_buffer()`
 is the mirror: free for a hardware-decoded frame, an upload for a CPU one.
-`Surface::to_rgba()` and `Surface::to_bgra()` are the portable exits for CPU
+`Surface::into_i420()` returns typed pixels with size and color intact;
+`I420::into_data()` explicitly extracts the packed bytes. `Surface::to_rgba(config)`
+and `Surface::to_bgra(config)` are the portable exits for CPU
 image and UI toolkits, returning owned, tightly packed pixels with the surface's
 color metadata applied. Both orders are there because toolkits disagree and the
 conversion is a full pass over the frame: producing the order the caller wants
@@ -123,7 +176,7 @@ Backends are tried hardware-first, like encode:
 
 | Codec | Software | macOS | Windows | Linux | Android |
 |---|---|---|---|---|---|
-| H.264 | openh264 (vendored, static) | VideoToolbox | Media Foundation (DXVA) | NVDEC (feature `nvidia`), VAAPI (feature `vaapi`) | MediaCodec (feature `mediacodec`, API 26+) |
+| H.264 | OpenH264 (feature `openh264`, default) | VideoToolbox | Media Foundation (DXVA) | NVDEC (feature `nvidia`), VAAPI (feature `vaapi`) | MediaCodec (feature `mediacodec`, API 26+) |
 | H.265 | none | VideoToolbox | Media Foundation (DXVA) | NVDEC (feature `nvidia`) | MediaCodec (feature `mediacodec`, API 26+) |
 | AV1 | none | none | none | NVDEC (feature `nvidia`) | MediaCodec (feature `mediacodec`, when the device provides it) |
 
@@ -135,7 +188,24 @@ Direct3D11 device bound to it, so the decode happens on the GPU through DXVA
 no software decoder, so it needs the GPU path (on Windows, an HEVC decoder MFT:
 the inbox HEVC Video Extensions or a vendor one). On Linux, NVDEC decodes H.264,
 H.265, and 8-bit 4:2:0 AV1 to CUDA NV12 frames; AV1 is decode-only and is useful
-for AV1 source to H.264/H.265 transcode rungs. VAAPI decodes H.264 to CPU I420 by
-default; set `decode::Config::gpu_frames` to receive DMA-BUF surfaces that the
-renderer can import without a download. A non-H.264/H.265/AV1 rendition yields
-`Error::UnsupportedCodec`.
+for AV1 source to H.264/H.265 transcode rungs. VAAPI decodes H.264 to DMA-BUF
+surfaces the renderer imports without a download. A non-H.264/H.265/AV1
+rendition yields `Error::UnsupportedCodec`.
+
+`decode::Config::output` says where decoded pictures live: `Output::Native`
+(the default) hands back whatever the backend decoded into, a GPU surface or
+CPU pixels, and `Output::Cpu` delivers every picture as `Surface::I420`,
+decoded straight to system memory where the backend can and downloaded where it
+cannot. `decode::Config::scale_hint` asks a decoder with a hardware scaler
+(NVDEC) to emit that size; it is a hint, so check `Frame::size` and use
+`Frame::resize` for the exact size. `decode::Consumer` takes `decode::Options`,
+which pairs that config with the subscription's `start` and `max_age`.
+
+Common feature sets:
+
+```bash
+cargo add moq-video                                      # native defaults + OpenH264, no renderer
+cargo add moq-video --no-default-features --features openh264  # software H.264 only
+cargo add moq-video --no-default-features --features nvidia    # Linux NVIDIA only
+cargo add moq-video --features render                    # add the wgpu renderer
+```

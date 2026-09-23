@@ -8,10 +8,16 @@ import { type Kind, Rendition } from "./rendition";
 // Signals the broadcast reads. Whoever owns the backing Signal (the element, or another component
 // whose output is wired in, e.g. a Video.Capture's `display`) does the writing.
 export type BroadcastInput = {
-	connection: Getter<Moq.Connection.Established | undefined>;
+	// The origin to publish into. Independent of any connection: whichever sessions serve the
+	// origin announce the broadcast, and it survives their reconnects.
+	origin: Getter<Moq.Origin.Table | undefined>;
 
-	// Whether to publish the broadcast. Defaults to false so nothing is announced until ready.
+	// Whether to create the broadcast. Defaults to true.
 	enabled: Getter<boolean>;
+
+	// Whether to advertise the broadcast. Defaults to true. The flip rather than a gate on
+	// creating it: tracks can be populated while this is false, then announced once ready.
+	announce: Getter<boolean>;
 
 	// The broadcast name.
 	name: Getter<Moq.Path.Valid>;
@@ -32,12 +38,11 @@ export type BroadcastInput = {
 	 * A retention budget, not a delivery one, so lowering it does not reduce latency: it only
 	 * shortens how far back a fetch can reach.
 	 */
-	latencyMax: Getter<number | undefined>;
+	maxAge: Getter<Moq.Time.Milli | undefined>;
 };
 
 /**
- * A published broadcast: the network broadcast plus a catalog producer, minting per-rendition track
- * handles on demand.
+ * A published broadcast: the network broadcast plus a catalog producer and its rendition tracks.
  *
  * Register renditions with {@link video} / {@link audio}; each returns a {@link Rendition} whose
  * producer (usually an encoder) fills the catalog config and encodes into the demand-gated track.
@@ -57,10 +62,11 @@ export class Broadcast {
 	// root sections (e.g. `scte35`) by locking it too.
 	readonly catalog = new CatalogProducer();
 
-	// The underlying network broadcast, (re)created on each (re)connection and `undefined` while
-	// offline. Exposed so an application can serve its own tracks alongside the built-in
+	// The underlying network broadcast, recreated when the name or enabled state changes and
+	// `undefined` in between. It lives in the origin rather than any session, so it spans
+	// reconnects. Exposed so an application can serve its own tracks alongside the built-in
 	// catalog/audio/video, e.g. `net.createTrack("meta.json")` plus a matching `catalog` section.
-	// Reacquire it via an effect, since reconnecting swaps in a fresh producer.
+	// Reacquire it via an effect, since a rename swaps in a fresh producer.
 	readonly net = new Signal<Moq.Broadcast.Producer | undefined>(undefined);
 
 	// The registered renditions keyed by full track name. A plain object so deep-equality detects a
@@ -68,19 +74,20 @@ export class Broadcast {
 	readonly #renditions = new Signal<Record<string, Rendition<unknown>>>({});
 
 	// The writable track producer signals backing each Rendition's read-only `track`, keyed by name.
-	// The request loop sets these on accept; teardown and unregister clear them.
+	// A static network track is exposed here only while at least one subscriber uses it.
 	readonly #tracks = new Map<string, Signal<Moq.Track.Producer | undefined>>();
 
 	#signals = new Effect();
 
 	constructor(props?: Inputs<BroadcastInput>) {
 		this.in = {
-			connection: getter(props?.connection),
-			enabled: getter(props?.enabled ?? false),
+			origin: getter(props?.origin),
+			enabled: getter(props?.enabled ?? true),
+			announce: getter(props?.announce ?? true),
 			name: getter(props?.name ?? Moq.Path.empty()),
 			display: getter(props?.display),
 			flip: getter(props?.flip ?? false),
-			latencyMax: getter(props?.latencyMax),
+			maxAge: getter(props?.maxAge),
 		};
 
 		this.#signals.run(this.#runCatalog.bind(this));
@@ -95,6 +102,18 @@ export class Broadcast {
 	/** Register an audio rendition under a full track name (e.g. `"audio/data"`). Throws if the name is taken. */
 	audio(name: string): Rendition<Catalog.AudioConfig> {
 		return this.#register<Catalog.AudioConfig>(name, "audio");
+	}
+
+	/**
+	 * Register a text (caption/subtitle) rendition under a full track name (e.g. `"captions/en"`).
+	 * Throws if the name is taken.
+	 *
+	 * Set the returned rendition's `config` to a {@link Catalog.TextConfig}, then write one cue per
+	 * group into its `track` with `Hang.Container.Legacy.Producer` (each cue is a keyframe, so it opens
+	 * its own group). See the module docs for the cue framing.
+	 */
+	text(name: string): Rendition<Catalog.TextConfig> {
+		return this.#register<Catalog.TextConfig>(name, "text");
 	}
 
 	#register<C>(name: string, kind: Kind): Rendition<C> {
@@ -135,6 +154,7 @@ export class Broadcast {
 
 		const video: Record<string, Catalog.VideoConfig> = {};
 		const audio: Record<string, Catalog.AudioConfig> = {};
+		const text: Record<string, Catalog.TextConfig> = {};
 
 		for (const rendition of Object.values(renditions)) {
 			const config = enabled ? effect.get(rendition.config) : undefined;
@@ -142,8 +162,10 @@ export class Broadcast {
 
 			if (rendition.kind === "video") {
 				video[rendition.name] = config as Catalog.VideoConfig;
-			} else {
+			} else if (rendition.kind === "audio") {
 				audio[rendition.name] = config as Catalog.AudioConfig;
+			} else {
+				text[rendition.name] = config as Catalog.TextConfig;
 			}
 		}
 
@@ -168,13 +190,19 @@ export class Broadcast {
 			} else {
 				delete catalog.audio;
 			}
+
+			if (Object.keys(text).length > 0) {
+				catalog.text = { renditions: text };
+			} else {
+				delete catalog.text;
+			}
 		});
 	}
 
 	#run(effect: Effect) {
-		const values = effect.getAll([this.in.enabled, this.in.connection]);
+		const values = effect.getAll([this.in.enabled, this.in.origin]);
 		if (!values) return;
-		const [_enabled, connection] = values;
+		const [_enabled, origin] = values;
 
 		const name = effect.get(this.in.name);
 		if (Catalog.detectFormat(name) === undefined) {
@@ -183,70 +211,58 @@ export class Broadcast {
 			);
 		}
 
-		const broadcast = new Moq.Broadcast.Producer();
+		// Creating into the origin outlives any single session: a reconnect re-announces the
+		// broadcast and new subscriptions land on the same producer.
+		const broadcast = origin.createBroadcast(name);
 		effect.cleanup(() => broadcast.close());
 
-		// Close every active rendition track when the broadcast tears down (reconnect/offline), so an
-		// encoder stops encoding into a dead producer. The Rendition handles themselves stay registered.
-		effect.cleanup(() => {
-			for (const track of this.#tracks.values()) {
-				track.peek()?.close();
-				track.set(undefined);
-			}
+		effect.run((inner) => {
+			if (inner.get(this.in.announce)) broadcast.announce();
+			else broadcast.unannounce();
 		});
 
-		// Publish it before serving so an application reacting to `net` can insert its own tracks.
+		// Expose it before serving so an application reacting to `net` can insert its own tracks.
 		this.net.set(broadcast);
 		effect.cleanup(() => {
 			if (this.net.peek() === broadcast) this.net.set(undefined);
 		});
 
-		connection.publish(name, broadcast);
-
-		effect.spawn(this.#runBroadcast.bind(this, broadcast, effect));
-	}
-
-	async #runBroadcast(broadcast: Moq.Broadcast.Producer, effect: Effect) {
-		for (;;) {
-			const request = await broadcast.requested();
-			if (!request) break;
-
-			if (request.name === Broadcast.CATALOG_TRACK || request.name === Broadcast.CATALOG_TRACK_COMPRESSED) {
-				const compression = request.name === Broadcast.CATALOG_TRACK_COMPRESSED;
-				const track = request.accept();
-
-				// Serve from a per-subscription child scope. Releasing it when this subscriber leaves keeps
-				// serving state from piling up on the connection-lifetime effect as viewers come and go.
-				const dispose = effect.run((effect) => {
-					effect.cleanup(() => track.close());
-					this.catalog.serve(track, effect, { compression });
-				});
-				void track.closed.then(dispose);
-				continue;
-			}
-
-			const signal = this.#tracks.get(request.name);
-			if (!signal) {
-				console.error("received subscription for unknown track", request.name);
-				request.reject(new Error(`Unknown track: ${request.name}`));
-				continue;
-			}
-
-			// Media, so declare the retention a FETCH-based consumer needs (the catalog above
-			// keeps the bare defaults: it is read at the live edge, which is always retained).
-			// Matches what a Rust publisher declares via `hang::container::track_info`.
-			const track = request.accept(Container.trackInfo({ latencyMax: this.in.latencyMax.peek() }));
-
-			// A second subscription for the same name supersedes the first: close the old producer.
-			signal.peek()?.close();
-			signal.set(track);
-
-			// Clear the signal when this track closes on its own, unless it's already been replaced. A
-			// plain promise callback (no child effect) so nothing lingers on the connection effect.
-			void track.closed.then(() => {
-				if (signal.peek() === track) signal.set(undefined);
+		// Catalog tracks are shared across every subscriber and always hold the latest value.
+		for (const [name, compression] of [
+			[Broadcast.CATALOG_TRACK, false],
+			[Broadcast.CATALOG_TRACK_COMPRESSED, true],
+		] as const) {
+			// A catalog may publish once and stay unchanged for the broadcast's whole life. Keep
+			// that sole closed snapshot replayable so a viewer arriving after the ordinary media
+			// retention window can still bootstrap.
+			const track = broadcast.createTrack(name, {
+				maxAge: Moq.Time.Milli(Number.MAX_SAFE_INTEGER),
+				priority: Catalog.PRIORITY.catalog,
 			});
+			effect.cleanup(() => track.close());
+			this.catalog.serve(track, effect, { compression });
 		}
+
+		// Static tracks fan out to every subscriber. Keep the encoder-facing handle demand-gated
+		// so capture and encoding still stop when the final subscriber leaves.
+		effect.run((tracks) => {
+			const renditions = tracks.get(this.#renditions);
+			const maxAge = tracks.get(this.in.maxAge);
+
+			for (const rendition of Object.values(renditions)) {
+				const signal = this.#tracks.get(rendition.name);
+				if (!signal) continue;
+
+				const track = broadcast.createTrack(
+					rendition.name,
+					Container.trackInfo({ maxAge, priority: Catalog.PRIORITY[rendition.kind] }),
+				);
+				tracks.cleanup(() => track.close());
+				tracks.run((demand) => {
+					demand.set(signal, demand.get(track.used) ? track : undefined);
+				});
+			}
+		});
 	}
 
 	close() {

@@ -24,7 +24,9 @@ const cleanup = new FinalizationRegistry<Moq.Signals.Effect>((signals) => signal
 export default class MoqBoy extends HTMLElement {
 	static observedAttributes = OBSERVED;
 
-	readonly connection: Moq.Connection.Reload;
+	readonly connection: Moq.Connection;
+	/** The origin viewer broadcasts are published into, served across reconnects. */
+	readonly origin = new Moq.Origin.Producer();
 	readonly expanded = new Moq.Signals.Signal<string | undefined>(undefined);
 
 	/** Reactive map of active game sessions. Emits on add/remove. */
@@ -42,8 +44,16 @@ export default class MoqBoy extends HTMLElement {
 		super();
 		cleanup.register(this, this.#signals);
 
-		this.connection = new Moq.Connection.Reload({ enabled: this.#enabled });
+		// One origin, both directions: viewer broadcasts are published into it and the
+		// relay's announced games arrive in it, with no risk of echoing either back.
+		this.connection = new Moq.Connection({
+			enabled: this.#enabled,
+			publish: this.origin.consume(),
+			consume: this.origin,
+			share: false,
+		});
 		this.#signals.cleanup(() => this.connection.close());
+		this.#signals.cleanup(() => this.origin.close());
 
 		// Discover game sessions via announcements.
 		this.#signals.run(this.#runDiscovery.bind(this));
@@ -113,15 +123,14 @@ export default class MoqBoy extends HTMLElement {
 	}
 
 	#runDiscovery(effect: Moq.Signals.Effect) {
-		const conn = effect.get(this.connection.established);
-		if (!conn) return;
-
 		const base = effect.get(this.#prefix);
 		const gamePrefix = effect.get(this.#gamePrefixOverride) ?? `${base}/game`;
 		const viewerPrefix = effect.get(this.#viewerPrefixOverride) ?? `${base}/viewer`;
 		const prefix = Moq.Path.from(gamePrefix);
 
-		const announced = conn.announced(prefix);
+		// The origin's stream spans reconnects: entries retract when the session dies and
+		// return when the next one re-announces them, so this loop never needs to restart.
+		const announced = this.origin.consume().announced(Moq.Path.Pattern.parse("*").rooted(prefix));
 		effect.cleanup(() => announced.close());
 
 		effect.spawn(async () => {
@@ -129,15 +138,16 @@ export default class MoqBoy extends HTMLElement {
 				const entry = await Promise.race([effect.cancel, announced.next()]);
 				if (!entry) break;
 
-				// Skip nested paths (e.g. "viewer/..." sub-broadcasts).
-				const suffix = entry.path;
-				if (!suffix || suffix.includes("/")) continue;
+				// A broad route that cannot pin the game id names nothing to open.
+				const capture = entry.captures?.[0];
+				if (!capture?.isLiteral) continue;
 
-				const id = suffix;
-				if (entry.active && !this.#sessions.has(id)) {
+				const id = capture.text;
+				if (Moq.Announce.isActive(entry.kind) && !this.#sessions.has(id)) {
 					const config: GameConfig = {
 						sessionId: id,
 						connection: this.connection,
+						origin: this.origin,
 						expanded: this.expanded,
 						gamePrefix,
 						viewerPrefix,
@@ -145,7 +155,7 @@ export default class MoqBoy extends HTMLElement {
 					const game = new Game(config);
 					this.#sessions.set(id, game);
 					this.games.set(new Map(this.#sessions));
-				} else if (!entry.active) {
+				} else if (entry.kind === "retracted") {
 					const game = this.#sessions.get(id);
 					if (game) {
 						game.close();

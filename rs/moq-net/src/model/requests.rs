@@ -149,6 +149,13 @@ impl<K: Clone + Eq + Hash, V> Requests<K, V> {
 			.filter_map(|key| self.pending.remove(&key))
 			.collect()
 	}
+
+	/// Remove and return every pending request, queued or already handed to a
+	/// handler, so the caller can reject them all on a terminal teardown.
+	pub fn drain_all(&mut self) -> Vec<V> {
+		self.order.clear();
+		self.pending.drain().map(|(_, value)| value).collect()
+	}
 }
 
 #[cfg(test)]
@@ -175,6 +182,8 @@ mod test {
 		requests.add_handler();
 		assert!(requests.insert(1, "a").is_ok());
 
+		// Popping hands the request to a handler, which leaves it joinable: a later
+		// caller wanting the same key shares its result rather than queuing a second.
 		assert_eq!(requests.pop(), Some(1));
 		assert_eq!(requests.join(&1), Some(&mut "a"));
 		assert!(!requests.has_queued());

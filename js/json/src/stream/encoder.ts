@@ -1,13 +1,15 @@
-import { Encoder as Flate } from "@moq/flate";
+import { DEFAULT_MAX_FRAME_SIZE, Encoder as Flate } from "@moq/flate";
 
-/** Options shared by an {@link Encoder} and the {@link Producer} that wraps one. */
-export interface ProducerConfig {
+import { type Compression, isDeflate } from "../compression.ts";
+
+/** Options for an {@link Encoder}. */
+export interface Config {
 	/**
 	 * Compress the group as one sync-flushed `deflate-raw` stream, so each record reuses the earlier
 	 * ones as context and shrinks sharply. A {@link Decoder} reading the frames must set the same
-	 * flag. Defaults to `false`.
+	 * {@link compression}. Defaults to `"none"`.
 	 */
-	compression?: boolean;
+	compression?: Compression;
 }
 
 /**
@@ -59,8 +61,8 @@ export class Encoder<T> {
 	// tell that it is acknowledging a record that is no longer the outstanding one.
 	#generation = 0;
 
-	constructor(config: ProducerConfig = {}) {
-		this.#compress = config.compression ?? false;
+	constructor(config: Config = {}) {
+		this.#compress = isDeflate(config.compression);
 		this.#flate = this.#compress ? new Flate() : undefined;
 	}
 
@@ -99,6 +101,13 @@ export class Encoder<T> {
 		}
 
 		const bytes = new TextEncoder().encode(text);
+
+		// Every consumer decodes with `@moq/flate`'s default output cap, so a record past it would be
+		// unreadable however small it compresses to. Reject it here, where the caller still learns
+		// why, rather than publishing something only the producer can read.
+		if (this.#compress && bytes.byteLength > DEFAULT_MAX_FRAME_SIZE) {
+			throw new Error(`record larger than the decoder's ${DEFAULT_MAX_FRAME_SIZE} byte limit`);
+		}
 		const payload = this.#flate ? this.#flate.frame(bytes) : bytes;
 
 		this.#pending = true;

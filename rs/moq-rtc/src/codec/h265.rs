@@ -15,8 +15,8 @@ pub struct Bridge {
 
 impl Bridge {
 	/// Publish a `.hev1` track on `broadcast`, adding the catalog rendition once config is known.
-	pub fn new(mut broadcast: moq_net::broadcast::Producer, catalog: moq_mux::catalog::Producer) -> Result<Self> {
-		let track = broadcast.unique_track(".hev1", catalog.track_info())?;
+	pub fn new(broadcast: moq_net::broadcast::Producer, catalog: moq_mux::catalog::Producer) -> Result<Self> {
+		let track = broadcast.unique_track(".hev1", catalog.track_info(hang::catalog::PRIORITY.video))?;
 		let import = moq_mux::codec::h265::Import::new(track, catalog.reserve(), Default::default())?;
 		let split = moq_mux::codec::h265::Split::new();
 		Ok(Self { split, import })
@@ -25,12 +25,16 @@ impl Bridge {
 
 impl codec::Bridge for Bridge {
 	fn push(&mut self, frame: codec::Frame) -> Result<()> {
-		let pts = moq_net::Timestamp::from_micros(frame.timestamp_us)
-			.map_err(|err| crate::Error::Other(anyhow::anyhow!("invalid timestamp: {err}")))?;
+		let pts = moq_net::Timestamp::from_micros(frame.timestamp_us).map_err(moq_mux::Error::from)?;
 		// str0m hands over one whole access unit per frame, so flush to emit it.
 		let mut frames = self.split.decode(&frame.payload, Some(pts))?;
 		frames.extend(self.split.flush(Some(pts))?);
 		self.import.decode(frames)?;
+		Ok(())
+	}
+
+	fn tick(&mut self) -> Result<()> {
+		self.import.tick()?;
 		Ok(())
 	}
 

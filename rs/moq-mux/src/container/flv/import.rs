@@ -21,6 +21,7 @@
 //! enhanced audio, and any other codec, are logged and dropped.
 
 use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use bytes::{Buf, Bytes, BytesMut};
@@ -84,13 +85,15 @@ pub struct Import<E: crate::catalog::hang::CatalogExt = ()> {
 /// The demuxed video track plus its current catalog config, so a repeated
 /// (identical) sequence header is a no-op rather than a track rebuild.
 struct VideoStream {
-	track: crate::container::Producer<crate::catalog::hang::Container>,
+	track: crate::container::Producer<crate::catalog::hang::Container, VideoConfig>,
 	config: VideoConfig,
+	stalled: hang::catalog::stalled::Detector,
+	last_source: Option<Instant>,
 }
 
 /// The demuxed audio track plus its current catalog config.
 struct AudioStream {
-	track: crate::container::Producer<crate::catalog::hang::Container>,
+	track: crate::container::Producer<crate::catalog::hang::Container, AudioConfig>,
 	config: AudioConfig,
 }
 
@@ -178,6 +181,7 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 			}
 		}
 
+		self.tick_stalled()?;
 		Ok(())
 	}
 
@@ -450,13 +454,6 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 		composition_time: i32,
 		keyframe: bool,
 	) -> anyhow::Result<()> {
-		let Some(stream) = self.video.get_mut(&track_id) else {
-			tracing::debug!("video frame before sequence header, dropping");
-			return Ok(());
-		};
-		// A media frame means every sequence header has arrived (FLV sends config before data), so
-		// the track set is declared; release the reservation to publish.
-		self.initial_reservation = None;
 		// FLV stores DTS in the tag; PTS is DTS plus the composition offset.
 		let pts_ms = (dts as i64) + (composition_time as i64);
 		if pts_ms < 0 {
@@ -466,15 +463,34 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 			}
 			.into());
 		}
-		match stream.track.write(Frame {
-			timestamp: Timestamp::from_millis(pts_ms as u64)?,
-			duration: None,
-			payload: Bytes::copy_from_slice(data),
-			keyframe,
-		}) {
-			Ok(()) | Err(crate::Error::MissingKeyframe(_)) => Ok(()),
-			Err(e) => Err(e.into()),
+		if !self.video.contains_key(&track_id) {
+			tracing::debug!("video frame before sequence header, dropping");
+			return Ok(());
 		}
+		// A media frame means every sequence header has arrived (FLV sends config before data), so
+		// the track set is declared; release the reservation to publish.
+		self.initial_reservation = None;
+		let timestamp = Timestamp::from_millis(pts_ms as u64)?;
+		let written = {
+			let stream = self.video.get_mut(&track_id).expect("checked above");
+			match stream.track.write(Frame {
+				timestamp,
+				duration: None,
+				payload: Bytes::copy_from_slice(data),
+				keyframe,
+			}) {
+				Ok(()) => {
+					stream.last_source = Some(Instant::now());
+					true
+				}
+				Err(crate::Error::MissingKeyframe(_)) => false,
+				Err(e) => return Err(e.into()),
+			}
+		};
+		if written {
+			self.publish_stalled(track_id, true)?;
+		}
+		Ok(())
 	}
 
 	/// Write one audio frame as its own group, so the relay can forward it immediately.
@@ -504,13 +520,14 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 		}
 
 		let net_track = self.replace_video(track_id)?;
-		let name = net_track.name().to_string();
 		// Build the wire producer before advertising the rendition. Both steps are fallible (an
 		// unsupported container, a colliding timeline track), and a rendition published for a track
 		// we then fail to produce would be advertised to consumers but never served.
-		let wire = crate::catalog::hang::Container::try_from(&self.container)?;
-		let media = self.catalog.media_producer(net_track, wire)?;
-		self.catalog.lock().video.renditions.insert(name, config.clone());
+		let wire = crate::catalog::hang::Container::try_from(&config)?;
+		let media = match &self.initial_reservation {
+			Some(reserved) => reserved.video(net_track, wire, config.clone())?,
+			None => self.catalog.video(net_track, wire, config.clone())?,
+		};
 		self.video.insert(
 			track_id,
 			VideoStream {
@@ -518,6 +535,8 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 				// site (the producer reports MissingKeyframe), so a mid-GOP join works.
 				track: media,
 				config,
+				stalled: hang::catalog::stalled::Detector::new(),
+				last_source: None,
 			},
 		);
 		Ok(())
@@ -531,14 +550,55 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 		}
 
 		let net_track = self.replace_audio(track_id)?;
-		let name = net_track.name().to_string();
 		// Build the wire producer before advertising the rendition. Both steps are fallible (an
 		// unsupported container, a colliding timeline track), and a rendition published for a track
 		// we then fail to produce would be advertised to consumers but never served.
-		let wire = crate::catalog::hang::Container::try_from(&self.container)?;
-		let media = self.catalog.media_producer(net_track, wire)?;
-		self.catalog.lock().audio.renditions.insert(name, config.clone());
+		let wire = crate::catalog::hang::Container::try_from(&config)?;
+		let media = match &self.initial_reservation {
+			Some(reserved) => reserved.audio(net_track, wire, config.clone())?,
+			None => self.catalog.audio(net_track, wire, config.clone())?,
+		};
 		self.audio.insert(track_id, AudioStream { track: media, config });
+		Ok(())
+	}
+
+	fn tick_stalled(&mut self) -> anyhow::Result<()> {
+		let ids: Vec<u8> = self.video.keys().copied().collect();
+		for id in ids {
+			self.publish_stalled(id, false)?;
+		}
+		Ok(())
+	}
+
+	fn publish_stalled(&mut self, track_id: u8, frame: bool) -> anyhow::Result<()> {
+		let Some(stream) = self.video.get_mut(&track_id) else {
+			return Ok(());
+		};
+		let demand = stream.track.track().is_used();
+		if demand {
+			stream.last_source.get_or_insert_with(Instant::now);
+		} else {
+			stream.last_source = None;
+		}
+		let quiet = stream
+			.last_source
+			.map(|at| Instant::now().saturating_duration_since(at))
+			.unwrap_or(Duration::ZERO);
+		let interval = hang::catalog::stalled::interval_from_fps(stream.config.framerate);
+		if !stream.stalled.observe(hang::catalog::stalled::Sample {
+			frame,
+			media_lag: Duration::ZERO,
+			quiet,
+			interval,
+			demand,
+			idle: false,
+		}) {
+			return Ok(());
+		}
+		let flag = stream.stalled.flag();
+		let mut config = stream.track.modify()?;
+		config.stalled = flag;
+		config.commit()?;
 		Ok(())
 	}
 
@@ -547,9 +607,10 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 	fn replace_video(&mut self, track_id: u8) -> anyhow::Result<moq_net::track::Producer> {
 		if let Some(mut old) = self.video.remove(&track_id) {
 			old.track.finish()?;
-			self.catalog.lock().video.renditions.remove(old.track.name());
 		}
-		Ok(self.broadcast.unique_track(".flv-v", self.catalog.track_info())?)
+		Ok(self
+			.broadcast
+			.unique_track(".flv-v", self.catalog.track_info(hang::catalog::PRIORITY.video))?)
 	}
 
 	/// Drop any existing audio track `track_id` (finishing it and clearing its
@@ -557,9 +618,10 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 	fn replace_audio(&mut self, track_id: u8) -> anyhow::Result<moq_net::track::Producer> {
 		if let Some(mut old) = self.audio.remove(&track_id) {
 			old.track.finish()?;
-			self.catalog.lock().audio.renditions.remove(old.track.name());
 		}
-		Ok(self.broadcast.unique_track(".flv-a", self.catalog.track_info())?)
+		Ok(self
+			.broadcast
+			.unique_track(".flv-a", self.catalog.track_info(hang::catalog::PRIORITY.audio))?)
 	}
 
 	/// Close the current group on every track and reopen at `sequence`.
@@ -589,30 +651,12 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 	/// [`Self::finish`] for a failed teardown (e.g. the RTMP client disconnected).
 	/// Consumes the importer.
 	pub fn abort(mut self, err: moq_net::Error) {
-		self.unregister();
 		for stream in std::mem::take(&mut self.video).into_values() {
 			stream.track.abort(err.clone());
 		}
 		for stream in std::mem::take(&mut self.audio).into_values() {
 			stream.track.abort(err.clone());
 		}
-	}
-
-	/// Drop every rendition this importer registered from the catalog.
-	fn unregister(&mut self) {
-		let mut catalog = self.catalog.lock();
-		for stream in self.video.values() {
-			catalog.video.renditions.remove(stream.track.name());
-		}
-		for stream in self.audio.values() {
-			catalog.audio.renditions.remove(stream.track.name());
-		}
-	}
-}
-
-impl<E: crate::catalog::hang::CatalogExt> Drop for Import<E> {
-	fn drop(&mut self) {
-		self.unregister();
 	}
 }
 

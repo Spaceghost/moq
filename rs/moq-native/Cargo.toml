@@ -1,6 +1,6 @@
 [package]
 name = "moq-native"
-description = "Media over QUIC - Helper library for native applications"
+description = "Deprecated: use moq-tokio instead"
 authors = ["Luke Curley"]
 repository = "https://github.com/moq-dev/moq"
 license = "MIT OR Apache-2.0"
@@ -14,106 +14,15 @@ categories = ["multimedia", "network-programming", "web-programming"]
 
 [features]
 default = ["noq", "aws-lc-rs", "websocket", "tcp", "uds"]
-quinn = ["dep:quinn", "dep:web-transport-quinn", "dep:rcgen", "dep:reqwest", "dep:rustls-webpki", "watch", "dep:dns-lookup"]
-noq = ["dep:web-transport-noq", "dep:noq", "dep:rcgen", "dep:reqwest", "dep:rustls-webpki", "watch", "dep:dns-lookup"]
-quiche = ["dep:web-transport-quiche", "dep:rcgen", "dep:reqwest", "dep:rustls-webpki", "dep:rustls-native-certs", "dep:dns-lookup", "watch"]
-# Filesystem watcher for hot-reloading on-disk TLS certs, keys, and root CAs.
-watch = ["dep:notify"]
-# Capture qlog traces (`--*-quic-qlog <DIR>`). Off by default: quinn and noq pull in
-# the qlog crate and its serde_json encoder, which a production build has no use for.
-# quiche compiles its qlog support in unconditionally, so this is empty for a
-# quiche-only build; it still gates the flag there, so one feature means one thing
-# across every backend.
-qlog = ["quinn?/qlog", "web-transport-noq?/qlog"]
-# The QUIC backends pull in their crypto provider from these features (default-features
-# are off on each backend dep), so a backend without aws-lc-rs/ring has no initial cipher.
-aws-lc-rs = ["rustls/aws-lc-rs", "rcgen?/aws_lc_rs", "quinn?/rustls-aws-lc-rs", "web-transport-noq?/aws-lc-rs"]
-iroh = ["dep:web-transport-iroh", "dep:web-transport-proto", "dep:noq-proto"]
-jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
-websocket = ["dep:qmux", "watch"]
-# Plain-TCP qmux transport (`tcp://`), no TLS. Server-side and client-side.
-tcp = ["dep:qmux", "dep:dns-lookup"]
-# Unix-domain-socket qmux transport (`unix://`), unix-only. Adds peer-credential
-# inspection on accept. Pulls in `tcp` (shares qmux's stream transport).
-uds = ["tcp", "qmux/uds"]
-ring = ["rustls/ring", "rcgen?/ring", "quinn?/rustls-ring", "web-transport-noq?/ring"]
-android-logcat = ["dep:tracing-android"]
-
-[dependencies]
-clap = { workspace = true, features = ["env"] }
-# Family-restricted `getaddrinfo`, so the AAAA and A queries can be issued separately
-# (RFC 8305 section 3) while still going through the system resolver.
-dns-lookup = { version = "4", optional = true }
-futures = { workspace = true }
-hex = { workspace = true }
-humantime = { workspace = true }
-humantime-serde = { workspace = true }
-
-moq-net = { workspace = true }
-# Depended on directly rather than through web-transport-noq's re-export so the
-# version floor is ours: web-transport-noq only asks for `noq = "1"`, and this
-# backend installs BBRv3 by default, which underflows on loss before 1.2.
-noq = { version = "1.2", default-features = false, optional = true }
-# iroh runs on noq but re-exports only the ControllerFactory trait, not the concrete
-# congestion configs. Version matched to the copy iroh pulls in. The floor is 1.2
-# because that is where BBRInflightAtLoss stopped underflowing, and this backend
-# installs BBRv3 by default.
-noq-proto = { version = "1.2", default-features = false, optional = true }
-notify = { version = "8", optional = true }
-qmux = { workspace = true, features = ["wss", "tls", "tcp"], optional = true }
-quinn = { version = "0.11", default-features = false, features = ["platform-verifier", "runtime-tokio", "bloom"], optional = true }
-rand = { workspace = true }
-rcgen = { version = "0.14", default-features = false, optional = true }
-reqwest = { workspace = true, optional = true }
-rustls = "0.23"
-rustls-native-certs = { version = "0.8", optional = true }
-# OS-native server-cert verifier for the rustls backends. Version matched to the
-# copy quinn-proto already pulls in, to avoid duplication.
-rustls-platform-verifier = "0.7"
-rustls-webpki = { version = "0.103", features = ["aws-lc-rs"], optional = true }
-serde = { workspace = true }
-serde_with = { workspace = true, features = ["hex"] }
-socket2 = { workspace = true }
-thiserror = { workspace = true }
-tikv-jemalloc-ctl = { version = "0.6", optional = true }
-tikv-jemallocator = { version = "0.6", features = ["profiling", "unprefixed_malloc_on_supported_platforms"], optional = true }
-time = "0.3"
-tokio = { workspace = true, features = ["full"] }
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true, features = ["env-filter"] }
-url = { workspace = true, features = ["serde"] }
-web-transport-iroh = { workspace = true, optional = true }
-web-transport-noq = { workspace = true, optional = true }
-web-transport-proto = { workspace = true, optional = true }
-web-transport-quiche = { workspace = true, optional = true }
-web-transport-quinn = { workspace = true, optional = true }
-web-transport-trait = { workspace = true }
-x509-parser = "0.18"
-
-[target.'cfg(target_os = "android")'.dependencies]
-# Android's platform verifier needs a JNI handle to the app Context (see
-# `tls::init_android`); jni is the bridge. Until init runs, verification falls
-# back to the bundled Mozilla roots.
-jni = "0.22"
-tracing-android = { version = "0.2", optional = true }
-webpki-roots = "1"
-
-[target.'cfg(unix)'.dependencies]
-# Errno constants for classifying an `accept(2)` failure (`accept::Failure`).
-# Their numeric values differ across unix platforms, so they can't be spelled out.
-libc = { workspace = true }
-
-[dev-dependencies]
-anyhow = { workspace = true }
-bytes = { workspace = true }
-chrono = "0.4"
-rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc_rs"] }
-tempfile = { workspace = true }
-# test-util adds tokio::time::pause/auto-advance for the time-dependent tests.
-tokio = { workspace = true, features = ["test-util"] }
-tokio-rustls = { workspace = true }
-toml = { workspace = true }
-# no-env-filter: traced_test's default filter scopes to the test binary's own
-# crate name, which never matches log lines from a dependency crate (e.g.
-# moq-net's), so a test asserting on those needs this to see them at all.
-tracing-test = { workspace = true, features = ["no-env-filter"] }
+noq = []
+watch = []
+qlog = []
+aws-lc-rs = []
+iroh = []
+mdns = []
+jemalloc = []
+websocket = []
+tcp = []
+uds = []
+ring = []
+android-logcat = []

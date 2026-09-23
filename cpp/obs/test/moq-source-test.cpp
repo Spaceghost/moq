@@ -557,7 +557,7 @@ std::atomic<int> g_origin_closes{0};
 std::atomic<int> g_session_connects{0};
 std::atomic<int> g_announced_calls{0};
 // moq_origin_request resolves only broadcasts that are already announced. The
-// source must wait with moq_origin_consume_announced, so this stays zero.
+// source must wait with moq_origin_announced_broadcast, so this stays zero.
 std::atomic<int> g_request_calls{0};
 std::atomic<int> g_catalog_calls{0};
 std::atomic<int> g_video_calls{0};
@@ -717,8 +717,8 @@ int32_t moq_origin_close(uint32_t)
 	return 0;
 }
 
-int32_t moq_session_connect(const char *, uintptr_t, uint32_t, uint32_t, void (*on_status)(void *, int32_t),
-			    void *user_data)
+int32_t moq_session_connect(const char *, uintptr_t, const moq_client_config *, uint32_t, uint32_t,
+			    void (*on_status)(void *, int32_t), void *user_data)
 {
 	if (g_session_result < 0)
 		return g_session_result;
@@ -735,8 +735,8 @@ int32_t moq_session_close(uint32_t session)
 	return closeSub(static_cast<int32_t>(session));
 }
 
-int32_t moq_origin_consume_announced(uint32_t, const char *, uintptr_t, void (*on_broadcast)(void *, int32_t),
-				     void *user_data)
+int32_t moq_origin_announced_broadcast(uint32_t, const char *, uintptr_t, void (*on_broadcast)(void *, int32_t),
+				       void *user_data)
 {
 	if (g_announced_result < 0)
 		return g_announced_result;
@@ -746,7 +746,7 @@ int32_t moq_origin_consume_announced(uint32_t, const char *, uintptr_t, void (*o
 	return handle;
 }
 
-int32_t moq_origin_consume_announced_close(uint32_t task)
+int32_t moq_origin_announced_broadcast_cancel(uint32_t task)
 {
 	return closeSub(static_cast<int32_t>(task));
 }
@@ -769,7 +769,7 @@ int32_t moq_consume_catalog(uint32_t, void (*on_catalog)(void *, int32_t), void 
 	return handle;
 }
 
-int32_t moq_consume_catalog_close(uint32_t catalog)
+int32_t moq_consume_catalog_cancel(uint32_t catalog)
 {
 	return closeSub(static_cast<int32_t>(catalog));
 }
@@ -799,17 +799,19 @@ int32_t moq_consume_video_config(uint32_t catalog, uint32_t, struct moq_video_co
 	if (g_video_config_result < 0)
 		return g_video_config_result;
 
+	// The caller hands over an uninitialized struct and libmoq writes every
+	// field, so zero it first: a field this stub doesn't know about (the label,
+	// today) would otherwise be read back as whatever the stack held.
+	*dst = {};
 	dst->name = "video";
 	dst->name_len = 5;
 	dst->codec = g_codec;
 	dst->codec_len = sizeof(g_codec) - 1;
 	dst->description = g_describe ? g_description : nullptr;
 	dst->description_len = g_describe ? sizeof(g_description) : 0;
-	dst->coded_width = &g_coded_width;
-	dst->coded_height = &g_coded_height;
+	dst->coded_width = g_coded_width;
+	dst->coded_height = g_coded_height;
 	dst->container.kind = MOQ_CONTAINER_KIND_LEGACY;
-	dst->container.init = nullptr;
-	dst->container.init_len = 0;
 	return 0;
 }
 
@@ -830,7 +832,7 @@ int32_t moq_consume_video(uint32_t catalog, uint32_t, uint64_t, void (*on_frame)
 	return handle;
 }
 
-int32_t moq_consume_video_close(uint32_t track)
+int32_t moq_consume_video_cancel(uint32_t track)
 {
 	return closeSub(static_cast<int32_t>(track));
 }
@@ -880,7 +882,7 @@ int32_t moq_consume_audio(uint32_t catalog, uint32_t, uint64_t, void (*on_frame)
 	return handle;
 }
 
-int32_t moq_consume_audio_close(uint32_t track)
+int32_t moq_consume_audio_cancel(uint32_t track)
 {
 	g_audio_closes++;
 	return closeSub(static_cast<int32_t>(track));
@@ -894,6 +896,8 @@ int32_t moq_consume_frame(uint32_t frame, struct moq_frame *dst)
 		g_stub_errors++;
 		return -1;
 	}
+	// Zeroed for the reason moq_consume_video_config zeroes its own out-param.
+	*dst = {};
 	dst->payload = g_description;
 	dst->payload_size = sizeof(g_description);
 	g_last_frame_payload = static_cast<const uint8_t *>(dst->payload);

@@ -166,7 +166,7 @@ impl ObjectSubclass for MoqSink {
 impl ObjectImpl for MoqSink {
 	fn properties() -> &'static [glib::ParamSpec] {
 		static PROPS: LazyLock<Vec<glib::ParamSpec>> = LazyLock::new(|| {
-			let quic = moq_native::quic::Resolved::default();
+			let quic = moq_tokio::quic::Resolved::default();
 			vec![
 				glib::ParamSpecString::builder("url")
 					.nick("Destination URL")
@@ -212,12 +212,12 @@ impl ObjectImpl for MoqSink {
 					.blurb("The negotiated MoQ protocol version, null when disconnected")
 					.read_only()
 					.build(),
-				glib::ParamSpecUInt64::builder("estimated-send-bitrate")
+				glib::ParamSpecUInt64::builder("estimated-send-rate")
 					.nick("Estimated send bitrate")
 					.blurb("Estimated send bitrate in bits per second (congestion controller), 0 when unavailable")
 					.read_only()
 					.build(),
-				glib::ParamSpecUInt64::builder("estimated-recv-bitrate")
+				glib::ParamSpecUInt64::builder("estimated-recv-rate")
 					.nick("Estimated receive bitrate")
 					.blurb("Estimated receive bitrate in bits per second, 0 when unavailable")
 					.read_only()
@@ -272,8 +272,8 @@ impl ObjectImpl for MoqSink {
 			"status"
 			| "connected"
 			| "moq-version"
-			| "estimated-send-bitrate"
-			| "estimated-recv-bitrate"
+			| "estimated-send-rate"
+			| "estimated-recv-rate"
 			| "connection-stats"
 			| "sessions" => {
 				let control = self.control.lock().unwrap();
@@ -282,8 +282,8 @@ impl ObjectImpl for MoqSink {
 					"status" => session.map(|s| s.status().status()).unwrap_or_default().to_value(),
 					"connected" => session.is_some_and(|s| s.status().connected()).to_value(),
 					"moq-version" => session.and_then(|s| s.status().version()).to_value(),
-					"estimated-send-bitrate" => session.map(|s| s.send_bitrate()).unwrap_or(0).to_value(),
-					"estimated-recv-bitrate" => session.map(|s| s.recv_bitrate()).unwrap_or(0).to_value(),
+					"estimated-send-rate" => session.map(|s| s.estimated_send_rate()).unwrap_or(0).to_value(),
+					"estimated-recv-rate" => session.map(|s| s.estimated_recv_rate()).unwrap_or(0).to_value(),
 					"connection-stats" => session.and_then(Session::connection_stats).to_value(),
 					"sessions" => sessions_structure(session.map(Session::presence).unwrap_or_default()).to_value(),
 					_ => unreachable!(),
@@ -298,12 +298,12 @@ impl ObjectImpl for MoqSink {
 					"quic-idle-timeout" => duration_millis(
 						settings
 							.quic_idle_timeout
-							.unwrap_or_else(|| moq_native::quic::Resolved::default().idle_timeout),
+							.unwrap_or_else(|| moq_tokio::quic::Resolved::default().idle_timeout),
 					)
 					.to_value(),
 					"quic-keep-alive" => settings
 						.quic_keep_alive
-						.or_else(|| moq_native::quic::Resolved::default().keep_alive)
+						.or_else(|| moq_tokio::quic::Resolved::default().keep_alive)
 						.map(duration_millis)
 						.unwrap_or(0)
 						.to_value(),
@@ -389,6 +389,8 @@ impl ElementImpl for MoqSink {
 					.build(),
 			);
 			caps.merge(gst::Caps::builder("audio/x-opus").build());
+			// Subtitles: one decoded UTF-8 cue per buffer, as demuxers emit timed text.
+			caps.merge(gst::Caps::builder("text/x-raw").field("format", "utf8").build());
 			// Opaque application data: published byte for byte, so there is no structural field to pin.
 			caps.merge(gst::Caps::builder("application/octet-stream").build());
 
@@ -623,8 +625,8 @@ impl MoqSink {
 				"status",
 				"connected",
 				"moq-version",
-				"estimated-send-bitrate",
-				"estimated-recv-bitrate",
+				"estimated-send-rate",
+				"estimated-recv-rate",
 				"connection-stats",
 				"sessions",
 			],
@@ -654,6 +656,8 @@ impl MoqSink {
 		// copy for an oversized buffer needs a reliable, media-aware size heuristic; moq-net remains the
 		// authority and rejects FrameTooLarge before reserving its own group slot.
 		let pts = buffer.pts();
+		// Only subtitles use this: a cue needs an explicit end, unlike a media frame.
+		let duration = buffer.duration();
 		let current_running_time = self.obj().current_running_time();
 		let map = buffer.map_readable().map_err(|_| {
 			gst::error!(CAT, "failed to map buffer on pad {}", pad.name());
@@ -681,7 +685,7 @@ impl MoqSink {
 			if lifecycle.media.is_failed() {
 				return Ok(gst::FlowSuccess::Ok);
 			}
-			let outcome = lifecycle.media.push_buffer(data, pts, current_running_time);
+			let outcome = lifecycle.media.push_buffer(data, pts, duration, current_running_time);
 			let changes = match &outcome {
 				Ok(PushOutcome::Failed(reason)) => Some(lifecycle.fail(reason.clone())),
 				_ => None,
@@ -1449,8 +1453,8 @@ mod tests {
 			"status",
 			"connected",
 			"moq-version",
-			"estimated-send-bitrate",
-			"estimated-recv-bitrate",
+			"estimated-send-rate",
+			"estimated-recv-rate",
 			"connection-stats",
 			"sessions",
 		] {
@@ -1480,14 +1484,14 @@ mod tests {
 		sink.set_property("quic-keep-alive", 3_000u64);
 
 		let resolved = ResolvedSettings::try_from(sink.imp().settings.lock().unwrap().clone()).unwrap();
-		let quic = super::super::session::client_config(&resolved).quic.resolve();
+		let quic = super::super::session::quic_config(&resolved).resolve();
 		assert_eq!(quic.idle_timeout, Duration::from_secs(15));
 		assert_eq!(quic.keep_alive, Some(Duration::from_secs(3)));
 
 		sink.set_property("quic-keep-alive", 0u64);
 		sink.set_property("quic-idle-timeout", 0u64);
 		let resolved = ResolvedSettings::try_from(sink.imp().settings.lock().unwrap().clone()).unwrap();
-		let quic = super::super::session::client_config(&resolved).quic.resolve();
+		let quic = super::super::session::quic_config(&resolved).resolve();
 		assert_eq!(quic.idle_timeout, Duration::ZERO);
 		assert_eq!(quic.keep_alive, None);
 	}

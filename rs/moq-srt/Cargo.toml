@@ -16,7 +16,6 @@ categories = ["multimedia", "network-programming", "web-programming"]
 # subcommand); a relay can also embed `moq_srt::run` / `Server` against its own
 # origin.
 [dependencies]
-anyhow = { workspace = true, features = ["backtrace"] }
 bytes = { workspace = true }
 futures = { workspace = true }
 moq-mux = { workspace = true }
@@ -30,3 +29,4 @@ tracing = { workspace = true }
 [dev-dependencies]
 # Builds the synthetic broadcasts the egress tests mux back to TS.
 hang = { workspace = true }
+srt-protocol = "0.4"

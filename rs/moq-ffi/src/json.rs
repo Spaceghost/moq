@@ -31,19 +31,27 @@ pub struct MoqJsonSnapshotConfig {
 	pub compression: bool,
 }
 
-impl From<MoqJsonSnapshotConfig> for moq_json::snapshot::ProducerConfig {
+fn compression(on: bool) -> moq_json::Compression {
+	if on {
+		moq_json::Compression::Deflate
+	} else {
+		moq_json::Compression::None
+	}
+}
+
+impl From<MoqJsonSnapshotConfig> for moq_json::snapshot::Config {
 	fn from(config: MoqJsonSnapshotConfig) -> Self {
-		let mut out = moq_json::snapshot::ProducerConfig::default();
+		let mut out = moq_json::snapshot::Config::default();
 		out.delta_ratio = config.delta_ratio;
-		out.compression = config.compression;
+		out.compression = compression(config.compression);
 		out
 	}
 }
 
-impl From<MoqJsonSnapshotConfig> for moq_json::snapshot::ConsumerConfig {
+impl From<MoqJsonSnapshotConfig> for moq_json::snapshot::consumer::Config {
 	fn from(config: MoqJsonSnapshotConfig) -> Self {
-		let mut out = moq_json::snapshot::ConsumerConfig::default();
-		out.compression = config.compression;
+		let mut out = moq_json::snapshot::consumer::Config::default();
+		out.compression = compression(config.compression);
 		out
 	}
 }
@@ -58,15 +66,11 @@ pub struct MoqJsonStreamConfig {
 	pub compression: bool,
 }
 
-impl From<MoqJsonStreamConfig> for moq_json::stream::ProducerConfig {
+impl From<MoqJsonStreamConfig> for moq_json::stream::Config {
 	fn from(config: MoqJsonStreamConfig) -> Self {
-		moq_json::stream::ProducerConfig::default().with_compression(config.compression)
-	}
-}
-
-impl From<MoqJsonStreamConfig> for moq_json::stream::ConsumerConfig {
-	fn from(config: MoqJsonStreamConfig) -> Self {
-		moq_json::stream::ConsumerConfig::default().with_compression(config.compression)
+		let mut out = moq_json::stream::Config::default();
+		out.compression = compression(config.compression);
+		out
 	}
 }
 
@@ -77,11 +81,16 @@ mod tests {
 	// each wrapper different behavior than the Rust API.
 	#[test]
 	fn record_defaults_match_moq_json() {
-		let snapshot = moq_json::snapshot::ProducerConfig::default();
+		let snapshot = moq_json::snapshot::Config::default();
 		assert_eq!(snapshot.delta_ratio, 8, "update #[uniffi(default)] on delta_ratio");
-		assert!(!snapshot.compression, "update #[uniffi(default)] on compression");
-		assert!(
-			!moq_json::stream::ProducerConfig::default().compression,
+		assert_eq!(
+			snapshot.compression,
+			moq_json::Compression::None,
+			"update #[uniffi(default)] on compression"
+		);
+		assert_eq!(
+			moq_json::stream::Config::default().compression,
+			moq_json::Compression::None,
 			"update #[uniffi(default)] on MoqJsonStreamConfig::compression"
 		);
 	}
@@ -102,7 +111,7 @@ impl MoqBroadcastProducer {
 	) -> Result<Arc<MoqJsonSnapshotProducer>, MoqError> {
 		let _guard = crate::ffi::enter();
 		self.with_state(|state| {
-			let mut broadcast = state.broadcast.clone();
+			let broadcast = state.broadcast.clone();
 			let track = broadcast.create_track(name, None)?;
 			let producer = moq_json::snapshot::Producer::<Value>::new(track, config.into());
 			Ok(Arc::new(MoqJsonSnapshotProducer {
@@ -119,7 +128,7 @@ impl MoqBroadcastProducer {
 	) -> Result<Arc<MoqJsonStreamProducer>, MoqError> {
 		let _guard = crate::ffi::enter();
 		self.with_state(|state| {
-			let mut broadcast = state.broadcast.clone();
+			let broadcast = state.broadcast.clone();
 			let track = broadcast.create_track(name, None)?;
 			let producer = moq_json::stream::Producer::<Value>::new(track, config.into());
 			Ok(Arc::new(MoqJsonStreamProducer {
@@ -219,6 +228,8 @@ impl MoqJsonSnapshotConsumer {
 	}
 
 	/// Cancel all current and future `next()` calls.
+	///
+	/// Terminal: the subscription is released here, not when the handle is.
 	pub fn cancel(&self) {
 		self.task.cancel();
 	}
@@ -280,6 +291,8 @@ impl MoqJsonStreamConsumer {
 	}
 
 	/// Cancel all current and future `next()` calls.
+	///
+	/// Terminal: the subscription is released here, not when the handle is.
 	pub fn cancel(&self) {
 		self.task.cancel();
 	}

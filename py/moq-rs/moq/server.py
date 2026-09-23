@@ -4,26 +4,25 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Sequence
-from typing import Literal
 
-from moq_ffi import MoqRequest, MoqServer
+from moq_ffi import MoqRequest, MoqServer, MoqTransport
 
 from .origin import OriginProducer
 from .publish import BroadcastProducer
 from .session import Session
 
-# The wire transport carrying a session: raw QUIC, iroh's peer-to-peer QUIC, or WebSocket.
-Transport = Literal["quic", "iroh", "websocket"]
+# The network transport carrying an incoming session.
+Transport = MoqTransport
 
 
 class Request:
     """Wraps MoqRequest, an incoming session that can be accepted or rejected.
 
     Use `await request.accept()` to complete the handshake, or
-    `await request.reject(code)` to reject with an HTTP status code.
+    `await request.reject(code)` to reject with an application error code.
 
     Dropping a Request without responding closes the underlying connection
-    silently; call `reject(code)` to send an explicit HTTP status.
+    silently; call `reject(code)` to send an explicit MoQ error.
     """
 
     def __init__(self, inner: MoqRequest) -> None:
@@ -46,17 +45,23 @@ class Request:
 
     @property
     def transport(self) -> Transport:
-        """The wire transport carrying this session (`"quic"`, `"iroh"`, or `"websocket"`)."""
-        return self._inner.transport()  # type: ignore[return-value]
+        """The network transport carrying this session."""
+        return self._inner.transport()
 
     def set_publish(self, origin: OriginProducer | None) -> None:
         """Override the publish origin for this session. Falls back to the
-        server's configured publish origin if unset."""
+        server's configured publish origin if unset. Captured at ``accept()``.
+
+        Raises if the request is currently accepting, already answered, or cancelled.
+        """
         self._inner.set_publish(origin._inner if origin is not None else None)
 
     def set_consume(self, origin: OriginProducer | None) -> None:
         """Override the consume origin for this session. Falls back to the
-        server's configured consume origin if unset."""
+        server's configured consume origin if unset. Captured at ``accept()``.
+
+        Raises if the request is currently accepting, already answered, or cancelled.
+        """
         self._inner.set_consume(origin._inner if origin is not None else None)
 
     async def accept(self) -> Session:
@@ -69,7 +74,9 @@ class Request:
         return Session(await self._inner.accept())
 
     async def reject(self, code: int) -> None:
-        """Reject the session with the given HTTP status code.
+        """Reject the session with the given application error code.
+
+        Codes 401 and 403 map to the protocol's unauthorized error.
 
         Raises `Error.AlreadyResponded` if `accept()` or `reject()` has already
         been called.
@@ -99,9 +106,10 @@ class Server:
                     continue
                 session = await request.accept()  # hold to keep the connection alive
 
-    Exiting the context manager stops accepting new sessions but does not
-    close in-flight sessions; those stay alive until their handles are
-    dropped or `Session.cancel()` is called.
+    Exiting the context manager stops accepting new sessions and releases the
+    listening socket before it returns, so the address can be bound again
+    immediately. In-flight sessions stay alive until their handles are dropped
+    or `Session.cancel()` is called.
 
     In advanced mode, provide your own origins for full control::
 

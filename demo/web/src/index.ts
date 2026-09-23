@@ -79,7 +79,7 @@ const metaSignal = new Signals.Signal<unknown>(undefined);
 const relayUrl = new Signals.Signal<URL | undefined>(new URL(RELAY_URL));
 
 // Discovery connection (the tiles each open their own connection internally).
-const connection = new Net.Connection.Reload({ url: relayUrl, enabled: true });
+const connection = new Net.Connection({ url: relayUrl });
 
 // ---------------------------------------------------------------------------
 // Per-broadcast tile (a <moq-watch-ui> in the left column)
@@ -119,9 +119,9 @@ function createTile(name: string): WatchTile {
 	const watch = document.createElement("moq-watch") as MoqWatch;
 	watch.name = name;
 	watch.muted = true; // unmuted only while active (see below)
-	// Default to a fixed 100ms jitter buffer (instead of adaptive "real-time") so
-	// the latency visualization has something to show. Drag it in the panel.
-	watch.setAttribute("latency", "100");
+	// Default to a fixed 100ms jitter buffer (instead of adaptive "auto") so
+	// the delay visualization has something to show. Drag it in the panel.
+	watch.setAttribute("delay", "100ms");
 	const canvas = document.createElement("canvas");
 	canvas.style.cssText = "width: 100%; height: auto;";
 	watch.appendChild(canvas);
@@ -177,12 +177,12 @@ function createTile(name: string): WatchTile {
 //
 // Subscribe to announcements under the prefix and keep a live set of active broadcasts.
 // `announced.next()` drains the update stream, so we track membership ourselves: active=true adds the
-// path, active=false removes it. `Reload.announced()` spans reconnects (it retracts everything on
+// path, active=false removes it. `Connection.announced()` spans reconnects (it retracts everything on
 // disconnect and re-announces on reconnect), so the set self-heals without any extra wiring here.
 const discovery = new Signals.Effect();
 discovery.run((effect) => {
 	const prefix = prefixPath(effect.get(prefixInput));
-	const announced = connection.announced(prefix);
+	const announced = connection.announced(Net.Path.Pattern.subtree(prefix));
 	effect.cleanup(() => announced.close());
 
 	const live = new Set<string>();
@@ -190,11 +190,11 @@ discovery.run((effect) => {
 		for (;;) {
 			const entry = await Promise.race([effect.cancel, announced.next()]);
 			if (!entry) break;
-			const path = Net.Path.join(prefix, entry.path);
+			const path = entry.prefix;
 			// Only catalog-backed broadcasts are watchable streams; this skips the relay's
 			// `.stats` broadcast (see the stats dashboard demo for that one).
 			if (!path.endsWith(".hang") && !path.endsWith(".msf")) continue;
-			if (entry.active) live.add(path);
+			if (Net.Announce.isActive(entry.kind)) live.add(path);
 			else live.delete(path);
 			broadcasts.set([...live].sort());
 		}
@@ -382,8 +382,8 @@ ui.run((effect) => {
 	section.hidden = false;
 
 	// Report the transport negotiated by the live connection.
-	const conn = effect.get(connection.established);
-	$("network-transport").textContent = conn ? (conn.transport === "websocket" ? "WebSocket" : "WebTransport") : "";
+	const transport = effect.get(connection.transport);
+	$("network-transport").textContent = transport ? (transport === "websocket" ? "WebSocket" : "WebTransport") : "";
 
 	const video = effect.get(watch.video.out.stats);
 	const audio = effect.get(watch.audio.out.stats);
@@ -433,7 +433,7 @@ ui.run((effect) => {
 
 	const track = broadcast.track(trackName).subscribe({ priority: Hang.Catalog.PRIORITY.catalog });
 	effect.cleanup(() => track.close());
-	const consumer = new Json.Snapshot.Consumer<unknown>(track);
+	const consumer = new Json.Snapshot.Consumer<unknown>({ track });
 
 	effect.spawn(async () => {
 		try {

@@ -88,7 +88,7 @@ impl Rung {
 	}
 
 	fn container(&self) -> Result<moq_mux::catalog::hang::Container, Error> {
-		Ok(moq_mux::catalog::hang::Container::try_from(&self.config.container)?)
+		Ok(moq_mux::catalog::hang::Container::try_from(&self.config)?)
 	}
 
 	/// An encoder producing this rung's rendition.
@@ -105,14 +105,14 @@ impl Rung {
 	/// worker's initialization and uninitialize COM on one that never initialized
 	/// it. The sink owns a thread and stays on it.
 	async fn encode(&self, color: Option<moq_video::Color>) -> Result<moq_video::encode::Sink, Error> {
-		let mut config =
-			moq_video::encode::Config::new(self.info.size.width, self.info.size.height, self.info.framerate);
+		let framerate = self.info.framerate.unwrap_or(moq_video::Rate::new(30, 1).unwrap());
+		let mut config = moq_video::encode::Config::new(self.info.size.width, self.info.size.height, framerate);
 		config.bitrate = Some(self.info.bitrate);
 		config.kind = self.encoder.clone();
 		config.color = color;
-		// Keyframes are forced at every group boundary; the GOP is only a
+		// Every source group boundary is a cut; the keyframe interval is only a
 		// backstop against pathologically long source groups.
-		config.gop = self.info.framerate.saturating_mul(8).max(1);
+		config.gop = moq_video::encode::Gop::keyframe_every(std::time::Duration::from_secs(8), framerate);
 		Ok(moq_video::encode::Sink::open(&config).await?)
 	}
 }
@@ -130,7 +130,7 @@ pub(crate) async fn serve(rung: Rung, request: moq_net::track::Request) -> Resul
 	// Grab the group-request handle before accepting: a Request is dynamic from
 	// birth, so a fetch racing the acceptance queues instead of failing.
 	let dynamic = request.dynamic();
-	let info = hang::container::track_info();
+	let info = hang::container::track_info(hang::catalog::PRIORITY.video);
 	let mut producer = request.accept(info);
 	let (finished, mut finishing) = tokio::sync::watch::channel(false);
 
@@ -207,10 +207,10 @@ async fn live(rung: &Rung, producer: &mut moq_net::track::Producer) -> Result<En
 		// encoder session until someone subscribes again.
 		let mut listener = rung.feed.listen();
 		// Built from the first frame: the encoder writes that frame's color space
-		// into the bitstream, so it cannot open before one has arrived. A keyframe
+		// into the bitstream, so it cannot open before one has arrived. A cut
 		// asked for at a group boundary waits here until it exists.
 		let mut encoder: Option<moq_video::encode::Sink> = None;
-		let mut pending_keyframe = false;
+		let mut pending_cut = false;
 
 		// The output group currently being written, if the feed is mid-group.
 		let mut current: Option<moq_net::group::Producer> = None;
@@ -259,10 +259,12 @@ async fn live(rung: &Rung, producer: &mut moq_net::track::Producer) -> Result<En
 					}
 					// A subscriber has to be able to start at this group, so its first
 					// frame must be an IDR. The request waits for the next frame, so a
-					// rung that skips this group simply carries it forward.
+					// rung that skips this group simply carries it forward. A backend
+					// that cannot cut fails the rung here: its groups could never
+					// mirror the source's, which is what this rung promises.
 					match &mut encoder {
-						Some(encoder) => encoder.keyframe(),
-						None => pending_keyframe = true,
+						Some(encoder) => encoder.cut().await?,
+						None => pending_cut = true,
 					}
 					// Mirror the source sequence so fetches and rendition
 					// switches map 1:1.
@@ -294,14 +296,14 @@ async fn live(rung: &Rung, producer: &mut moq_net::track::Producer) -> Result<En
 					// this rung's size.
 					let frame: Arc<moq_video::Frame> = match frame.size() == rung.info.size {
 						true => frame,
-						false => Arc::new(frame.resize_with(rung.info.size, &rung.resize)?),
+						false => Arc::new(frame.resize(rung.info.size, &rung.resize)?),
 					};
 					let encoder = match &mut encoder {
 						Some(encoder) => encoder,
 						None => {
 							let mut opened = rung.encode(frame.surface.color()).await?;
-							if std::mem::take(&mut pending_keyframe) {
-								opened.keyframe();
+							if std::mem::take(&mut pending_cut) {
+								opened.cut().await?;
 							}
 							encoder.insert(opened)
 						}
@@ -460,7 +462,7 @@ async fn fetches(
 fn spawn_fetch(
 	tasks: &mut tokio::task::JoinSet<()>,
 	rung: Rung,
-	request: moq_net::track::GroupRequest,
+	request: moq_net::group::Request,
 	permit: tokio::sync::OwnedSemaphorePermit,
 ) {
 	tasks.spawn(async move {
@@ -478,7 +480,7 @@ fn spawn_fetch(
 /// `GroupRequest` auto-rejects with [`moq_net::Error::Dropped`], which reads as
 /// "the handler vanished" and hides the actual decode/encode/source failure from
 /// the waiting consumer.
-async fn fetch(rung: Rung, request: moq_net::track::GroupRequest) -> Result<(), Error> {
+async fn fetch(rung: Rung, request: moq_net::group::Request) -> Result<(), Error> {
 	let options = moq_net::group::Fetch::default().with_priority(request.priority());
 	let mut source = match rung.source.fetch_group(request.sequence(), options).await {
 		Ok(source) => source,
@@ -603,18 +605,18 @@ fn write(
 
 /// Decode -> resize -> encode for one fetched group of one rung.
 ///
-/// Unless CPU scaling is forced, the decoder is asked to emit frames at the
-/// rung's resolution (`decode::Config::resize`). A decoder with a hardware
+/// Unless CPU output is forced, the decoder is asked to emit frames at the
+/// rung's resolution (`decode::Config::scale_hint`). A decoder with a hardware
 /// scaler (NVDEC) does, and its GPU frames feed the encoder in place: the NVDEC
 /// -> NVENC path never touches the CPU. Frames that come back at any other size
-/// get `Frame::resize_with` instead.
+/// get `Frame::resize` instead.
 struct Pipeline {
 	decoder: moq_video::decode::Sink,
 	/// Opened from the first decoded frame, whose color space it has to declare.
-	/// `None` until one arrives; a keyframe requested before then waits in
-	/// `pending_keyframe`.
+	/// `None` until one arrives; a cut requested before then waits in
+	/// `pending_cut`.
 	encoder: Option<moq_video::encode::Sink>,
-	pending_keyframe: bool,
+	pending_cut: bool,
 	rung: Rung,
 	size: moq_video::Size,
 }
@@ -623,7 +625,8 @@ impl Pipeline {
 	async fn new(rung: &Rung) -> Result<Self, Error> {
 		let mut decode = moq_video::decode::Config::new();
 		decode.kind = rung.decoder.clone();
-		decode.resize = decoder_resize(rung.info.size, rung.resize.acceleration);
+		decode.output = rung.resize.output;
+		decode.scale_hint = scale_hint(rung.info.size, rung.resize.output);
 		// A `Sink` for the same reason as the encoder above: a fetch task holds this
 		// pipeline across `Container::read`, so the codec must own its thread.
 		let decoder = moq_video::decode::Sink::open(&rung.config, &decode).await?;
@@ -631,7 +634,7 @@ impl Pipeline {
 		Ok(Self {
 			decoder,
 			encoder: None,
-			pending_keyframe: false,
+			pending_cut: false,
 			rung: rung.clone(),
 			size: rung.info.size,
 		})
@@ -650,8 +653,8 @@ impl Pipeline {
 		// nothing for the access unit that asked for one.
 		if keyframe {
 			match &mut self.encoder {
-				Some(encoder) => encoder.keyframe(),
-				None => self.pending_keyframe = true,
+				Some(encoder) => encoder.cut().await?,
+				None => self.pending_cut = true,
 			}
 		}
 
@@ -668,12 +671,12 @@ impl Pipeline {
 		// as-is, keeping a GPU frame on the GPU.
 		let raw = match raw.size() == self.size {
 			true => raw,
-			false => raw.resize_with(self.size, &self.rung.resize)?,
+			false => raw.resize(self.size, &self.rung.resize)?,
 		};
 		if self.encoder.is_none() {
 			let mut opened = self.rung.encode(raw.surface.color()).await?;
-			if std::mem::take(&mut self.pending_keyframe) {
-				opened.keyframe();
+			if std::mem::take(&mut self.pending_cut) {
+				opened.cut().await?;
 			}
 			self.encoder = Some(opened);
 		}
@@ -699,24 +702,23 @@ impl Pipeline {
 }
 
 /// Let a hardware decoder scale only when the caller has not forced the CPU.
-fn decoder_resize(size: moq_video::Size, acceleration: moq_video::resize::Acceleration) -> Option<moq_video::Size> {
-	(acceleration != moq_video::resize::Acceleration::Cpu).then_some(size)
+fn scale_hint(size: moq_video::Size, output: moq_video::Output) -> Option<moq_video::Size> {
+	(output != moq_video::Output::Cpu).then_some(size)
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use moq_video::resize::Acceleration;
+	use moq_video::Output;
 
-	/// A fetched NVDEC group reaches `Frame::resize_with` at native size when
-	/// CPU scaling is forced, rather than being resized in the decoder first.
+	/// A fetched NVDEC group reaches `Frame::resize` at native size when
+	/// CPU output is forced, rather than being resized in the decoder first.
 	#[test]
 	fn forced_cpu_skips_the_decoder_scaler() {
 		let size = moq_video::Size::new(160, 120);
 
-		assert_eq!(decoder_resize(size, Acceleration::Cpu), None);
-		assert_eq!(decoder_resize(size, Acceleration::Auto), Some(size));
-		assert_eq!(decoder_resize(size, Acceleration::Gpu), Some(size));
+		assert_eq!(scale_hint(size, Output::Cpu), None);
+		assert_eq!(scale_hint(size, Output::Native), Some(size));
 	}
 
 	/// A frame that reached the group is billable even when a later frame in the
@@ -728,8 +730,8 @@ mod tests {
 			name: "video/120p".to_string(),
 			height: 120,
 			size: moq_video::Size::new(160, 120),
-			bitrate: 100_000,
-			framerate: 30,
+			bitrate: moq_net::bandwidth::Rate::from_bps(100_000),
+			framerate: Some(moq_video::Rate::new(30, 1).unwrap()),
 		};
 
 		let active = crate::active::Producer::default();
@@ -737,9 +739,9 @@ mod tests {
 		let mut cursor = active.consume();
 		let rendition = cursor.try_next().expect("ladder").rendition;
 
-		let mut broadcast = moq_net::broadcast::Info::default().produce();
-		let mut track = broadcast
-			.create_track("video/120p", hang::container::track_info())
+		let broadcast = moq_net::broadcast::Info::default().produce();
+		let track = broadcast
+			.create_track("video/120p", hang::container::track_info(hang::catalog::PRIORITY.video))
 			.unwrap();
 		let mut group = track.create_group(moq_net::group::Info { sequence: 0 }).unwrap();
 		let guard = active.attach(&rung);

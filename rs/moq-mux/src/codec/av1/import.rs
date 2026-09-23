@@ -26,37 +26,35 @@ use crate::container::Frame;
 /// [`catalog::Reserved`](crate::catalog::Reserved) it reserves its rendition from, and feed it
 /// frames a [`Split`](super::Split) produced via [`decode`](Self::decode). The
 /// catalog rendition fills in lazily once the config is known.
-pub struct Import<E: CatalogExt = ()> {
-	track: crate::container::Producer<crate::catalog::hang::Container>,
-	rendition: crate::catalog::VideoTrack<E>,
+pub struct Import {
+	track: crate::container::Producer<crate::catalog::hang::Container, hang::catalog::VideoConfig>,
 	catalog: crate::codec::video::Catalog,
 	last_seq: Option<Bytes>,
 }
 
-impl<E: CatalogExt> Import<E> {
+impl Import {
 	/// Publish on an existing track producer, seeding the rendition from `hint` (pass
 	/// [`VideoHint::default`](crate::catalog::VideoHint) for none).
 	///
 	/// A hint carrying a codec publishes the catalog rendition up front (the sequence header still
 	/// refines it in band on the first keyframe).
-	pub fn new(
+	pub fn new<E: CatalogExt>(
 		track: moq_net::track::Producer,
 		reserved: crate::catalog::Reserved<E>,
 		hint: crate::catalog::VideoHint,
 	) -> crate::Result<Self> {
-		let rendition = reserved.video(track.name());
 		// The hint names the container; the writer is built from that same value so the wire
 		// cannot disagree with what the rendition advertises.
-		let wire = crate::catalog::hang::Container::try_from(&hint.container)?;
-		let catalog = crate::codec::video::Catalog::new(&reserved, track.name(), hint)?;
+		let wire = crate::catalog::hang::Container::try_from(&hint)?;
+		let catalog = crate::codec::video::Catalog::new(hint);
+		let track = reserved.video(track, wire, None)?;
 		let mut import = Self {
-			track: reserved.producer().media_producer(track, wire)?,
-			rendition,
+			track,
 			catalog,
 			last_seq: None,
 		};
 		if let Some(config) = import.catalog.initial_config() {
-			import.apply_config(config);
+			import.apply_config(config)?;
 		}
 		Ok(import)
 	}
@@ -77,7 +75,7 @@ impl<E: CatalogExt> Import<E> {
 		// fixed 4-byte header is read here, so don't gate on a larger size or a short
 		// out-of-band record falls through to raw-OBU scanning and leaves the config unset.
 		if data.len() >= 4 && data[0] == 0x81 {
-			self.init_from_av1c(data);
+			self.init_from_av1c(data)?;
 			return Ok(());
 		}
 
@@ -88,7 +86,7 @@ impl<E: CatalogExt> Import<E> {
 		Ok(())
 	}
 
-	fn init_from_av1c(&mut self, data: &[u8]) {
+	fn init_from_av1c(&mut self, data: &[u8]) -> crate::Result<()> {
 		let seq_profile = (data[1] >> 5) & 0x07;
 		let seq_level_idx = data[1] & 0x1F;
 		let tier = ((data[2] >> 7) & 0x01) == 1;
@@ -110,10 +108,11 @@ impl<E: CatalogExt> Import<E> {
 			matrix_coefficients: 1,
 			full_range: false,
 		});
-		self.apply_config(config);
+		self.apply_config(config)?;
+		Ok(())
 	}
 
-	fn init(&mut self, seq_header: &SequenceHeaderObu) {
+	fn init(&mut self, seq_header: &SequenceHeaderObu) -> crate::Result<()> {
 		let mut config = hang::catalog::VideoConfig::new(hang::catalog::AV1 {
 			profile: seq_header.seq_profile,
 			level: seq_header
@@ -143,12 +142,13 @@ impl<E: CatalogExt> Import<E> {
 		});
 		config.coded_width = Some(seq_header.max_frame_width as u32);
 		config.coded_height = Some(seq_header.max_frame_height as u32);
-		self.apply_config(config);
+		self.apply_config(config)?;
+		Ok(())
 	}
 
 	/// Minimal config when sequence-header parsing fails, so the stream can still
 	/// flow (the catalog just won't carry full codec info).
-	fn init_minimal(&mut self) {
+	fn init_minimal(&mut self) -> crate::Result<()> {
 		let config = hang::catalog::VideoConfig::new(hang::catalog::AV1 {
 			profile: 0,
 			level: 0,
@@ -163,15 +163,16 @@ impl<E: CatalogExt> Import<E> {
 			matrix_coefficients: 2,      // Unspecified
 			full_range: false,
 		});
-		self.apply_config(config);
+		self.apply_config(config)?;
+		Ok(())
 	}
 
 	/// Apply a resolved config, updating the catalog rendition in place.
 	///
 	/// A changed config just re-mirrors the rendition; there are no fixed tracks
 	/// to reject a reconfiguration.
-	fn apply_config(&mut self, config: hang::catalog::VideoConfig) {
-		self.catalog.publish(&mut self.rendition, config);
+	fn apply_config(&mut self, config: hang::catalog::VideoConfig) -> crate::Result<()> {
+		self.catalog.publish(&mut self.track, config)
 	}
 
 	/// Resolve the config from a sequence-header OBU, falling back to a minimal
@@ -183,10 +184,10 @@ impl<E: CatalogExt> Import<E> {
 		self.last_seq = Some(seq_obu.clone());
 
 		match parse_sequence_header(seq_obu)? {
-			Some(seq_header) => self.init(&seq_header),
+			Some(seq_header) => self.init(&seq_header)?,
 			None if !self.catalog.configured() => {
 				tracing::debug!("sequence header parse failed, using minimal config");
-				self.init_minimal();
+				self.init_minimal()?;
 			}
 			None => {}
 		}
@@ -201,7 +202,6 @@ impl<E: CatalogExt> Import<E> {
 	/// Finish the track, flushing the current group.
 	pub fn finish(&mut self) -> Result<()> {
 		self.track.finish()?;
-		self.estimate();
 		Ok(())
 	}
 
@@ -213,21 +213,15 @@ impl<E: CatalogExt> Import<E> {
 
 	/// Publish what the track measured (bitrate, jitter) into the catalog rendition, filling only
 	/// the fields its config didn't supply.
-	fn estimate(&mut self) {
-		self.rendition.estimate(self.track.estimate());
-	}
-
 	/// Cut the current group at `end` without finishing the track.
 	pub fn cut(&mut self, end: Option<moq_net::Timestamp>) -> Result<()> {
 		self.track.cut(end)?;
-		self.estimate();
 		Ok(())
 	}
 
 	/// Close the current group and open the next one at `sequence`.
 	pub fn seek(&mut self, sequence: u64) -> Result<()> {
 		self.track.seek(sequence)?;
-		self.estimate();
 		Ok(())
 	}
 
@@ -249,10 +243,27 @@ impl<E: CatalogExt> Import<E> {
 			// A pre-keyframe delta has no group to anchor it: the producer returns
 			// MissingKeyframe, which a caller joining mid-stream skips.
 			self.track.write(frame)?;
+			let demand = self.track.track().is_used();
+			self.catalog.on_frame(&mut self.track, demand)?;
 		}
-
-		self.estimate();
 		Ok(())
+	}
+
+	/// Re-evaluate stall from source silence.
+	pub fn tick(&mut self) -> crate::Result<()> {
+		let demand = self.track.track().is_used();
+		self.catalog.tick(&mut self.track, demand)
+	}
+
+	/// The source is gone; this rendition is never stalled while idle.
+	pub fn idle(&mut self) -> crate::Result<()> {
+		self.catalog.idle(&mut self.track)
+	}
+
+	/// Record the encode duration before publishing its frames so the catalog can report a stall.
+	pub fn observe_lag(&mut self, lag: std::time::Duration) -> crate::Result<()> {
+		let demand = self.track.track().is_used();
+		self.catalog.observe_lag(&mut self.track, demand, lag)
 	}
 
 	/// Publish split frames, resolving the config from the first keyframe's inline

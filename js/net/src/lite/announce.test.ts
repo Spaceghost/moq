@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
-import { OriginSchema, UNKNOWN_ORIGIN } from "../origin.ts";
+import { ProtocolViolation } from "../error.ts";
+import { HopSchema, UNKNOWN_HOP } from "../hop.ts";
 import * as Path from "../path.ts";
 import { Reader, Writer } from "../stream.ts";
 import {
@@ -39,7 +40,7 @@ async function roundTrip(msg: AnnounceBroadcast, version: Version): Promise<Anno
 }
 
 test("AnnounceBroadcast round-trips on draft-05", async () => {
-	const hops = [OriginSchema.parse(7n)];
+	const hops = [HopSchema.parse(7n)];
 	const gotActive = await roundTrip({ status: "active", suffix: Path.from("room/cam"), hops }, Version.DRAFT_05);
 	expect(gotActive).toEqual({ status: "active", suffix: Path.from("room/cam"), hops });
 
@@ -48,32 +49,42 @@ test("AnnounceBroadcast round-trips on draft-05", async () => {
 });
 
 test("AnnounceBroadcast round-trips on draft-06", async () => {
-	const hops = [OriginSchema.parse(7n)];
+	const hops = [HopSchema.parse(7n)];
 	// An absent cost encodes as zero and decodes explicitly.
 	const gotActive = await roundTrip({ status: "active", suffix: Path.from("room/cam"), hops }, Version.DRAFT_06);
-	expect(gotActive).toEqual({ status: "active", suffix: Path.from("room/cam"), hops, cost: 0n });
+	expect(gotActive).toEqual({ status: "active", suffix: Path.from("room/cam"), hops, cost: { warm: 0n, cold: 0n } });
 
-	const gotCost = await roundTrip(
-		{ status: "active", suffix: Path.from("room/cam"), hops, cost: 12n },
-		Version.DRAFT_06,
-	);
-	expect(gotCost).toEqual({ status: "active", suffix: Path.from("room/cam"), hops, cost: 12n });
+	// Asymmetric on purpose: the two magnitudes travel independently, so a swapped
+	// or shared encode would round-trip a symmetric pair unnoticed.
+	const cost = { warm: 12n, cold: 30n };
+	const gotCost = await roundTrip({ status: "active", suffix: Path.from("room/cam"), hops, cost }, Version.DRAFT_06);
+	expect(gotCost).toEqual({ status: "active", suffix: Path.from("room/cam"), hops, cost });
 
 	const gotEnded = await roundTrip({ status: "endedId", id: 3n }, Version.DRAFT_06);
 	expect(gotEnded).toEqual({ status: "endedId", id: 3n });
 
-	const gotRestart = await roundTrip({ status: "restart", id: 3n, hops, cost: 12n }, Version.DRAFT_06);
-	expect(gotRestart).toEqual({ status: "restart", id: 3n, hops, cost: 12n });
+	const gotRestart = await roundTrip({ status: "restart", id: 3n, hops, cost }, Version.DRAFT_06);
+	expect(gotRestart).toEqual({ status: "restart", id: 3n, hops, cost });
+});
+
+test("AnnounceBroadcast skips an unknown type on draft-06", async () => {
+	const encoded = await bytes(async (w) => {
+		await w.u53(4);
+		await w.u53(1);
+		await w.u8(0);
+	});
+	const reader = new Reader(undefined, encoded);
+	expect(await decodeAnnounceBroadcast(reader, Version.DRAFT_06)).toEqual({ status: "skipped" });
 });
 
 test("AnnounceBroadcast drops the route cost before draft-06", async () => {
 	// Pre-lite-06 has no room for a cost on the wire, so one set locally is
 	// simply not sent, keeping mixed-version meshes ranking on hop count.
 	const got = await roundTrip(
-		{ status: "active", suffix: Path.from("room/cam"), hops: [], cost: 9n },
+		{ status: "active", suffix: Path.from("room/cam"), hops: [], cost: { warm: 9n, cold: 9n } },
 		Version.DRAFT_05,
 	);
-	expect(got).toEqual({ status: "active", suffix: Path.from("room/cam"), hops: [] });
+	expect(got).toEqual({ status: "active", suffix: Path.from("room/cam"), hops: [], cost: undefined });
 });
 
 test("AnnounceBroadcast rejects cross-version forms", async () => {
@@ -112,7 +123,7 @@ async function requestRoundTrip(msg: AnnounceRequest, version: Version): Promise
 	return AnnounceRequest.decode(reader, version);
 }
 
-// Draft04/05 carry the subscriber's origin id so the publisher can skip reflected
+// Draft04/05 carry the subscriber's Hop ID so the publisher can skip reflected
 // announces before they hit the wire.
 test("AnnounceRequest carries excludeHop on draft-05", async () => {
 	const got = await requestRoundTrip(new AnnounceRequest(Path.from("room/"), 42n), Version.DRAFT_05);
@@ -135,17 +146,60 @@ test("AnnounceRequest drops excludeHop on draft-06", async () => {
 // withholds it to obscure its routing. Rejecting it tore down the announce stream of a
 // conforming publisher.
 test("AnnounceOk accepts the reserved unknown origin", async () => {
-	const msg = new AnnounceOk(UNKNOWN_ORIGIN, 3);
+	const msg = new AnnounceOk(UNKNOWN_HOP, 3);
 	const reader = new Reader(undefined, await bytes((w) => msg.encode(w, Version.DRAFT_05)));
 	const got = await AnnounceOk.decode(reader, Version.DRAFT_05);
-	expect(got.origin).toBe(UNKNOWN_ORIGIN);
+	expect(got.hop).toBe(UNKNOWN_HOP);
 	expect(got.active).toBe(3);
 });
 
 test("AnnounceOk round-trips a declared origin", async () => {
-	const msg = new AnnounceOk(OriginSchema.parse(42n), 1);
+	const msg = new AnnounceOk(HopSchema.parse(42n), 1);
 	const reader = new Reader(undefined, await bytes((w) => msg.encode(w, Version.DRAFT_05)));
 	const got = await AnnounceOk.decode(reader, Version.DRAFT_05);
-	expect(got.origin).toBe(OriginSchema.parse(42n));
+	expect(got.hop).toBe(HopSchema.parse(42n));
 	expect(got.active).toBe(1);
+});
+
+test("a hop chain that revisits a hop is refused in both directions", async () => {
+	const four = HopSchema.parse(4n);
+	const eight = HopSchema.parse(8n);
+	const looped: AnnounceBroadcast = { status: "active", suffix: Path.from("room"), hops: [four, eight, four] };
+
+	// Outbound: refused before it reaches the wire. A receiver must close the session over
+	// a repeated Hop ID, so sending one costs someone else their session.
+	await expect(bytes((w) => encodeAnnounceBroadcast(w, looped, Version.DRAFT_06))).rejects.toThrow("appears twice");
+
+	// Inbound: encode a chain that is legal, then rewrite its last hop to repeat the
+	// first. Only a non-conforming sender produces these bytes, which is why they have to
+	// be built by hand. Every id here is a one-byte varint, so the length is unchanged.
+	const legal: AnnounceBroadcast = {
+		status: "active",
+		suffix: Path.from("room"),
+		hops: [four, eight, HopSchema.parse(9n)],
+	};
+	const forged = await bytes((w) => encodeAnnounceBroadcast(w, legal, Version.DRAFT_06));
+	const nine = forged.lastIndexOf(9);
+	expect(nine).toBeGreaterThan(0);
+	forged[nine] = 4;
+
+	// The type carries the consequence, not just the text: the subscriber's dispatch closes
+	// the session on `instanceof ProtocolViolation`, so a plain Error here would reset the
+	// stream and leave a nonconforming peer free to repeat itself.
+	await expect(decodeAnnounceBroadcast(new Reader(undefined, forged), Version.DRAFT_06)).rejects.toThrow(
+		ProtocolViolation,
+	);
+	await expect(decodeAnnounceBroadcast(new Reader(undefined, forged), Version.DRAFT_06)).rejects.toThrow(
+		"appears twice",
+	);
+
+	// Repeated unknowns are not a loop: 0 identifies nothing, so any number of hops may
+	// be unknown. A lite-03 announcement is nothing but these.
+	const unknown = HopSchema.parse(0n);
+	const anonymous: AnnounceBroadcast = {
+		status: "active",
+		suffix: Path.from("room"),
+		hops: [unknown, four, unknown],
+	};
+	expect(await roundTrip(anonymous, Version.DRAFT_05)).toEqual(anonymous);
 });

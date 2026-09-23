@@ -128,9 +128,13 @@ describe("Source error signal", () => {
 		source.close();
 	});
 
-	it("ignores escaping renditions before selecting a valid fallback", async () => {
-		const invalidVideo = { ...config("avc1.640028"), broadcast: "../../source" };
-		const validVideo = { ...config("avc1.640028"), broadcast: "./source" };
+	// The catalog goes as a whole rather than losing the one rendition, so a valid sibling
+	// is no rescue: the reference names content outside the consumer's authorized subtree,
+	// and selecting the fallback would leave a publisher bug to surface later as a track
+	// that never fills.
+	it("selects nothing when an escaping rendition rejects the catalog", async () => {
+		const invalidVideo = { ...config("avc1.640028"), broadcast: Path.normalizeRelative("../../source") };
+		const validVideo = { ...config("avc1.640028"), broadcast: Path.normalizeRelative("./source") };
 		const audioConfig = Catalog.AudioConfigSchema.parse({
 			codec: "opus",
 			container: { kind: "legacy" },
@@ -145,19 +149,24 @@ describe("Source error signal", () => {
 				video: { renditions: { invalid: invalidVideo, fallback: validVideo } },
 				audio: {
 					renditions: {
-						invalid: { ...audioConfig, broadcast: "../../source" },
-						fallback: { ...audioConfig, broadcast: "./source" },
+						invalid: { ...audioConfig, broadcast: Path.normalizeRelative("../../source") },
+						fallback: { ...audioConfig, broadcast: Path.normalizeRelative("./source") },
 					},
 				},
 			},
 		});
 		const source = new Source({ broadcast, supported: async () => true });
 
-		await settle();
-		expect(Object.keys(broadcast.out.catalog.peek()?.video?.renditions ?? {})).toEqual(["fallback"]);
-		expect(Object.keys(broadcast.out.catalog.peek()?.audio?.renditions ?? {})).toEqual(["fallback"]);
-		expect(Object.keys(source.out.available.peek())).toEqual(["fallback"]);
-		expect(source.out.track.peek()).toBe("fallback");
+		const error = console.error;
+		console.error = () => {};
+		try {
+			await settle();
+			expect(broadcast.out.catalog.peek()).toBeUndefined();
+			expect(Object.keys(source.out.available.peek())).toEqual([]);
+			expect(source.out.track.peek()).toBeUndefined();
+		} finally {
+			console.error = error;
+		}
 
 		source.close();
 		broadcast.close();
@@ -165,7 +174,33 @@ describe("Source error signal", () => {
 });
 
 describe("Source stalled rendition selection", () => {
-	it("skips a stalled manual target while an unstalled rendition exists", async () => {
+	it("moves to an unstalled rendition when the selected one is throttled", async () => {
+		const state = mutableBroadcast({
+			low: config("avc1.64001e", { bitrate: 1_000_000 }),
+			high: config("avc1.640028", { bitrate: 2_000_000 }),
+		});
+		const source = new Source({
+			broadcast: state.broadcast,
+			supported: async () => true,
+		});
+
+		await settle();
+		expect(source.out.track.peek()).toBe("high");
+
+		state.catalog.set({
+			video: {
+				renditions: {
+					low: config("avc1.64001e", { bitrate: 1_000_000 }),
+					high: config("avc1.640028", { bitrate: 2_000_000, stalled: true }),
+				},
+			},
+		});
+		await settle();
+		expect(source.out.track.peek()).toBe("low");
+		source.close();
+	});
+
+	it("keeps a stalled manual target while an unstalled rendition exists", async () => {
 		const source = new Source({
 			broadcast: mockBroadcast({
 				low: config("avc1.64001e", { bitrate: 1_000_000 }),
@@ -176,7 +211,7 @@ describe("Source stalled rendition selection", () => {
 		});
 
 		await settle();
-		expect(source.out.track.peek()).toBe("low");
+		expect(source.out.track.peek()).toBe("high");
 		expect(Object.keys(source.out.available.peek())).toEqual(["low", "high"]);
 		source.close();
 	});

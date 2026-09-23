@@ -7,6 +7,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- `MoqCancel` and the trailing `cancel` argument on blocking async methods. Bindings with
+  native async cancellation never needed it; Go now cancels through `context.Context` on
+  the generated call.
+
+### Added
+
+- `MoqError::Busy` when a configuration setter races an in-flight connect, listen, or accept.
+
+### Fixed
+
+- `TrackConsumer.read_frame` skips completed empty groups instead of returning
+  EOF, keeps a group across a cancelled read so its first frame is not lost,
+  and drops a group that errors so a later read can move on.
+
+### Changed
+
+- `MoqClient::set_tls_disable_verify(bool)` is `set_tls_verify(bool)`, so the
+  argument's polarity matches every ergonomic wrapper.
+- `MoqRequest::transport()` returns the closed `MoqTransport` enum instead of a string.
+- Bare-integer durations are microseconds: `max_age_us` on decoder outputs,
+  track info, and subscriptions; `MoqBackoff` is `initial_us` / `max_us` /
+  `timeout_us`. `MoqSession::publish()` / `consume()` match `set_publish` /
+  `set_consume`.
+- `MoqAnnounced` is `MoqAnnounceConsumer`, `MoqAnnouncement` is
+  `MoqAnnounceUpdate` with `prefix()` instead of `path()`; the returned covered
+  prefix is relative to the prefix passed to `announced`. `MoqBroadcastRequest::abort`
+  is `reject`, and `MoqOriginOptions` is `MoqOriginConfig`.
+
+- [**breaking**] `MoqTrackProducer::finish` and `MoqGroupProducer::finish` keep the handle open so a
+  later `abort` can still run. Broadcast, audio, video, and JSON producers still close on finish.
+- Client, server, and pending-request configuration setters now return `Result` and
+  apply or fail. They error with `Busy` while connect/listen/accept owns the handle
+  and `Cancelled` after `cancel()`. Server bind/TLS is captured at `listen()` and
+  those setters fail afterwards; request origin overrides fail with `AlreadyResponded`
+  after accept/reject. `cert_fingerprints()` uses `Busy` instead of `Bind` when the
+  server is in an accept/listen call.
+
+- `MoqError` is no longer a flat error. `Protocol` carries a `MoqProtocolError` record
+  (session or stream scope, the verbatim wire code, a known kind, and a message). Transport
+  failures are `Transport`; local failures without a protocol code are `Internal`. Associated
+  data on other variants is now visible to bindings instead of being flattened into the message.
+
+- `publish_container_stream` takes a `MoqContainerFormat` instead of a `MoqContainerInit`, which
+  carried leading bytes the stream importer discarded.
+
+- `publish_media`, `publish_media_on_track`, and `publish_media_stream` split by media kind:
+  `publish_audio`, `publish_video`, `publish_container`, `publish_audio_on_track`,
+  `publish_video_on_track`, `publish_video_stream`, and `publish_container_stream`. Each takes only
+  the fields its kind can honor, so a video hint on an audio track and a label on a container are no
+  longer expressible. There is no audio stream variant: audio has no frame boundaries to infer.
+- `MoqInit` splits into `MoqAudioInit`, `MoqVideoInit`, and `MoqContainerInit`, and the format is a
+  typed `MoqAudioFormat` / `MoqVideoFormat` / `MoqContainerFormat` rather than a string.
+- The raw encoder paths are `encode_audio` and `encode_video`, freeing `publish_audio` /
+  `publish_video` for the bring-your-own-encoder path. C already called these `_raw`.
+- `MoqAudioFormat` (the PCM sample layout) is now `MoqAudioSampleFormat`, matching the existing
+  `MoqVideoPixelFormat`.
+- A container gets its own `MoqContainerProducer` / `MoqContainerStreamProducer` rather than sharing
+  `MoqMediaProducer`. `write` takes no timestamp, since a container carries its own timing and the
+  shared type silently dropped it; and `name`/`used`/`unused` no longer have a container case to
+  fail on.
+
+### Added
+
+- `MoqErrorScope`, `MoqProtocolKind`, and `MoqProtocolError` so every binding can read a
+  peer's session or stream code without parsing a message.
+
+- Publish and consume human-readable audio and video rendition labels.
+
+### Changed
+
+- `publish_media` and `publish_media_stream` reject a `MoqInit` label or video hint on a container
+  format, and an audio format rejects a video hint, instead of silently dropping either.
+
 ## [0.3.19](https://github.com/moq-dev/moq/compare/moq-ffi-v0.3.18...moq-ffi-v0.3.19) - 2026-09-17
 
 ### Other

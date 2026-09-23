@@ -42,4 +42,11 @@ for file in "$OUTPUT_DIR/moq.dart" "$OUTPUT_DIR/uniffi_runtime.dart"; do
     sed -i.bak '1s/unused_import/unused_import, type=lint/' "$file"
     rm -f "$file.bak"
 done
+
+# uniffi_bindgen_dart names the record converter after the Rust type
+# (`MoqProtocolError`) but the exception variant after the Dart type
+# (`MoqProtocolException`). Point the variant at the class that was emitted.
+sed -i.bak 's/FfiConverterMoqProtocolException/FfiConverterMoqProtocolError/g' "$OUTPUT_DIR/moq.dart"
+rm -f "$OUTPUT_DIR/moq.dart.bak"
+
 dart format --language-version 3.10 "$OUTPUT_DIR/moq.dart" "$OUTPUT_DIR/uniffi_runtime.dart"

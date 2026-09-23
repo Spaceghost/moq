@@ -91,14 +91,20 @@ impl Status {
 }
 
 /// Convert only transport metrics actually supplied by the active backend into the public property.
-fn connection_stats_structure(stats: moq_net::ConnectionStats) -> gst::Structure {
+fn connection_stats_structure(stats: moq_net::session::Stats) -> gst::Structure {
 	let mut structure = gst::Structure::new_empty("moq-connection-stats");
 	if let Some(rtt) = stats.rtt {
 		structure.set("rtt-us", u64::try_from(rtt.as_micros()).unwrap_or(u64::MAX));
 	}
 	for (name, value) in [
-		("estimated-send-rate-bps", stats.estimated_send_rate),
-		("estimated-recv-rate-bps", stats.estimated_recv_rate),
+		(
+			"estimated-send-rate-bps",
+			stats.estimated_send_rate.map(moq_net::bandwidth::Rate::as_bps),
+		),
+		(
+			"estimated-recv-rate-bps",
+			stats.estimated_recv_rate.map(moq_net::bandwidth::Rate::as_bps),
+		),
 		("bytes-sent", stats.bytes_sent),
 		("bytes-received", stats.bytes_received),
 		("bytes-lost", stats.bytes_lost),
@@ -116,8 +122,8 @@ fn connection_stats_structure(stats: moq_net::ConnectionStats) -> gst::Structure
 /// One coherent readout of both presence counters, so `started - ended` never mixes two samples.
 pub(super) fn sessions_structure(presence: moq_net::stats::Presence) -> gst::Structure {
 	gst::Structure::builder("moq-sessions")
-		.field("started", presence.sessions)
-		.field("ended", presence.sessions_closed)
+		.field("started", presence.sessions_started)
+		.field("ended", presence.sessions_ended)
 		.build()
 }
 
@@ -136,13 +142,25 @@ pub struct ResolvedSettings {
 	pub quic_keep_alive: Option<std::time::Duration>,
 }
 
-/// Builds the native client configuration with the sink's TLS, QUIC, and backoff overrides.
-pub(super) fn client_config(settings: &ResolvedSettings) -> moq_native::ClientConfig {
-	let mut config = moq_native::ClientConfig::default();
-	config.tls.disable_verify = Some(settings.tls_disable_verify);
-	config.quic.idle_timeout = settings.quic_idle_timeout;
-	config.quic.keep_alive = settings.quic_keep_alive;
+/// Builds the connect configuration with the sink's TLS and backoff overrides.
+pub(super) fn connect_config(settings: &ResolvedSettings) -> moq_tokio::connect::Config {
+	let mut config = moq_tokio::connect::Config::default();
+	config.tls.insecure = Some(settings.tls_disable_verify);
 	config.backoff.timeout = std::time::Duration::ZERO;
+	config
+}
+
+/// The QUIC transport overrides the sink exposes as properties.
+pub(super) fn quic_config(settings: &ResolvedSettings) -> moq_tokio::quic::Config {
+	let mut config = moq_tokio::quic::Config::default();
+	// The properties are optional and the config fields are not: an unset property
+	// leaves the library default rather than overriding it with one of its own.
+	if let Some(idle_timeout) = settings.quic_idle_timeout {
+		config.idle_timeout = idle_timeout;
+	}
+	if let Some(keep_alive) = settings.quic_keep_alive {
+		config.keep_alive = keep_alive;
+	}
 	config
 }
 
@@ -235,12 +253,12 @@ pub(crate) struct Session {
 	join: tokio::task::JoinHandle<()>,
 	status: Arc<Status>,
 	/// The live send-bitrate estimate, tracked across reconnects by the reconnect loop. Read directly
-	/// by the `estimated-send-bitrate` getter.
+	/// by the `estimated-send-rate` getter.
 	send_bandwidth: moq_net::bandwidth::Consumer,
 	/// The live recv-bitrate estimate, tracked across reconnects by the reconnect loop. Read directly
-	/// by the `estimated-recv-bitrate` getter.
+	/// by the `estimated-recv-rate` getter.
 	recv_bandwidth: moq_net::bandwidth::Consumer,
-	connection_stats: moq_native::ConnectionStatsReader,
+	connection_stats: moq_tokio::connection::Monitor,
 	/// This publication's completion. The task moves it to `Failed` on a fatal transport error, so the
 	/// pad streaming threads stop feeding a dead session without consulting the element.
 	completion: CompletionHandle,
@@ -261,12 +279,9 @@ impl Session {
 		// Producer setup may touch tokio time (group eviction), so run it inside the runtime context.
 		let _rt = RUNTIME.enter();
 
-		let origin = moq_net::Origin::random().produce();
-		let mut broadcast = origin.create_broadcast(
-			&settings.broadcast,
-			moq_net::broadcast::Route::new().with_announce(true),
-		)?;
-		let catalog = moq_mux::catalog::Producer::new(&mut broadcast)?;
+		let origin = moq_tokio::origin::spawn();
+		let mut broadcast = origin.publish(&settings.broadcast, moq_net::origin::Route::default())?;
+		let catalog = moq_mux::catalog::Producer::new(&mut broadcast, moq_mux::catalog::Config::default())?;
 
 		let status = Arc::new(Status::default());
 		let completion = CompletionState::new();
@@ -279,12 +294,14 @@ impl Session {
 		// retry), posting the bus error below. During an outage the pad threads keep writing (bounded
 		// by moq-net's per-group eviction) and the relay catches up from a group boundary on
 		// reconnect. A bounded policy is available via `ClientConfig::backoff`.
-		let client = client_config(&settings).init()?.with_publisher(origin.consume());
-		let reconnect = client.reconnect(settings.url.clone());
+		let client = connect_config(&settings)
+			.init(quic_config(&settings))?
+			.with_publisher(origin.consume());
+		let reconnect = client.connect(settings.url.clone());
 		// Persistent handles that survive reconnects; the getters read them without touching the loop.
 		let send_bandwidth = reconnect.send_bandwidth();
 		let recv_bandwidth = reconnect.recv_bandwidth();
-		let connection_stats = reconnect.stats();
+		let connection_stats = reconnect.monitor();
 
 		// The task is spawned parked. An immediate auth rejection would otherwise race the element
 		// installing this session, and its bus error would be discarded for belonging to no live one.
@@ -319,13 +336,13 @@ impl Session {
 	}
 
 	/// The congestion controller's send estimate in bits per second, 0 when disconnected or unavailable.
-	pub fn send_bitrate(&self) -> u64 {
-		self.send_bandwidth.peek().unwrap_or(0)
+	pub fn estimated_send_rate(&self) -> u64 {
+		self.send_bandwidth.peek().map_or(0, moq_net::bandwidth::Rate::as_bps)
 	}
 
 	/// The estimated receive bitrate in bits per second, 0 when disconnected or unavailable.
-	pub fn recv_bitrate(&self) -> u64 {
-		self.recv_bandwidth.peek().unwrap_or(0)
+	pub fn estimated_recv_rate(&self) -> u64 {
+		self.recv_bandwidth.peek().map_or(0, moq_net::bandwidth::Rate::as_bps)
 	}
 
 	/// Snapshot the current connection statistics, or None while disconnected.
@@ -359,17 +376,17 @@ impl Drop for Session {
 /// Track the reconnect loop's observable state into the element's [`Status`] and fire GObject
 /// notifications until the loop stops.
 ///
-/// The reconnect loop owns the session; this task follows [`moq_native::Reconnect`] to mirror
+/// The reconnect loop owns the session; this task follows [`moq_tokio::Connection`] to mirror
 /// status/version into the `Status` the getters read, and watches the persistent bandwidth consumers
 /// only to `notify` the bitrate properties (the getters read the estimates directly). Each source is
 /// notified on its own change: a status edge notifies `status`/`connected`/`moq-version` together, a
 /// presence change notifies `sessions` and `connection-stats`, and a bitrate change notifies just that
 /// bitrate. The loop stops only on a terminal error (a non-retryable auth failure, or a bounded backoff's
 /// give-up), which the `Err` arm posts as a bus error.
-/// [`Session`]'s `Drop` aborts this task, which drops the `Reconnect` handle and quietly tears the loop
+/// [`Session`]'s `Drop` aborts this task, which drops the `Connection` handle and quietly tears the loop
 /// down.
 async fn forward(
-	reconnect: moq_native::Reconnect,
+	reconnect: moq_tokio::Connection,
 	origin: moq_net::origin::Producer,
 	status: Arc<Status>,
 	completion: CompletionHandle,
@@ -387,7 +404,7 @@ async fn wait_for_registration(registered: Arc<tokio::sync::Notify>) {
 }
 
 async fn forward_registered(
-	mut reconnect: moq_native::Reconnect,
+	mut reconnect: moq_tokio::Connection,
 	origin: moq_net::origin::Producer,
 	status: Arc<Status>,
 	completion: CompletionHandle,
@@ -401,7 +418,7 @@ async fn forward_registered(
 	// Persistent across reconnects; watched only to fire property notifications.
 	let mut send_bandwidth = reconnect.send_bandwidth();
 	let mut recv_bandwidth = reconnect.recv_bandwidth();
-	let mut connection_stats = reconnect.stats();
+	let mut connection_stats = reconnect.monitor();
 
 	loop {
 		tokio::select! {
@@ -412,13 +429,13 @@ async fn forward_registered(
 			result = reconnect.status() => match result {
 				Ok(state) => {
 					let connection = match state {
-						moq_native::Status::Connected => ConnectionStatus::Connected,
+						moq_tokio::Status::Connected => ConnectionStatus::Connected,
 						_ => ConnectionStatus::Disconnected,
 					};
 					status.set(connection, reconnect.version().map(|v| v.to_string()));
 					match state {
-						moq_native::Status::Connected => gst::info!(CAT, "session connected"),
-						moq_native::Status::Disconnected => gst::warning!(CAT, "session disconnected, reconnecting"),
+						moq_tokio::Status::Connected => gst::info!(CAT, "session connected"),
+						moq_tokio::Status::Disconnected => gst::warning!(CAT, "session disconnected, reconnecting"),
 						_ => {}
 					}
 					notify(&element, &["status", "connected", "moq-version", "connection-stats"]);
@@ -441,11 +458,11 @@ async fn forward_registered(
 				// a channel that is now always ready. The biased status arm above wins when it has the
 				// reason, which is the usual way this loop ends.
 				result = send_bandwidth.changed() => match result {
-					Ok(_) => notify(&element, &["estimated-send-bitrate"]),
+					Ok(_) => notify(&element, &["estimated-send-rate"]),
 					Err(_) => return,
 				},
 				result = recv_bandwidth.changed() => match result {
-					Ok(_) => notify(&element, &["estimated-recv-bitrate"]),
+					Ok(_) => notify(&element, &["estimated-recv-rate"]),
 					Err(_) => return,
 				},
 			result = connection_stats.presence_changed() => match result {
@@ -479,7 +496,7 @@ mod tests {
 	#[test]
 	fn connection_stats_preserve_unavailable_separately_from_zero() {
 		gst::init().unwrap();
-		let mut stats = moq_net::ConnectionStats::default();
+		let mut stats = moq_net::session::Stats::default();
 		stats.rtt = Some(std::time::Duration::ZERO);
 		stats.bytes_sent = Some(0);
 		stats.packets_lost = Some(7);
@@ -494,8 +511,8 @@ mod tests {
 	fn sessions_structure_reads_both_counters_together() {
 		gst::init().unwrap();
 		let mut presence = moq_net::stats::Presence::default();
-		presence.sessions = 3;
-		presence.sessions_closed = 2;
+		presence.sessions_started = 3;
+		presence.sessions_ended = 2;
 		let structure = sessions_structure(presence);
 		assert_eq!(structure.name(), "moq-sessions");
 		assert_eq!(structure.get::<u64>("started"), Ok(3));

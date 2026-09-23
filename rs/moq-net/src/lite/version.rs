@@ -84,6 +84,17 @@ impl Version {
 		}
 	}
 
+	/// Whether the session supports the GOAWAY control stream (0x5) for graceful
+	/// shutdown and migration. Added in lite-04.
+	#[allow(clippy::match_like_matches_macro)]
+	pub fn has_goaway(self) -> bool {
+		// Match form so future versions default forward (CLAUDE.md convention).
+		match self {
+			Self::Lite01 | Self::Lite02 | Self::Lite03 => false,
+			_ => true,
+		}
+	}
+
 	/// Whether announcements carry implicit announce ids: each `active`
 	/// ANNOUNCE_BROADCAST assigns the next per-stream ordinal, and `ended`/`restart`
 	/// reference that id instead of repeating the path. Added in lite-06.
@@ -97,19 +108,63 @@ impl Version {
 	}
 
 	/// Whether ANNOUNCE_REQUEST carries the Exclude Hop field: the subscriber's own
-	/// origin id, which the publisher uses to skip announces whose hop chain already
+	/// Hop ID, which the publisher uses to skip announces whose hop chain already
 	/// passed through the subscriber. Present in lite-04 and lite-05 only.
 	///
 	/// The receiver's own reflected-announce check drops those announces anyway (and
 	/// catches loops of any length, not just the two-hop case), so lite-06 drops the
 	/// field and keeps the check. Lite-06 also declares the same identity session-wide
-	/// in the SETUP `Origin` parameter, which filters announcements and subscriptions
+	/// in the SETUP `Hop` parameter, which filters announcements and subscriptions
 	/// alike rather than one announce stream.
 	///
 	/// Unlike the gates above, this lists the versions that *have* the field: it was
 	/// removed rather than added, so future versions default to not carrying it.
 	pub fn has_exclude_hop(self) -> bool {
 		matches!(self, Self::Lite04 | Self::Lite05)
+	}
+
+	/// Whether SUBSCRIBE, SUBSCRIBE_UPDATE, FETCH, and GROUP carry frame indices
+	/// alongside their group sequences, so a subscription or fetch can start and end
+	/// partway through a group. Added in lite-06.
+	///
+	/// Older versions only address whole groups, so a route change has to wait for the
+	/// next group before it can resume.
+	#[allow(clippy::match_like_matches_macro)]
+	pub fn has_frame_bounds(self) -> bool {
+		// Match form so future versions default forward (CLAUDE.md convention).
+		match self {
+			Self::Lite01 | Self::Lite02 | Self::Lite03 | Self::Lite04 | Self::Lite05 => false,
+			_ => true,
+		}
+	}
+
+	/// Whether this version's SUBSCRIBE, SUBSCRIBE_UPDATE, SUBSCRIBE_OK, and TRACK_INFO
+	/// carry the retired `Ordered` byte.
+	///
+	/// The field is gone from the model: a publisher transmits newest-first within a
+	/// track, always. Deployed drafts still have the byte in their layout, so it is
+	/// written as 0 and ignored on read rather than shifting every field behind it.
+	pub(crate) fn has_group_order(self) -> bool {
+		match self {
+			Self::Lite01 | Self::Lite02 | Self::Lite03 | Self::Lite04 | Self::Lite05 => true,
+			Self::Lite06Wip => false,
+		}
+	}
+
+	/// Whether SUBSCRIBE's `Group Start` is an absolute floor the publisher resolves a
+	/// start from: the raw minimum group sequence (default 0), with `Subscriber Max Age`
+	/// as the only gate on how far back delivery begins. Changed in lite-06.
+	///
+	/// Older versions encode `Group Start` as the sequence + 1, with 0 meaning the
+	/// latest group, so an absent start there pins the cursor to the live edge instead
+	/// of resolving it from the budget.
+	#[allow(clippy::match_like_matches_macro)]
+	pub(crate) fn resolves_start(self) -> bool {
+		// Match form so future versions default forward (CLAUDE.md convention).
+		match self {
+			Self::Lite01 | Self::Lite02 | Self::Lite03 | Self::Lite04 | Self::Lite05 => false,
+			_ => true,
+		}
 	}
 
 	/// Whether announcements carry the route cost: the marginal cost of pulling

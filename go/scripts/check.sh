@@ -30,7 +30,7 @@ if ! command -v cargo >/dev/null 2>&1; then
 fi
 if ! command -v uniffi-bindgen-go >/dev/null 2>&1; then
     echo "go check: uniffi-bindgen-go not on PATH, skipping" >&2
-    echo "  install: cargo install uniffi-bindgen-go --git https://github.com/kixelated/uniffi-bindgen-go --rev 4f79e52bd8f518e5fa4d7acff9e586aee21e12a0 --locked" >&2
+    echo "  install: cargo install uniffi-bindgen-go --git https://github.com/kixelated/uniffi-bindgen-go --rev v0.9.0+v0.32.0 --locked" >&2
     exit 0
 fi
 
@@ -42,8 +42,8 @@ WRAPPER_PKG=$(printf '%s\n' "$STAGED" | sed -n 2p)
 echo "go check: checking error sentinels..."
 bash "$SCRIPT_DIR/check-errors.sh" \
     "$STAGE_PARENT/go-bindings/moq/moq.go" \
-    "$GO_DIR/wrapper/moq/errors.go" \
-    "$GO_DIR/wrapper/moq/errors_test.go"
+    "$GO_DIR/wrapper/errors.go" \
+    "$GO_DIR/wrapper/errors_test.go"
 
 cd "$WRAPPER_PKG"
 export CGO_ENABLED=1 GOFLAGS=-mod=mod

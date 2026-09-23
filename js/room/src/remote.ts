@@ -5,12 +5,10 @@
  */
 
 import type * as Moq from "@moq/net";
-import { Effect, type Getter, type GetterInit, getter, type Readonlys, readonlys, Signal } from "@moq/signals";
+import { Effect, type Getter, type Readonlys, readonlys, Signal } from "@moq/signals";
 import * as Watch from "@moq/watch";
 import { consume, type Preview, type UserInput } from "./metadata.ts";
 import { KIND, type Kind } from "./path.ts";
-
-type Established = Moq.Connection.Established;
 
 /** One watched broadcast (camera or screen) for a remote participant. */
 export class Member {
@@ -26,6 +24,8 @@ export class Member {
 	/** Playback volume, 0..1. */
 	readonly volume = new Signal(0.5);
 
+	/** Playback pipeline for this member. */
+	readonly player: Watch.Player;
 	/** Watched broadcast and catalog. */
 	readonly broadcast: Watch.Broadcast;
 	/** Video decoding pipeline. */
@@ -42,69 +42,27 @@ export class Member {
 	/** Published presence fields. */
 	readonly preview: Getter<Preview>;
 
-	#videoEnabled = new Signal(false);
-	#audioEnabled = new Signal(false);
 	#metadata: ReturnType<typeof consume>;
 	#signals = new Effect();
 
-	constructor(kind: Kind, path: Moq.Path.Valid, connection: Getter<Established | undefined>) {
+	constructor(kind: Kind, path: Moq.Path.Valid, connection: Moq.Connection) {
 		this.kind = kind;
 		this.path = path;
 
-		this.broadcast = new Watch.Broadcast({
-			connection,
-			enabled: true,
+		this.player = new Watch.Player({
+			origin: connection.origin,
+			probe: connection.probe,
 			name: path,
-			reload: true,
-		});
-		this.#signals.cleanup(() => this.broadcast.close());
-
-		const videoSource = new Watch.Video.Source({
-			broadcast: this.broadcast,
-			supported: Watch.Video.Decoder.supported,
-		});
-		const audioSource = new Watch.Audio.Source({
-			broadcast: this.broadcast,
-			supported: Watch.Audio.Decoder.supported,
-		});
-		this.#signals.cleanup(() => {
-			videoSource.close();
-			audioSource.close();
-		});
-
-		const sync = new Watch.Sync({
-			latency: "real-time",
-			connection,
-			video: videoSource.out.jitter,
-			audio: audioSource.out.jitter,
-		});
-		this.#signals.cleanup(() => sync.close());
-
-		this.video = new Watch.Video.Decoder(videoSource, sync, { enabled: this.#videoEnabled });
-		this.audio = new Watch.Audio.Decoder(audioSource, sync, { enabled: this.#audioEnabled });
-		this.#signals.cleanup(() => {
-			this.video.close();
-			this.audio.close();
-		});
-
-		this.renderer = new Watch.Video.Renderer(this.video, {
 			canvas: this.canvas,
-		});
-		this.emitter = new Watch.Audio.Emitter(this.audio, {
-			volume: this.volume,
 			muted: this.muted,
+			volume: this.volume,
 		});
-		this.#signals.cleanup(() => {
-			this.renderer.close();
-			this.emitter.close();
-		});
-
-		this.#signals.run((effect) => {
-			this.#videoEnabled.set(effect.get(this.renderer.out.visible));
-		});
-		this.#signals.run((effect) => {
-			this.#audioEnabled.set(effect.get(this.emitter.out.enabled));
-		});
+		this.#signals.cleanup(() => this.player.close());
+		this.broadcast = this.player.broadcast;
+		this.video = this.player.video;
+		this.audio = this.player.audio;
+		this.renderer = this.player.renderer;
+		this.emitter = this.player.emitter;
 
 		this.#metadata = consume(this.broadcast);
 		this.user = this.#metadata.user;
@@ -122,8 +80,8 @@ export class Member {
 export interface RemoteProps {
 	/** Participant identity. */
 	identity: Moq.Path.Valid;
-	/** Live session, usually a `Connection.Reload`'s `established`. */
-	connection: GetterInit<Established | undefined>;
+	/** Reconnecting connection whose origin supplies this participant's broadcasts. */
+	connection: Moq.Connection;
 }
 
 /**
@@ -155,12 +113,12 @@ export class Remote {
 	/** Published presence fields. */
 	readonly preview: Getter<Preview>;
 
-	#connection: Getter<Established | undefined>;
+	#connection: Moq.Connection;
 	#signals = new Effect();
 
 	constructor(props: RemoteProps) {
 		this.identity = props.identity;
-		this.#connection = getter(props.connection);
+		this.#connection = props.connection;
 		this.camera = this.#camera;
 		this.screen = this.#screen;
 		this.user = readonlys(this.#user);

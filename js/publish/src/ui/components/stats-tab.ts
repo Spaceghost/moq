@@ -70,7 +70,8 @@ export function statsTab(parent: Effect, publish: MoqPublish): HTMLElement {
 
 	// Resolution/codec from the live capture (display) + catalog; card hides when not capturing video.
 	parent.run((effect) => {
-		const display = effect.get(publish.capture.out.display);
+		const capture = effect.get(publish.video.in.capture);
+		const display = capture ? effect.get(capture.out.display) : undefined;
 		const cfg = effect.get(publish.video.out.catalog);
 		videoCard.el.style.display = display ? "" : "none";
 		vRes.textContent = display ? `${display.width}×${display.height}` : "—";
@@ -99,9 +100,28 @@ export function statsTab(parent: Effect, publish: MoqPublish): HTMLElement {
 	// Live graphs: frame rate from captured frames, bitrate measured from the bytes we encoded.
 	// The congestion controller's send estimate would be simpler, but Safari's WebTransport has no
 	// getStats(), so it has no estimate at all and the graph stayed empty there.
+	// Counted off our own stream rather than a signal, which would coalesce a burst of frames into
+	// one notification and undercount the rate.
 	let frames = 0;
-	parent.subscribe(publish.capture.out.frame, () => {
-		frames++;
+	parent.run((effect) => {
+		const capture = effect.get(publish.video.in.capture);
+		const fanout = capture ? effect.get(capture.out.frames) : undefined;
+		if (!fanout) return;
+
+		const reader = fanout.subscribe(effect).getReader();
+		effect.cleanup(() => {
+			reader.cancel().catch(() => {});
+		});
+
+		effect.spawn(async () => {
+			for (;;) {
+				const next = await Promise.race([reader.read(), effect.cancel]);
+				if (!next?.value) break;
+
+				frames++;
+				next.value.close();
+			}
+		});
 	});
 
 	const encoded = () => publish.video.out.stats.peek().bytes;

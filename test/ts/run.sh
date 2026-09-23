@@ -41,6 +41,7 @@ RERUN="$(harness_env TSC_DURATION TSC_BITRATE TSC_PORT TSC_PROFILE)just test ts$
 
 SOURCE=""       # real capture to publish instead of a generated clip
 ANALYZE_ONLY="" # existing TS to analyze without a round-trip
+CAPTURE_OUT=""  # keep the subscriber capture here (for callers asserting on it)
 DURATION="${TSC_DURATION:-20}"
 BITRATE="${TSC_BITRATE:-10000000}"
 # Empty means "any reserved port"; TSC_PORT or --port pins one instead.
@@ -76,6 +77,10 @@ while [[ $# -gt 0 ]]; do
         --strict)
             STRICT="--strict"
             shift
+            ;;
+        --capture-out)
+            CAPTURE_OUT="$2"
+            shift 2
             ;;
         --with-eit)
             WITH_EIT=1
@@ -240,7 +245,7 @@ grade_live() {
     # status we are here to record.
     set +e
     timeout -k 3 $((DURATION + 20)) \
-        "$MOQ" --client-connect "$URL" --broadcast "$BROADCAST" export ts 2>"$HARNESS_RUN/sub.log" |
+        "$MOQ" --connect "$URL" --broadcast "$BROADCAST" export ts 2>"$HARNESS_RUN/sub.log" |
         python3 "$DIR/pcr-timing.py" --live --seconds "$DURATION" --release-pct-max 1 $STRICT \
             ${PASSTHRU[@]+"${PASSTHRU[@]}"} >"$HARNESS_RUN/timing.out" 2>&1
     printf '%s\n' "${PIPESTATUS[0]} ${PIPESTATUS[1]}" >"$HARNESS_RUN/timing.rc"
@@ -249,7 +254,7 @@ grade_live() {
 # shellcheck disable=SC2329  # invoked indirectly via 'harness_spawn'
 capture() {
     timeout -k 3 $((DURATION + 20)) \
-        "$MOQ" --client-connect "$URL" --broadcast "$BROADCAST" export ts >"$SUB_TS" 2>"$HARNESS_RUN/sub.log"
+        "$MOQ" --connect "$URL" --broadcast "$BROADCAST" export ts >"$SUB_TS" 2>"$HARNESS_RUN/sub.log"
 }
 
 if [[ -n "$LIVE" ]]; then
@@ -278,7 +283,7 @@ publish() {
     # shellcheck disable=SC2016  # $1..$4 are the child bash -c positionals, not ours.
     timeout -k 3 $((DURATION + 20)) bash -c '
         tsp -I file "$1" -P regulate --pcr-synchronous --wait-min 5 |
-            "$2" --client-connect "$3" --broadcast "$4" import ts
+            "$2" --connect "$3" --broadcast "$4" import ts
     ' _ "$SRC_TS" "$MOQ" "$URL" "$BROADCAST"
 }
 harness_spawn pub "$HARNESS_RUN/pub.log" publish
@@ -346,6 +351,10 @@ if [[ ! -s "$SUB_TS" ]]; then
     echo "error: subscriber captured no data" >&2
     dump_logs
     exit 1
+fi
+
+if [[ -n "$CAPTURE_OUT" ]]; then
+    cp "$SUB_TS" "$CAPTURE_OUT"
 fi
 
 echo "### captured $(wc -c <"$SUB_TS" | tr -d ' ') bytes -> analyzing"

@@ -13,7 +13,6 @@
 //!   extracted from the avcC are injected ahead of every keyframe.
 
 use std::task::{Poll, ready};
-use std::time::Duration;
 
 use bytes::Bytes;
 use hang::Catalog;
@@ -27,7 +26,7 @@ use crate::container::ExportSource;
 pub struct Export<S: Stream> {
 	source: crate::Source,
 	catalog: Option<S>,
-	latency: Duration,
+	max_age: std::time::Duration,
 	track: Option<H264Track>,
 }
 
@@ -61,14 +60,18 @@ impl<S: Stream> Export<S> {
 		Self {
 			source,
 			catalog: Some(catalog),
-			latency: Duration::ZERO,
+			max_age: std::time::Duration::ZERO,
 			track: None,
 		}
 	}
 
-	/// Set the maximum buffering latency for the per-track source.
-	pub fn with_latency(mut self, latency: Duration) -> Self {
-		self.latency = latency;
+	/// Set the max age for the per-track source.
+	///
+	/// See [`Consumer`](crate::container::Consumer) for the per-track skip behavior.
+	/// Defaults to
+	/// [`std::time::Duration::ZERO`](std::time::Duration::ZERO) (skip aggressively).
+	pub fn with_max_age(mut self, max_age: std::time::Duration) -> Self {
+		self.max_age = max_age;
 		self
 	}
 
@@ -150,7 +153,7 @@ impl<S: Stream> Export<S> {
 			return Ok(());
 		}
 
-		let Some(source) = ExportSource::for_video_raw(&self.source, name, config, self.latency)? else {
+		let Some(source) = ExportSource::for_video_raw(&self.source, name, config, self.max_age)? else {
 			unreachable!("invalid broadcast references were removed above");
 		};
 		let convert = match config.description.as_ref().filter(|d| !d.is_empty()) {
@@ -244,7 +247,7 @@ mod tests {
 			duration: None,
 		};
 		<crate::catalog::hang::Container as crate::container::Container>::write(
-			&crate::catalog::hang::Container::Legacy,
+			&crate::catalog::hang::Container::Legacy(crate::container::Kind::Data),
 			group,
 			&[frame],
 		)
@@ -268,9 +271,9 @@ mod tests {
 		let catalog = avc1_catalog("video.m4s", avcc);
 
 		// Producer side: publish the broadcast with one length-prefixed video track.
-		let mut broadcast = moq_net::broadcast::Info::new().produce();
-		let mut track = broadcast
-			.create_track("video.m4s", hang::container::track_info())
+		let broadcast = moq_net::broadcast::Info::new().produce();
+		let track = broadcast
+			.create_track("video.m4s", hang::container::track_info(hang::catalog::PRIORITY.video))
 			.unwrap();
 
 		// Group 0 (keyframe-starting group): one IDR frame.
@@ -288,7 +291,10 @@ mod tests {
 
 		// Consumer side: run the exporter.
 		let consumer = broadcast.consume();
-		let mut export = Export::new(crate::source::announced(&consumer), Once(Some(catalog)));
+		// The whole track is written before the exporter runs, so it needs a budget
+		// wide enough to read it: the default skips everything but the live edge.
+		let mut export = Export::new(crate::source::announced(&consumer), Once(Some(catalog)))
+			.with_max_age(std::time::Duration::from_secs(30));
 
 		let frame0 = export.next().await.unwrap().expect("first frame");
 		let frame1 = export.next().await.unwrap().expect("second frame");

@@ -1,20 +1,8 @@
 //! Transcoder configuration: the rung ladder and catalog wiring.
 
-use moq_net::{AsPath, PathRelativeOwned};
+use moq_net::path::RelativeOwned;
 
 use crate::Ladder;
-
-#[doc(hidden)]
-#[deprecated(note = "use moq_net::Path::relative")]
-pub fn source_reference(source: impl AsPath, output: impl AsPath) -> Option<PathRelativeOwned> {
-	let source = source.as_path();
-	let output = output.as_path();
-	if output.strip_prefix(&source)?.is_empty() {
-		return None;
-	}
-
-	source.relative(&output)
-}
 
 /// Transcoder configuration for [`run`](crate::run).
 ///
@@ -40,40 +28,32 @@ pub struct Config {
 	/// and audio) through this path so players fetch them from the source
 	/// directly; the transcoder never proxies or subscribes them. `None` omits
 	/// them from the derivative catalog.
-	pub source: Option<PathRelativeOwned>,
+	pub source: Option<RelativeOwned>,
 
 	/// Which video encoder implementation encodes the rungs. The default
 	/// prefers hardware (NVENC on Linux, VideoToolbox on macOS, Media
-	/// Foundation on Windows) and falls back to openh264.
+	/// Foundation on Windows) and falls back to OpenH264 when enabled.
 	pub encoder: moq_video::encode::Kind,
 
 	/// Which video decoder implementation decodes the source. The default
-	/// prefers hardware and falls back to openh264 (H.264 only; H.265 sources
-	/// need a hardware decoder).
+	/// prefers hardware and falls back to OpenH264 when enabled (H.264 only;
+	/// H.265 sources need a hardware decoder).
 	pub decoder: moq_video::decode::Kind,
 
-	/// Frame resize behavior. Automatic mode keeps GPU-backed frames on the GPU.
+	/// Where decoded and resized frames live. Native output keeps GPU-backed
+	/// frames on the GPU from decode through encode; CPU output downloads at
+	/// the decoder and scales on the CPU.
 	pub resize: moq_video::resize::Config,
 }
 
-#[cfg(test)]
-#[allow(deprecated)]
-mod tests {
-	use super::*;
-
-	#[test]
-	fn source_reference_normalizes_and_counts_output_depth() {
-		assert_eq!(source_reference("a/b", "a/b/transcode.hang").unwrap().as_str(), ".");
-		assert_eq!(source_reference("/a//b/", "a/b/dir/").unwrap().as_str(), ".");
-		assert_eq!(
-			source_reference("a/b", "a/b/dir/transcode.hang").unwrap().as_str(),
-			".."
-		);
-		assert_eq!(
-			source_reference("a/b", "a/b/one/two/transcode.hang").unwrap().as_str(),
-			"../.."
-		);
-		assert!(source_reference("a/b", "other/transcode.hang").is_none());
-		assert!(source_reference("a/b", "a/b").is_none());
+impl Config {
+	/// The decoder the shared live feed opens: the configured implementation,
+	/// delivering frames where the resize expects them. No scale hint, since
+	/// the feed decodes once at native size for every rung.
+	pub(crate) fn feed_decoder(&self) -> moq_video::decode::Config {
+		let mut decoder = moq_video::decode::Config::new();
+		decoder.kind = self.decoder.clone();
+		decoder.output = self.resize.output;
+		decoder
 	}
 }

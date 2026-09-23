@@ -13,7 +13,7 @@
 
 import type { Root as CatalogRoot } from "@moq/hang/catalog";
 import * as Json from "@moq/json";
-import type * as Moq from "@moq/net";
+import * as Moq from "@moq/net";
 import type * as Publish from "@moq/publish";
 import { Effect, type Getter, type Readonlys, readonlys, Signal } from "@moq/signals";
 import type * as Watch from "@moq/watch";
@@ -152,7 +152,7 @@ function serveSnapshot<T>(
 		if (!net) return;
 
 		// A day-long cache so a late joiner still replays the latest value.
-		const track = net.createTrack(name, { latencyMax: 86_400_000, priority: PRIORITY });
+		const track = net.createTrack(name, { maxAge: Moq.Time.Milli(86_400_000), priority: PRIORITY });
 		effect.cleanup(() => track.close());
 
 		const producer = new Json.Snapshot.Producer<T>({ track });
@@ -228,7 +228,7 @@ function subscribeJson<T>(
 	const track = broadcast.track(name).subscribe({ priority: PRIORITY });
 	effect.cleanup(() => track.close());
 
-	const consumer = new Json.Snapshot.Consumer<T>(track);
+	const consumer = new Json.Snapshot.Consumer<T>({ track });
 	effect.spawn(async () => {
 		for (;;) {
 			const value = await Promise.race([effect.cancel, consumer.next()]);

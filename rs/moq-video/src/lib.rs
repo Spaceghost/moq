@@ -9,9 +9,9 @@
 //! A raw picture is a [`Frame`] wherever it crosses the API: a timestamp and a
 //! [`Surface`] holding the pixels. Capture and [`decode`] produce them, [`encode`]
 //! consumes them and hands back the compressed [`encode::Encoded`], and [`Size`]
-//! names a resolution. Keyframes are the encoder's business: it inserts them per
-//! [`encode::Config::gop`], and [`encode::Encoder::keyframe`] is there for the
-//! rarer case where a caller needs one at a specific frame.
+//! names a resolution. Group boundaries are the encoder's business: it places
+//! them per [`encode::Config::gop`], and [`encode::Encoder::cut`] is there for
+//! the rarer case where a caller needs one at a specific frame.
 //!
 //! - `capture` describes a frame source and grabs frames per platform:
 //!   AVFoundation/ScreenCaptureKit on macOS, native V4L2 on Linux, native Media
@@ -19,8 +19,7 @@
 //!   Windows, plus portal/PipeWire on Wayland and X11 capture on Linux. Use
 //!   `capture::open` for an embeddable raw-frame stream or
 //!   `encode::publish_capture` for turnkey publication. It requires the opt-in
-//!   `capture` feature: on Linux the camera path's bindgen needs libclang and
-//!   the V4L2 headers on the build host.
+//!   `capture` feature, which costs the build host nothing on any platform.
 //! - [`encode`] encodes frames with a native backend and publishes them through
 //!   the matching `moq_mux::codec` importer, which handles catalog registration
 //!   and framing. The codec is chosen via [`encode::Codec`]: H.264 (openh264 /
@@ -36,38 +35,41 @@
 //!     [`encode::Producer`] publishes the results.
 //! - [`decode`] subscribes to an H.264, H.265, or AV1 track and decodes it to
 //!   raw frames with a native backend (VideoToolbox on macOS, Media Foundation /
-//!   DXVA on Windows, NVDEC, VAAPI, or an ARM SoC's V4L2 M2M decoder on Linux, openh264
-//!   software fallback for H.264).
+//!   DXVA on Windows, NVDEC, VAAPI, or an ARM SoC's V4L2 M2M decoder on Linux,
+//!   with the default `openh264` feature providing software H.264 fallback).
 //!   [`decode::Consumer`] is the mirror of `moq_audio::decode::Consumer`. An
-//!   NVDEC frame stays in CUDA memory and feeds [`encode::Encoder::encode`]
-//!   zero-copy (the transcode path), scaled in hardware via
-//!   [`decode::Config::resize`]. A VAAPI decoder can return importable DMA-BUFs
-//!   when [`decode::Config::gpu_frames`] is enabled.
-//! - [`convert`] downloads any [`Surface`] to owned, tightly packed RGBA pixels
-//!   for CPU image and UI toolkits, honoring native color metadata when present.
+//!   [`decode::Config::output`] picks native surfaces (the default: an NVDEC
+//!   frame stays in CUDA memory and feeds [`encode::Encoder::encode`]
+//!   zero-copy, a VAAPI frame is a DMA-BUF the renderer imports) or CPU I420;
+//!   [`decode::Config::scale_hint`] lets a decoder with a hardware scaler emit
+//!   the output size directly.
+//! - [`convert`] downloads readback-capable [`Surface`]s to owned, tightly packed
+//!   RGBA pixels for CPU image and UI toolkits, honoring native color metadata.
+//!   Vulkan/CUDA surfaces deliberately expose no CPU pixel fallback.
 //! - `render` draws a [`Frame`] on the GPU and hands back a `wgpu` texture to
 //!   present, importing a GPU frame's surface directly where the platform
-//!   allows and uploading I420 otherwise. Behind the `render` feature, on by
-//!   default, which a publisher or relay drops to skip the graphics stack.
+//!   allows and uploading I420 otherwise. Behind the opt-in `render` feature,
+//!   so a codec-only consumer skips the graphics stack.
 //!
 //! ## API stability
 //!
 //! The public API is codec-agnostic: no public type, signature, or error
 //! variant names a backend (openh264 / VideoToolbox / NVENC / NVDEC / VAAPI / V4L2) or a
 //! codec implementation. [`encode::Encoder`] takes a [`Frame`],
-//! [`decode::Consumer`] returns one (CPU I420 on demand, GPU-resident when
-//! hardware decoded), and `capture::Stream` returns a [`Surface`]. So swapping
+//! [`decode::Consumer`] and `capture::Stream` return one (CPU I420 on demand,
+//! GPU-resident when hardware decoded). So swapping
 //! or bumping any backend crate is not a breaking change for consumers. Config
 //! structs are `#[non_exhaustive]`: build them via `default()`/`new()` and set
 //! fields, so new options stay additive.
 //!
 //! The one deliberate exception is [`Surface`], the enum behind every frame.
 //! Its variants name platform representations (`CVPixelBuffer`, Direct3D11,
-//! CUDA, `AHardwareBuffer`) so you can render or re-encode a frame yourself
-//! without a CPU round trip, which means a major bump of one of those platform
-//! crates is a breaking change here. It is `#[non_exhaustive]` and every variant has a universal
-//! fallback in [`Surface::into_i420`], so matching on it stays portable: take the
-//! fast path you recognize and let the `_` arm handle the rest.
+//! CUDA, Vulkan/CUDA, `AHardwareBuffer`) so you can render or re-encode a frame
+//! yourself without a CPU round trip, which means a major bump of one of those
+//! platform crates is a breaking change here. It is `#[non_exhaustive]` and
+//! every variant has a universal fallback in [`Surface::into_i420`] except the
+//! explicitly GPU-only `Surface::Vulkan`, so matching stays portable but a
+//! CPU-only consumer can receive [`Error::Unsupported`].
 
 #[cfg(feature = "capture")]
 pub mod capture;
@@ -81,6 +83,8 @@ pub mod resize;
 mod color;
 mod error;
 pub mod frame;
+mod output;
+mod rate;
 mod size;
 // Only the threaded sinks use this, and both are compiled out on macOS, where
 // the codecs run inline (no COM apartment to confine). Ungated it is dead code
@@ -99,6 +103,8 @@ pub use error::Error;
 #[cfg(all(target_os = "linux", feature = "dmabuf"))]
 pub use frame::{DmaBuf, DmaBufExport, DmaBufPlane, DrmFormat};
 pub use frame::{Frame, I420, Surface};
+pub use output::Output;
+pub use rate::{MAX_FRAMES_PER_SECOND, Rate, RateError};
 pub use size::Size;
 
 /// The NDK bindings [`frame::android::HardwareBuffer::buffer`] hands back,

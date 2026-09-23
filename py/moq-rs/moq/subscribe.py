@@ -17,8 +17,8 @@ from moq_ffi import (
     MoqJsonStreamConsumer,
     MoqMediaConsumer,
     MoqMediaGroupConsumer,
-    MoqRouteWatch,
     MoqTrackConsumer,
+    MoqVideoConsumer,
 )
 
 from .types import (
@@ -31,10 +31,11 @@ from .types import (
     FetchGroupOptions,
     Frame,
     MediaFrame,
-    Route,
     Subscription,
     TrackInfo,
     Video,
+    VideoDecodedFrame,
+    VideoDecoderOutput,
 )
 
 
@@ -194,8 +195,10 @@ class TrackConsumer:
     async def next_group(self) -> GroupConsumer | None:
         """Return the next group in sequence order, skipping forward if behind.
 
-        Returns `None` when the track ends. This is what the default iteration
-        yields; use `recv_group` when latency matters more than order.
+        Returns `None` when the track ends. Shares the sequence cursor with
+        :meth:`read_frame`: a group one method has already taken is not
+        returned by the other. This is what the default iteration yields; use
+        `recv_group` when latency matters more than order.
         """
         group = await self._inner.next_group()
         if group is None:
@@ -206,7 +209,9 @@ class TrackConsumer:
         """Read the first timestamped frame of the next group.
 
         Convenience for tracks using one-frame-per-group (like moq-boy's
-        status/command tracks). Returns `None` when the track ends.
+        status/command tracks). Completed empty groups are skipped. Returns
+        `None` only when the track ends. Cancelling one call keeps the current
+        group so a later :meth:`read_frame` or :meth:`next_group` still sees it.
         """
         return await self._inner.read_frame()
 
@@ -234,7 +239,7 @@ class TrackConsumer:
 class AudioConsumer:
     """Async iterator of decoded audio frames.
 
-    Built via :meth:`BroadcastConsumer.subscribe_audio`. The PCM layout
+    Built via :meth:`BroadcastConsumer.decode_audio`. The PCM layout
     is fixed by the :class:`AudioDecoderOutput` passed at subscribe
     time; each frame's ``data`` is raw bytes in that format.
     """
@@ -262,15 +267,54 @@ class AudioConsumer:
         self._inner.cancel()
 
 
+class VideoConsumer:
+    """Async iterator of decoded video frames.
+
+    Built via :meth:`BroadcastConsumer.decode_video`. Each frame is
+    tightly packed in its own ``format`` and carries its own ``width``
+    and ``height``: ``output.resize`` is best effort, so read the frame
+    rather than assuming it took.
+    """
+
+    def __init__(self, inner: MoqVideoConsumer) -> None:
+        self._inner = inner
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        self.cancel()
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self) -> VideoDecodedFrame:
+        frame = await self._inner.next()
+        if frame is None:
+            raise StopAsyncIteration
+        return frame
+
+    def cancel(self) -> None:
+        """Cancel the subscription and stop delivering video frames."""
+        self._inner.cancel()
+
+
 class JsonSnapshotConsumer:
     """Async iterator over a JSON snapshot track, yielding the latest value (lossy).
 
     Built via :meth:`BroadcastConsumer.subscribe_json_snapshot`. Each item is a parsed Python object.
     A consumer that has fallen behind collapses the backlog and yields only the latest value.
+    Usable as an async context manager that cancels on exit.
     """
 
     def __init__(self, inner: MoqJsonSnapshotConsumer) -> None:
         self._inner = inner
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        self.cancel()
 
     def __aiter__(self):
         return self
@@ -290,10 +334,17 @@ class JsonStreamConsumer:
     """Async iterator over a JSON stream track, yielding every record in order (lossless).
 
     Built via :meth:`BroadcastConsumer.subscribe_json_stream`. Each item is a parsed Python object.
+    Usable as an async context manager that cancels on exit.
     """
 
     def __init__(self, inner: MoqJsonStreamConsumer) -> None:
         self._inner = inner
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        self.cancel()
 
     def __aiter__(self):
         return self
@@ -339,78 +390,15 @@ class CatalogConsumer:
         self._inner.cancel()
 
 
-class RouteWatch:
-    """Async iterator of a broadcast's route changes.
-
-    Created by :meth:`BroadcastConsumer.route_updates`. The first item is the
-    current route, followed by each update. Iteration ends when the broadcast
-    ends. Usable as an async context manager that cancels on exit.
-    """
-
-    def __init__(self, inner: MoqRouteWatch) -> None:
-        self._inner = inner
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *exc) -> None:
-        self.cancel()
-
-    def __aiter__(self):
-        return self
-
-    async def __anext__(self) -> Route:
-        route = await self._inner.next()
-        if route is None:
-            raise StopAsyncIteration
-        return route
-
-    def cancel(self) -> None:
-        """Cancel this watch and stop delivering route updates."""
-        self._inner.cancel()
-
-
 class BroadcastConsumer:
     """The consume side of one broadcast: subscribe to its tracks, catalog, and media.
 
-    Built by resolving an announcement or request. Read its :attr:`route`, then use
-    the ``subscribe_*`` / :meth:`fetch_group` methods to pull tracks and media.
+    Built by resolving a request. Use the ``subscribe_*`` / :meth:`fetch_group`
+    methods to pull tracks and media.
     """
 
     def __init__(self, inner: MoqBroadcastConsumer) -> None:
         self._inner = inner
-        self._route_watch: RouteWatch | None = None
-
-    @property
-    def route(self) -> Route:
-        """The route the broadcast currently takes to reach this origin.
-
-        ``route.hops`` is the chain of relay origin ids (oldest first) and
-        ``route.cost`` the publisher's advertised preference (lower wins).
-        """
-        return self._inner.route()
-
-    def route_updates(self) -> RouteWatch:
-        """Watch the current route and each later update.
-
-        The returned async iterator has its own cursor. Cancel it directly or
-        use it as an async context manager to stop a pending wait.
-        """
-        return RouteWatch(self._inner.route_updates())
-
-    async def route_changed(self) -> Route | None:
-        """Wait for the broadcast's route to change.
-
-        The first call returns the current route immediately; each later call
-        blocks until it changes again (e.g. an upstream failover). Returns
-        ``None`` once the broadcast ends.
-        """
-        if self._route_watch is None:
-            self._route_watch = self.route_updates()
-        try:
-            return await anext(self._route_watch)
-        except StopAsyncIteration:
-            return None
 
     async def subscribe_catalog(self) -> CatalogConsumer:
         """Subscribe to the broadcast's catalog, async-iterating snapshots as it changes."""
@@ -419,7 +407,7 @@ class BroadcastConsumer:
     async def subscribe_track(self, name: str, subscription: Subscription | None = None) -> TrackConsumer:
         """Subscribe to a track and receive arbitrary byte payloads.
 
-        ``subscription`` tunes delivery priority, group ordering priority, and group range; omit for defaults.
+        ``subscription`` tunes delivery priority, group range, and staleness; omit for defaults.
         """
         return TrackConsumer(await self._inner.subscribe_track(name, subscription))
 
@@ -482,15 +470,32 @@ class BroadcastConsumer:
         ``catalog.video[name]``), whose ``container`` describes how to parse the
         bitstream, or a :class:`Container` directly. Pass a bare container for the
         dynamic flow, where you subscribe before the catalog exists.
-        ``subscription`` tunes delivery priority, group ordering priority, group
-        range, and the latency budget; omit for defaults. Raise
-        :attr:`Subscription.latency_max_ms` to buffer instead of skipping a
+        ``subscription`` tunes delivery priority, group
+        range, and the max age; omit for defaults. Raise
+        :attr:`Subscription.max_age_us` to buffer instead of skipping a
         stalled group.
         """
         container = track if isinstance(track, Container) else track.container
         return MediaConsumer(await self._inner.subscribe_media(name, container, subscription))
 
-    async def subscribe_audio(
+    async def resolve(self, reference: str | None) -> "BroadcastConsumer":
+        """Resolve a catalog rendition's ``broadcast`` reference to the broadcast
+        serving its track.
+
+        ``reference`` is ``catalog.video[name].broadcast`` /
+        ``catalog.audio[name].broadcast``: ``None`` or empty names this broadcast,
+        anything else names a sibling relative to it (e.g. ``./source``). Call it on
+        a rendition that carries one before :meth:`subscribe_media`,
+        :meth:`subscribe_track`, :meth:`fetch_group`, or :meth:`fetch_media_group`,
+        which take a track name rather than a rendition; :meth:`decode_audio` and
+        :meth:`decode_video` resolve it themselves.
+
+        Raises if this broadcast came from a local producer rather than an origin,
+        since a standalone broadcast has no sibling to name.
+        """
+        return BroadcastConsumer(await self._inner.resolve(reference))
+
+    async def decode_audio(
         self,
         name: str,
         catalog_audio: Audio,
@@ -503,12 +508,36 @@ class BroadcastConsumer:
         ``await broadcast.catalog()`` followed by
         ``catalog.audio[name]``). Only Opus and AAC-LC tracks are supported;
         AAC is decode only, since nothing here encodes it.
-        Use ``output.latency_max_ms`` to
+        Use ``output.max_age_us`` to
         control how aggressively stalled groups get skipped. That's
         the congestion-control knob. (Named ``_max`` to leave room for
-        a future ``latency_min_ms`` jitter-buffer floor.)
+        a future ``min_buffer_us`` jitter-buffer floor, which is a
+        distinct knob: this one bounds how stale a group may be, that
+        one how much to hold before presenting.)
         """
-        return AudioConsumer(await self._inner.subscribe_audio(name, catalog_audio, output))
+        return AudioConsumer(await self._inner.decode_audio(name, catalog_audio, output))
+
+    async def decode_video(
+        self,
+        name: str,
+        catalog_video: Video,
+        output: VideoDecoderOutput | None = None,
+    ) -> VideoConsumer:
+        """Subscribe to a video track and decode it inside the bindings.
+
+        ``catalog_video`` comes from the catalog (e.g.
+        ``await broadcast.catalog()`` followed by ``catalog.video[name]``).
+        An unrecognized codec raises here; a recognized one no native backend
+        handles raises when the decoder opens, both before the first frame.
+
+        ``output.format`` picks the packed CPU layout frames arrive in and
+        defaults to :attr:`VideoPixelFormat.I420`, which is what a decoder
+        produces natively; each frame repeats the layout it was decoded to.
+
+        ``output.resize`` asks the decoder for a different size and is best
+        effort, so read each frame's own dimensions.
+        """
+        return VideoConsumer(await self._inner.decode_video(name, catalog_video, output or VideoDecoderOutput()))
 
     async def catalog(self) -> Catalog:
         """Convenience: subscribe and return the first catalog."""

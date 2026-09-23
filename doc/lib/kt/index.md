@@ -25,9 +25,11 @@ import dev.moq.*
 
 // Subscribe. The Flow is live, so run it in its own coroutine.
 Moq.connect("https://relay.example.com", tlsRoots = listOf("ca.pem")).use { moq ->
-    moq.announcements("live/").collect { announcement ->
-        val catalog = announcement.broadcast().catalog()
-        println(catalog)
+    moq.announcements(AnnounceConfig(prefix = "live/", filter = "*/camera")).collect { announcement ->
+        // Updates stay origin-relative; captures reports what each wildcard matched.
+        println(announcement.captures())
+        val broadcast = moq.requestBroadcast(announcement.prefix())
+        println(broadcast.catalog())
     }
 }
 ```
@@ -37,7 +39,7 @@ Moq.connect("https://relay.example.com", tlsRoots = listOf("ca.pem")).use { moq 
 // opusInit, packet, pts, and rgba come from your encoder or capture source.
 Moq.connect("https://relay.example.com").use { moq ->
     val broadcast = moq.createBroadcast("my-stream.hang")
-    val audio = broadcast.publishMedia(Init(format = "opus", data = opusInit, video = null))
+    val audio = broadcast.publishAudio(AudioInit(format = AudioFormat.OPUS, data = opusInit))
     audio.writeFrame(Frame(payload = packet, timestampUs = 20_000u))
 
     val video = broadcast.publishVideo(
@@ -45,17 +47,67 @@ Moq.connect("https://relay.example.com").use { moq ->
         VideoEncoderOutput(codec = VideoCodec.H264, track = "camera", bitrate = null, gop = null, kind = autoEncoder),
     )
     video.write(VideoFrame(timestampUs = pts, data = rgba))
+    broadcast.announce(Route())
 }
 ```
 
+The three advertising operations: `moq.createBroadcast(path)` (or
+`origin.createBroadcast`) returns a locally discoverable producer;
+`broadcast.announce(route)` / `broadcast.unannounce()` own that exact-path
+advertisement; `origin.dynamic(prefix, route)` claims `prefix` and every
+path beneath it (`""` for everything). Hold the returned `OriginDynamic`
+while the claim should stay advertised, and reject the requests you will not
+serve. A route is a capability, not an inventory. `announcements(config)` takes
+a literal prefix plus an optional relative pattern; `announcement.prefix()`
+stays origin-relative and `captures()` reports the wildcard matches.
+
+Sessions reconnect with backoff when the transport drops and re-announce local
+broadcasts. `moq.epoch()` counts the connections, 1 on the first, pairing with
+`MoqSession.status` to log each reconnect; the `backoff` argument tunes the
+pacing (`timeoutUs = 0` retries forever); and `maxStreams` raises the peer's
+inbound stream cap.
+
 `Server.listen(bind, tlsGenerate = ...)` accepts sessions with per-request
-`accept()`/`reject()`. JSON tracks take `@Serializable` types
+`accept()`/`reject()`. Generated configuration setters, including
+`MoqRequest.setPublish`/`setConsume`, throw if a connect, listen, or accept is
+in flight, or after cancel. `MoqRequest.transport()` returns a `Transport` enum.
+JSON tracks take `@Serializable` types
 (`publishJsonSnapshot`, `publishJsonStream`, `valuesAs<T>()`), and the rest of
 the [shared feature list](/lib/#what-every-binding-can-do) maps one to one:
-`fetchGroup`/`fetchMediaGroup`, `dynamic()`, `appendDatagram`/`datagrams()`,
-`setCatalogSection`, `used()`/`unused()`. `MoqException.isAuth` and
-`isShutdown` classify errors. Cancelling the collecting coroutine cancels the
+`fetchGroup`/`fetchMediaGroup`, `dynamic()` for tracks and `dynamic(prefix)` for broadcasts, `appendDatagram`/`datagrams()`,
+`setCatalogSection`, `used()`/`unused()`. `session.bandwidth()` divides the
+connection's send estimate; pass it to `encodeVideo` / `encodeAudio` or
+`reserve` a share for an app-owned track. `MoqException.isAuth` and
+`isShutdown` classify errors. Microsecond fields read back as a
+`kotlin.time.Duration`: `stats.rtt`, `backoff.initial`, `frame.timestamp`. `protocolError` is the structured protocol failure
+(scope, verbatim code, kind) when the peer sent one. Cancelling the collecting coroutine cancels the
 native side.
+
+`decodeVideo` picks the decoded CPU pixel layout: `VideoDecoderOutput.format`
+is `VideoPixelFormat.I420` when null, or `VideoPixelFormat.RGBA` for four bytes
+a pixel, and every frame repeats the layout it was decoded to. `resize` is best
+effort: only NVDEC has a built-in scaler, and MediaCodec is not it, so read each
+frame's own `width` and `height` rather than assuming it took.
+
+## Connection stats
+
+`session.stats()` returns a `ConnectionStats` snapshot. Each field is `null`
+when the transport backend does not report it (native QUIC reports all of them;
+browser WebTransport reports few or none) or before it is available, which is
+not the same as zero. `rttUs` is microseconds; the `rtt` extension property
+reads it as a `kotlin.time.Duration`.
+
+| Field | Unit | Meaning |
+| --- | --- | --- |
+| `rttUs` | microseconds | Smoothed round-trip time. |
+| `estimatedSendRateBps` | bits per second | Send bandwidth from the congestion controller. |
+| `estimatedRecvRateBps` | bits per second | Receive bandwidth from MoQ PROBE. |
+| `bytesSent` | bytes | Total sent, including retransmissions and overhead. |
+| `bytesReceived` | bytes | Total received, including duplicates and overhead. |
+| `bytesLost` | bytes | Total lost, detected via retransmission or acknowledgement. |
+| `packetsSent` | datagrams | Total datagrams sent. |
+| `packetsReceived` | datagrams | Total datagrams received. |
+| `packetsLost` | datagrams | Total datagrams detected as lost. |
 
 - API reference: [javadoc.io/doc/dev.moq/moq](https://javadoc.io/doc/dev.moq/moq)
 - Source: [`kt/`](https://github.com/moq-dev/moq/tree/main/kt); `just kt check` builds and tests locally

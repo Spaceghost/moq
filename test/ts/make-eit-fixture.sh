@@ -8,8 +8,9 @@
 #
 # Everything is derived from the input: the service triplet comes from its PAT and SDT, so
 # the generated EIT actually describes the service the stream carries rather than a
-# plausible-looking one a receiver would ignore. The EPG is anchored to a fixed UTC
-# reference by default, which makes the output byte-reproducible for a given input.
+# plausible-looking one a receiver would ignore. The EPG is anchored to the input's own
+# TDT where it has one, and to a fixed date otherwise, so the output is byte-reproducible
+# for a given input either way rather than varying with the wall clock.
 #
 # Requires TSDuck (tsp, tstables) and python3.
 #
@@ -17,6 +18,12 @@
 #
 #   --pf-only        EIT p/f actual only. The default also generates EIT schedule.
 #   --events N       events in the EPG (default 12)
+#   --days N         span the EPG N days instead, at the same 30-minute events. This is
+#                    the flag to reach for when the sparseness of EIT schedule matters:
+#                    a guide at the DVB planning horizon declares a
+#                    last_section_number covering its whole range and transmits only the
+#                    segment-boundary sections that hold events, so completeness cannot
+#                    be decided by counting. See "EIT fixtures" in README.md.
 #   --time T         UTC reference, "YYYY/MM/DD:hh:mm:ss". Defaults to the input's own
 #                    TDT if it has one, else a fixed date.
 #   --service-id N   service to describe (default: the first service in the PAT)
@@ -26,6 +33,7 @@ set -euo pipefail
 
 PF_ONLY=""
 EVENTS=12
+DAYS=""
 TIME_REF=""
 SERVICE_ID=""
 QUIET=""
@@ -41,6 +49,10 @@ while [[ $# -gt 0 ]]; do
             EVENTS="$2"
             shift 2
             ;;
+        --days)
+            DAYS="$2"
+            shift 2
+            ;;
         --time)
             TIME_REF="$2"
             shift 2
@@ -54,7 +66,7 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         -h | --help)
-            sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
         *)
@@ -63,6 +75,21 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# A day of 30-minute events is 48 of them, so the horizon and the event count are the
+# same knob; --days exists because the interesting property (how sparse the schedule
+# sub-tables come out) is a function of the span, not of the count.
+if [[ -n "$DAYS" ]]; then
+    [[ "$DAYS" =~ ^[1-9][0-9]*$ ]] || {
+        echo "error: --days takes a positive integer: $DAYS" >&2
+        exit 2
+    }
+    EVENTS=$((DAYS * 48))
+fi
+[[ "$EVENTS" =~ ^[1-9][0-9]*$ ]] || {
+    echo "error: --events takes a positive integer: $EVENTS" >&2
+    exit 2
+}
 
 [[ ${#ARGS[@]} -eq 2 ]] || {
     echo "usage: $(basename "$0") [options] <input.ts> <output.ts>" >&2
@@ -313,11 +340,75 @@ if expected not in observed:
     sys.exit(1)
 PY
 
+if [[ -z "$PF_ONLY" ]]; then
+    python3 - "$OUT" "$EVENTS" <<'PY'
+import collections, sys
+
+path, events = sys.argv[1:3]
+packet_size = 188
+
+
+def fail(message):
+    print(f"error: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+try:
+    with open(path, "rb") as stream:
+        data = stream.read()
+except OSError as error:
+    fail(f"cannot read generated transport stream: {error}")
+
+if not data or len(data) % packet_size:
+    fail("generated output is not a 188-byte-aligned transport stream")
+
+schedule = collections.defaultdict(set)
+last_sections = collections.defaultdict(set)
+for off in range(0, len(data), packet_size):
+    packet = data[off : off + packet_size]
+    if packet[0] != 0x47:
+        fail(f"generated output lost packet sync at byte {off}")
+    if ((packet[1] & 0x1F) << 8 | packet[2]) != 0x0012 or not packet[1] & 0x40:
+        continue
+    if not packet[3] & 0x10:
+        continue
+    body = 4 + (1 + packet[4] if packet[3] & 0x20 else 0)
+    if body >= packet_size:
+        continue
+    section = body + 1 + packet[body]
+    while section + 3 <= packet_size and packet[section] != 0xFF:
+        table_id = packet[section]
+        length = 3 + ((packet[section + 1] & 0x0F) << 8 | packet[section + 2])
+        # A start whose 8-byte header crosses into the next packet is legal;
+        # skipping it undercounts distinct sections, which only makes the
+        # sparseness check below more conservative.
+        if 0x50 <= table_id <= 0x6F and section + 8 <= packet_size:
+            schedule[table_id].add(packet[section + 6])
+            last_sections[table_id].add(packet[section + 7])
+        if section + length > packet_size:
+            break
+        section += length
+
+if not schedule:
+    fail("generated output has no EIT schedule section on PID 0x0012")
+if int(events) > 48 and not any(
+    last > len(schedule[table_id])
+    for table_id, declared in last_sections.items()
+    for last in declared
+):
+    census = ", ".join(
+        f"0x{table_id:02X}: {len(sections)} distinct, last {sorted(last_sections[table_id])}"
+        for table_id, sections in sorted(schedule.items())
+    )
+    fail(f"multi-day EIT schedule is not sparse: {census}")
+PY
+fi
+
 EIT_PKTS=$(tsp -I file "$OUT" -P count --pid 0x0012 --total -O drop 2>&1 |
     sed -n 's/.*counted \([0-9,]*\) packets.*/\1/p' | head -1)
 
 [[ -n "$QUIET" ]] || {
     echo "### EIT fixture: service $SERVICE_ID (ts $TSID, onid $ONID), reference $TIME_REF"
-    echo "### $EVENTS events, $([[ -n "$PF_ONLY" ]] && echo "p/f only" || echo "p/f + schedule")"
+    echo "### $EVENTS events${DAYS:+ spanning $DAYS day(s)}, $([[ -n "$PF_ONLY" ]] && echo "p/f only" || echo "p/f + schedule")"
     echo "### $EIT_PKTS packets on PID 0x0012 -> $OUT"
 }

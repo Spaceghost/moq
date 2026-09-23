@@ -6,11 +6,11 @@ use anyhow::Context;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-	// Optional: Use moq_native to configure a logger.
-	moq_native::Log::new(tracing::Level::DEBUG).init()?;
+	// Optional: Use moq_tokio to configure a logger.
+	moq_tokio::Log::new(tracing::Level::DEBUG).init()?;
 
 	// Create an origin that the session can publish incoming broadcasts to.
-	let origin = moq_net::Origin::random().produce();
+	let origin = moq_tokio::origin::spawn();
 	let consumer = origin.consume();
 
 	// Run the subscription and the session in parallel.
@@ -23,8 +23,8 @@ async fn main() -> anyhow::Result<()> {
 // Connect to the server and subscribe to broadcasts.
 // Automatically reconnects if the connection drops.
 async fn run_session(origin: moq_net::origin::Producer) -> anyhow::Result<()> {
-	// Optional: Use moq_native to make a QUIC client.
-	let client = moq_native::ClientConfig::default().init()?;
+	// Optional: Use moq_tokio to make a QUIC client.
+	let client = moq_tokio::connect::Config::default().init(Default::default())?;
 
 	// For local development, use: http://localhost:4443/video-example
 	// The "anon" path is usually configured to bypass authentication; be careful!
@@ -33,7 +33,7 @@ async fn run_session(origin: moq_net::origin::Producer) -> anyhow::Result<()> {
 	// Establish a connection with automatic reconnection.
 	// with_subscriber() registers an OriginProducer for incoming data.
 	// Use with_publisher() if you also want to publish from the session.
-	let reconnect = client.with_subscriber(origin).reconnect(url);
+	let reconnect = client.with_subscriber(origin).connect(url);
 
 	// Wait until the reconnect loop stops (e.g. timeout exceeded).
 	Ok(reconnect.closed().await?)
@@ -41,12 +41,14 @@ async fn run_session(origin: moq_net::origin::Producer) -> anyhow::Result<()> {
 
 // Subscribe to a broadcast and read media frames.
 async fn run_subscribe(consumer: moq_net::origin::Consumer) -> anyhow::Result<()> {
-	// Wait for a broadcast to be announced.
-	let moq_net::announce::Update { path, broadcast } = consumer.announced().next().await.context("origin closed")?;
-
-	let broadcast = broadcast.with_context(|| format!("broadcast unannounced: {path}"))?;
+	// Wait for a route to be announced, then resolve the broadcast at its path.
+	// The convention is that a publisher announces each broadcast's exact path.
+	let update = consumer.announced().next().await.context("origin closed")?;
+	anyhow::ensure!(update.kind.is_active(), "route retracted: {}", update.prefix);
+	let path = update.prefix;
 
 	tracing::info!(%path, "broadcast announced");
+	let broadcast = consumer.request_broadcast(&path).await?;
 
 	// Read the catalog to discover available tracks.
 	let catalog_track = broadcast
@@ -74,12 +76,17 @@ async fn run_subscribe(consumer: moq_net::origin::Consumer) -> anyhow::Result<()
 	);
 
 	// Subscribe to the video track.
+	let latency = Duration::from_millis(500);
 	let track_consumer = broadcast
 		.track(name)?
-		.subscribe(moq_net::track::Subscription::default().with_priority(1))
+		.subscribe(
+			moq_net::track::Subscription::default()
+				.with_priority(1)
+				.with_max_age(latency),
+		)
 		.await?;
-	let mut ordered = moq_mux::container::Consumer::new(track_consumer, moq_mux::catalog::hang::Container::Legacy)
-		.with_latency(Duration::from_millis(500));
+	let mut ordered =
+		moq_mux::container::Consumer::new(track_consumer, moq_mux::catalog::hang::Container::try_from(config)?);
 
 	// Read frames in latency-bounded presentation order.
 	while let Some(frame) = ordered.read().await? {

@@ -13,16 +13,18 @@ set working-directory := '..'
 # needs a nightly toolchain and sanitizer flags, so `just rs fuzz` is the one recipe
 # that may compile it. Every `--workspace` below therefore carries this, and a new
 # one that forgets it pays a vendored C++ libFuzzer build for nothing. The root
-# justfile's `check-all` and `fix-all` spell it out, since a module cannot read this.
+# justfile's `check --all` and `fix --all` spell it out, since a module cannot read this.
 no_fuzz := "--exclude moq-net-fuzz"
 
 default:
     just check
 
-# Default features only, here and in CI. The permutations (`--all-features`,
-# `--no-default-features`) each cost a full extra workspace compile that shares
-# almost nothing with this one, which is too slow for a per-PR gate; `features`
-# below covers them nightly.
+# Default features for the selected workspace packages, here and in CI. The full
+# workspace permutations (`--all-features`, `--no-default-features`) each cost a
+# separate compile that shares almost nothing with this one, so `features` below
+# covers them nightly. `check-changed` makes one scoped exception for moq-tokio,
+# whose feature-gated transport surface must compile in isolation to avoid
+# workspace feature unification hiding a broken configuration.
 #
 # No `cargo check` pass: clippy is a superset of it, and the two use different
 # rustc wrappers, so running both means compiling the workspace twice.
@@ -38,6 +40,8 @@ check *args:
     just rs _select-test
     just rs _publish-test
     just rs _doc-names-test
+    # A new MoqConnectionStats field has to reach every binding's doc page.
+    python3 rs/scripts/stats-docs.py
     rs/scripts/package-nfpm.test.sh
     cargo clippy --locked --all-targets {{ args }} -- -D warnings
     cargo fmt --all --check
@@ -249,6 +253,32 @@ _wants-wasm $PACKAGES:
     set -euo pipefail
     grep -qwE '(moq-wasm|moq-mux|moq-ffi)' <<< "$(just rs _names "$PACKAGES")"
 
+# True when the selection includes moq-tokio, whose zero-feature build is hidden
+# by workspace feature unification whenever any dependent enables a transport.
+[private]
+_wants-tokio-features $PACKAGES:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    grep -qw 'moq-tokio' <<< "$(just rs _names "$PACKAGES")"
+
+# True when the selection includes a crate with a `capture` feature. Selection
+# pulls in dependents, so a diff to moq-mux or moq-net lands here too, which is
+# how a rename in either reaches the device code that calls it.
+[private]
+_wants-capture $PACKAGES:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    grep -qwE '(moq-video|moq-audio)' <<< "$(just rs _names "$PACKAGES")"
+
+# True when the selection includes moq-relay, whose io_uring listener is off the
+# default feature set. Selection pulls in dependents, so a diff to any crate the
+# relay is built from (moq-uring, moq-sock, moq-tokio) lands here too.
+[private]
+_wants-uring $PACKAGES:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    grep -qw 'moq-relay' <<< "$(just rs _names "$PACKAGES")"
+
 # Print the crate names behind a list of `--package` flags.
 [private]
 _names $PACKAGES:
@@ -288,6 +318,32 @@ _select-test:
     relay=$(just rs _select "rs/moq-relay/src/web.rs")
     if just rs _wants-wasm "$relay"; then
     	fail "a moq-relay diff must not drive it: $(just rs _names "$relay")"
+    fi
+
+    # The break the capture gate was added for: a moq-mux API change that missed
+    # its callers behind `capture`. A moq-mux diff has to reach it.
+    mux=$(just rs _select "rs/moq-mux/src/clock.rs")
+    just rs _wants-capture "$mux" \
+        || fail "a moq-mux diff must drive the capture gate: $(just rs _names "$mux")"
+    if just rs _wants-capture "$relay"; then
+        fail "a moq-relay diff must not drive the capture gate: $(just rs _names "$relay")"
+    fi
+
+    # The break the uring gate was added for: a change that breaks moq-relay's
+    # io_uring listener, which the default pass above never compiles. A moq-relay
+    # diff has to reach it, and a diff that cannot affect the relay must not.
+    just rs _wants-uring "$relay" \
+        || fail "a moq-relay diff must drive the uring gate: $(just rs _names "$relay")"
+    hls=$(just rs _select "rs/moq-hls/src/lib.rs")
+    if just rs _wants-uring "$hls"; then
+        fail "a moq-hls diff must not drive the uring gate: $(just rs _names "$hls")"
+    fi
+
+    tokio=$(just rs _select "rs/moq-tokio/src/lib.rs")
+    just rs _wants-tokio-features "$tokio" \
+        || fail "a moq-tokio diff must drive its feature matrix: $(just rs _names "$tokio")"
+    if just rs _wants-tokio-features "$relay"; then
+        fail "a moq-relay-only selection must not drive the moq-tokio feature matrix"
     fi
 
     # A non-crate directory under rs/ seeds a name that is not a package. It must
@@ -349,6 +405,10 @@ check-changed $FILES:
     	*)     echo "rs: checking $(just rs _names "$packages")"; just rs check $packages ;;
     esac
 
+    if [[ "$packages" == "ALL" ]] || just rs _wants-tokio-features "$packages"; then
+        just rs tokio-features
+    fi
+
     # moq-wasm's crate root is entirely `#![cfg(target_arch = "wasm32")]`, so
     # however it got selected the host-target pass above compiled it to nothing
     # and saw no errors in it. This wasm32 pass is what actually checks it.
@@ -359,6 +419,47 @@ check-changed $FILES:
     # is selected by its dependents, none of which are moq-wasm.
     if [[ "$packages" == "ALL" ]] || just rs _wants-wasm "$packages"; then
     	just rs wasm
+    fi
+
+    # moq-video's and moq-audio's device code is behind `capture`, which is off
+    # by default, so the pass above never compiles it. Only nightly's
+    # `--all-features` did, and a break there lands on main.
+    if [[ "$packages" == "ALL" ]] || just rs _wants-capture "$packages"; then
+    	just rs capture
+    fi
+
+    # moq-relay's io_uring listener is behind `io-uring`, off by default, so the
+    # pass above never compiles it. `check --all` reaches it through `bench
+    # check`, but only for a diff under `bench/`; a relay change would otherwise
+    # land on the nightly.
+    if [[ "$packages" == "ALL" ]] || just rs _wants-uring "$packages"; then
+    	just rs uring-check
+    fi
+
+# Compile moq-tokio by itself at the feature extremes and with each crypto provider.
+# Its default-feature build is already part of the ordinary clippy pass above.
+tokio-features:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    cargo clippy --locked -p moq-tokio --no-default-features -- -D warnings
+    cargo clippy --locked -p moq-tokio --all-features -- -D warnings
+    cargo clippy --locked -p moq-tokio --no-default-features --features noq,aws-lc-rs -- -D warnings
+    cargo clippy --locked -p moq-tokio --no-default-features --features noq,ring -- -D warnings
+
+    for feature in aws-lc-rs ring tcp uds websocket; do
+        cargo clippy --locked -p moq-tokio --no-default-features --features "$feature" -- -D warnings
+    done
+
+    want='a rustls QUIC backend requires a crypto provider: enable either the `aws-lc-rs` or `ring` feature'
+    if output=$(cargo check --locked -p moq-tokio --no-default-features --features noq 2>&1); then
+        echo "rs: moq-tokio with only noq should reject its missing crypto provider" >&2
+        exit 1
+    fi
+    if ! grep -qF "$want" <<< "$output"; then
+        echo "rs: moq-tokio with only noq should fail on: $want" >&2
+        echo "$output" | grep -E '^error' >&2 || true
+        exit 1
     fi
 
 # Same as `fix`, but scoped the same way as `check-changed`.
@@ -388,8 +489,8 @@ fix-changed $FILES:
 # this once a day instead. A break there lands on main rather than being caught
 # in review, which is the same trade the other nightly gates make.
 #
-# Default features rather than `--all-features`: jemalloc and the quiche
-# backend don't build on MSVC, while moq-video's Linux-only `nvidia` default
+# Default features rather than `--all-features`: jemalloc doesn't build on
+# MSVC, while moq-video's Linux-only `nvidia` default
 # are already no-ops off Linux. moq-gst is excluded because it links
 # GStreamer via pkg-config, which the Windows runner doesn't have.
 #
@@ -400,6 +501,23 @@ fix-changed $FILES:
 # Compile the whole workspace on a Windows host. Must run ON Windows.
 windows *args:
     cargo check --locked --workspace --exclude moq-gst {{ no_fuzz }} --all-targets --features "moq-cli/play moq-cli/capture" {{ args }}
+
+# Compile and test the io_uring relay path, which is off the default feature set.
+# Linux-only, and the tests below the 6.12 kernel floor skip themselves.
+#
+# `qlog` is a second axis, and the traces are what a debugging run depends on,
+# so it gets a separate pass.
+uring *args:
+    just rs uring-check {{ args }}
+    cargo nextest run --locked -p moq-uring -p moq-relay --features moq-relay/io-uring --all-targets {{ args }}
+    cargo clippy --locked -p moq-uring -p moq-relay --features moq-relay/io-uring,moq-relay/qlog --all-targets {{ args }} -- -D warnings
+    cargo nextest run --locked -p moq-uring --features qlog --all-targets {{ args }}
+
+# Compile the io_uring relay path, off the default feature set. `check-changed`
+# runs this whenever moq-relay is selected, so a change that breaks the ring
+# listener fails its own PR rather than landing on the nightly.
+uring-check *args:
+    cargo clippy --locked -p moq-uring -p moq-relay --features moq-relay/io-uring --all-targets {{ args }} -- -D warnings
 
 # Runs the `#[cfg(target_os = "macos")]` code past the compiler: moq-video's
 # VideoToolbox encode/decode and its ScreenCaptureKit / AVFoundation capture,
@@ -421,15 +539,27 @@ windows *args:
 macos *args:
     cargo check --locked -p moq-video -p moq-audio --all-targets --all-features {{ args }}
 
+# The Linux device code: moq-video's V4L2 and X11 capture and moq-audio's cpal
+# capture, all behind the off-by-default `capture` feature. `check-changed` runs
+# this whenever either crate is selected. The per-crate `--features` spelling
+# keeps it to those two instead of widening what their dependencies compile.
+# `--all-features` would also build the bindgen codecs, which nightly covers.
+
+# Compile and lint the capture feature, which the default check skips.
+capture *args:
+    cargo clippy --locked -p moq-video -p moq-audio --all-targets --features moq-video/capture,moq-audio/capture {{ args }} -- -D warnings
+
 # Same idea as `windows`/`macos`, for Android: moq-video's MediaCodec encoder and
 # decoder, its `Surface::HardwareBuffer` variant, and the `frame::android` module
 # are all `#[cfg(target_os = "android")]`, so a host-target check compiles none of
 # them and every error in them stays invisible.
 #
 # Unlike `windows` and `macos` this needs no special host: the Android targets
-# cross-compile from the Linux dev shell in about half a minute. It needs an NDK,
-# which `cargo-ndk` finds through `ANDROID_NDK_HOME` or the standard SDK layout,
-# so it is a manual gate rather than a CI one until the shell provides one.
+# cross-compile from Linux in about half a minute. It needs an NDK, which
+# `cargo-ndk` finds through `ANDROID_NDK_HOME` or the standard SDK layout. The
+# dev shell provides neither, so android.yml runs this outside Nix on a GitHub
+# runner, whose image ships an NDK, for every PR that touches moq-video or
+# anything it is built from.
 #
 # arm64-v8a alone: it is the only ABI anything here ships, and the code is not
 # ABI-specific, so the other two would compile the same source twice more.
@@ -482,6 +612,82 @@ wasm-fix *args:
 audit:
     cargo deny check --show-stats
 
+# Verify relay startup validation without a QUIC backend.
+relay-minimal:
+    cargo nextest run --locked -p moq-relay --no-default-features --lib -E 'test(workers_require_a_quic_backend)'
+
+# libmoq's C fixtures (`rs/libmoq/c-tests/*.c`) link `libmoq.a` the way an
+# embedder does: an external `cc` against the generated `moq.h`, plus the native
+# libraries from `rs/libmoq/native-libs` that cargo can't inject into a link it
+# doesn't drive. Each fixture pins part of the C ABI at compile time and
+# exercises it at runtime, so it has to run, not just compile.
+#
+# Outside nextest on purpose. The staticlib link alone takes ~2 minutes, past the
+# hang budget in `.config/nextest.toml` once the rest of the workspace builds
+# beside it, and `rs/CLAUDE.md` says to make a slow test fast, not to raise the
+# ceiling. obs.yml runs this on every PR that touches rs/libmoq, right after it
+# has built the same debug libmoq.a for the plugin, and nightly.yml covers the
+# paths that filter misses.
+#
+# Unix only: linking a Rust staticlib from MSVC spells the flags and the
+# archive (`moq.lib`) differently, and this recipe doesn't model that.
+
+# Compile and run libmoq's C fixtures against libmoq.a. Must run on Unix.
+c-tests:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cc="${CC:-cc}"
+    if ! command -v "$cc" >/dev/null; then
+        echo "no C compiler at '$cc'" >&2
+        exit 1
+    fi
+
+    cargo build --locked -p libmoq
+
+    # Ask cargo where it put the staticlib rather than assuming target/debug:
+    # CARGO_TARGET_DIR and a configured build target (`target/<triple>/debug`)
+    # both move it, and guessing wrong would link a stale copy or nothing.
+    # Replays the build above from cache, so it costs a process, not a compile.
+    lib=$(cargo build --locked -p libmoq --message-format=json |
+        jq -r 'select(.reason == "compiler-artifact") | .filenames[] | select(endswith("/libmoq.a"))' |
+        tail -1)
+    if [ -z "$lib" ]; then
+        echo "cargo reported no libmoq.a for libmoq" >&2
+        exit 1
+    fi
+    # The header sits beside the profile directory: rs/libmoq/build.rs writes it
+    # to `<target>/include`, one level above `<target>/<profile>/libmoq.a`.
+    profile=$(dirname "$lib")
+    include="$(dirname "$profile")/include"
+    if [ ! -f "$include/moq.h" ]; then
+        echo "$include/moq.h missing after 'cargo build --locked -p libmoq'" >&2
+        exit 1
+    fi
+
+    # Same list build.rs (moq.pc), CMakeLists.txt, and test/smoke/smoke.sh read:
+    # `framework:Foo` is a linker framework flag, anything else a plain library.
+    case "$(uname -s)" in
+        Darwin) native_libs=rs/libmoq/native-libs/apple.txt ;;
+        *) native_libs=rs/libmoq/native-libs/linux.txt ;;
+    esac
+    libs=()
+    while read -r entry; do
+        case "$entry" in
+            '' | '#'*) continue ;;
+            framework:*) libs+=(-framework "${entry#framework:}") ;;
+            *) libs+=("-l$entry") ;;
+        esac
+    done <"$native_libs"
+
+    out=$(mktemp -d)
+    trap 'rm -rf "$out"' EXIT
+    for source in rs/libmoq/c-tests/*.c; do
+        bin="$out/$(basename "$source" .c)"
+        "$cc" "$source" -I"$include" -L"$profile" -lmoq "${libs[@]}" -o "$bin"
+        echo "running $source"
+        "$bin"
+    done
+
 # The feature permutations `check` leaves out. Each is a full workspace compile
 # at a feature set that shares almost no artifacts with the default one (~6min
 # for the all-features clippy alone), which is why this is nightly rather than
@@ -489,8 +695,13 @@ audit:
 #
 # `--all-features` is the only thing that compiles moq-cli's play/capture, the
 # moq-video and moq-audio device features, the Linux bindgen codecs (vaapi,
-# v4l2), PipeWire, quiche, and jemalloc. `--no-default-features` is
+# v4l2), PipeWire, and jemalloc. `--no-default-features` is
 # the only thing that compiles the `#[cfg(not(feature = ...))]` arms.
+#
+# Cargo unifies features across a workspace selection. Check each package alone
+# to catch missing dependencies in minimal builds. The nightly sweep adds each
+# feature to aws-lc-rs; tokio-features checks provider-free transports, standalone
+# providers, and the intentional refusal of rustls QUIC without a provider.
 #
 # Both carry `--all-targets`. A `#[cfg(test)]` module leans on whatever the
 # default features happened to import, so a test that only compiles by accident
@@ -499,9 +710,20 @@ audit:
 # Compile the workspace at the feature extremes.
 features:
     cargo check --locked --workspace {{ no_fuzz }} --all-targets --no-default-features
+    cargo hack check --locked -p moq-tokio --each-feature --features aws-lc-rs
+    cargo check --locked -p moq-relay --no-default-features
+    just rs relay-minimal
+    cargo check --locked -p moq-cli --no-default-features
+    cargo check --locked -p moq-bench --no-default-features
+    cargo check --locked -p moq-boy --no-default-features
     cargo clippy --locked --workspace {{ no_fuzz }} --all-targets --all-features -- -D warnings
     RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace {{ no_fuzz }} --all-features --no-deps
     cargo nextest run --locked --workspace {{ no_fuzz }} --all-targets --all-features
+
+# Compile the media crates at supported feature boundaries and prove expensive
+# native/render dependencies are absent when their features are excluded.
+media-features:
+    rs/scripts/media-features.sh
 
 # nextest, not `cargo test`, so a wedged test is killed instead of pinning a core
 # until someone notices (`.config/nextest.toml` sets the timeout). The trade is
@@ -536,6 +758,22 @@ features:
 test *args:
     RUSTC_WORKSPACE_WRAPPER="$(command -v clippy-driver || true)" cargo nextest run --locked --all-targets {{ args }}
 
+# Exercise the Vulkan producer -> CUDA image contract, the GPU color conversion
+# and resize, and NVENC encoding of the result on Linux/NVIDIA hardware. The
+# driver directory is added explicitly because the Nix shell's dynamic loader
+# path does not include Ubuntu's host driver directory.
+vulkan-cuda:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    driver=$(/usr/sbin/ldconfig -p | awk '/libcuda\.so\.1/{print $NF; exit}')
+    if [[ -z "$driver" ]]; then
+        echo "libcuda.so.1 is not installed" >&2
+        exit 1
+    fi
+    driver_dir=$(dirname "$driver")
+    export LD_LIBRARY_PATH="$driver_dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    cargo nextest run --locked -p moq-video --run-ignored only -E 'test(/^frame::(vulkan|cuda)::tests::vulkan_cuda_/)'
+
 # Same selection as `check-changed`: compiling a crate's test binaries is the
 # expensive half of a test run, so scoping matters more here than anywhere else.
 #
@@ -554,6 +792,10 @@ test-changed $FILES:
     	ALL)   just rs test --workspace {{ no_fuzz }} ;;
     	*)     echo "rs: testing $(just rs _names "$packages")"; just rs test --no-tests=pass $packages ;;
     esac
+
+    if [[ "$packages" == "ALL" ]] || just rs _names "$packages" | grep -qw moq-relay; then
+        just rs relay-minimal
+    fi
 
 # Compile and run the `/// ```` examples, which nextest skips.
 doctest *args:
@@ -626,7 +868,32 @@ build:
 # Run a moq-bench preset against a relay, e.g. `just rs bench chat https://relay.example.com`.
 # Extra args pass through, so `--connections 500 --output stats.jsonl` work as-is.
 bench preset url *args:
-    cargo run --release -p moq-bench -- --file 'rs/moq-bench/config/{{ preset }}.toml' --client-connect '{{ url }}' {{ args }}
+    cargo run --release -p moq-bench -- --file 'rs/moq-bench/config/{{ preset }}.toml' --connect '{{ url }}' {{ args }}
+
+# Measure the Linux Tokio/epoll UDP syscall path. Extra args pass to Criterion,
+# e.g. `just rs bench-udp-tokio --quick`.
+bench-udp-tokio *args:
+    cargo bench -p moq-uring --bench udp_tokio -- {{ args }}
+
+# Measure the Linux io_uring UDP completion path with multishot recvmsg.
+bench-udp-uring *args:
+    cargo bench -p moq-uring --bench udp_uring -- {{ args }}
+
+# Run the comparable epoll and io_uring UDP matrices.
+bench-udp *args:
+    cargo bench -p moq-uring --bench udp_tokio -- {{ args }}
+    cargo bench -p moq-uring --bench udp_uring -- {{ args }}
+
+# Measure a noq echo through the io_uring worker, ablating receive
+# batching, GRO, and GSO one at a time. Linux 6.12+ (skips loudly otherwise).
+bench-echo *args:
+    cargo bench -p moq-uring --bench echo_noq -- {{ args }}
+
+# Measure a full moq-lite session (publisher to subscriber) through the
+# io_uring worker, same ablations and per-iteration unit as bench-echo.
+# Linux 6.12+ (skips loudly otherwise).
+bench-session *args:
+    cargo bench -p moq-uring --bench session_lite -- {{ args }}
 
 # Sample a process's CPU/memory/context switches on this host (run it where the
 # relay runs; it only reads /proc). E.g. `just rs bench-host --name moq-relay`.
@@ -669,8 +936,7 @@ package crate packager:
     case "{{ crate }}" in
     	moq-relay)      bin=moq-relay  ;;
     	moq-cli)        bin=moq        ;;
-        moq-token-cli)  bin=moq-token  ;;
-    	*) echo "Unknown crate: {{ crate }} (use moq-relay, moq-cli, or moq-token-cli)" >&2; exit 1 ;;
+    	*) echo "Unknown crate: {{ crate }} (use moq-relay or moq-cli)" >&2; exit 1 ;;
     esac
     case "{{ packager }}" in
     	deb)

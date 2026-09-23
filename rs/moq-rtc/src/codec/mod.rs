@@ -44,6 +44,12 @@ pub struct Frame {
 pub trait Bridge: Send {
 	fn push(&mut self, frame: Frame) -> Result<()>;
 
+	/// Re-evaluate stall from source silence. Video bridges mark a quiet
+	/// rendition stalled; audio is a no-op.
+	fn tick(&mut self) -> Result<()> {
+		Ok(())
+	}
+
 	/// Abort the published track with `err` so subscribers see the real cause
 	/// (the peer disconnected, an ICE failure) rather than a bare `Error::Dropped`.
 	///
@@ -59,6 +65,9 @@ pub(crate) trait DeferredImport: Send + Sized {
 	/// Decode one complete codec frame.
 	fn decode(&mut self, frame: Bytes, pts: moq_net::Timestamp) -> moq_mux::Result<()>;
 
+	/// Re-evaluate stall from source silence.
+	fn tick(&mut self) -> moq_mux::Result<()>;
+
 	/// Abort the active media track.
 	fn abort(self, err: moq_net::Error);
 }
@@ -70,6 +79,10 @@ impl DeferredImport for moq_mux::codec::vp8::Import {
 
 	fn decode(&mut self, frame: Bytes, pts: moq_net::Timestamp) -> moq_mux::Result<()> {
 		moq_mux::codec::vp8::Import::decode(self, frame, Some(pts))
+	}
+
+	fn tick(&mut self) -> moq_mux::Result<()> {
+		moq_mux::codec::vp8::Import::tick(self)
 	}
 
 	fn abort(self, err: moq_net::Error) {
@@ -84,6 +97,10 @@ impl DeferredImport for moq_mux::codec::vp9::Import {
 
 	fn decode(&mut self, frame: Bytes, pts: moq_net::Timestamp) -> moq_mux::Result<()> {
 		moq_mux::codec::vp9::Import::decode(self, frame, Some(pts))
+	}
+
+	fn tick(&mut self) -> moq_mux::Result<()> {
+		moq_mux::codec::vp9::Import::tick(self)
 	}
 
 	fn abort(self, err: moq_net::Error) {
@@ -111,11 +128,11 @@ pub(crate) struct DeferredVideo<I> {
 impl<I: DeferredImport> DeferredVideo<I> {
 	/// Create the media track without gating the initial catalog snapshot.
 	pub fn new(
-		mut broadcast: moq_net::broadcast::Producer,
+		broadcast: moq_net::broadcast::Producer,
 		catalog: moq_mux::catalog::Producer,
 		suffix: &str,
 	) -> Result<Self> {
-		let track = broadcast.unique_track(suffix, catalog.track_info())?;
+		let track = broadcast.unique_track(suffix, catalog.track_info(hang::catalog::PRIORITY.video))?;
 		Ok(Self {
 			state: DeferredState::Pending(Box::new(PendingVideo { track, catalog })),
 		})
@@ -128,9 +145,7 @@ impl<I: DeferredImport> DeferredVideo<I> {
 		}
 
 		let DeferredState::Pending(pending) = std::mem::replace(&mut self.state, DeferredState::Poisoned) else {
-			return Err(crate::Error::Other(anyhow::anyhow!(
-				"video bridge initialization already failed"
-			)));
+			return Err(crate::Error::BridgeFailed);
 		};
 		let reserved = pending.catalog.reserve();
 		let abort = pending.track.clone();
@@ -146,6 +161,15 @@ impl<I: DeferredImport> DeferredVideo<I> {
 			unreachable!();
 		};
 		import.decode(frame, pts).map_err(Into::into)
+	}
+
+	/// Re-evaluate stall from source silence once the importer exists.
+	pub fn tick(&mut self) -> Result<()> {
+		if let DeferredState::Active(import) = &mut self.state {
+			import.tick().map_err(Into::into)
+		} else {
+			Ok(())
+		}
 	}
 
 	/// Abort the media track in either lifecycle state.
@@ -202,7 +226,7 @@ enum TrackConvert {
 impl Track {
 	/// Audio track for an Opus rendition, from a subscribed `track`.
 	pub fn opus(track: moq_net::track::Subscriber) -> Self {
-		let container = moq_mux::catalog::hang::Container::Legacy;
+		let container = moq_mux::catalog::hang::Container::Legacy(moq_mux::container::Kind::Audio);
 		let consumer = moq_mux::container::Consumer::new(track, container);
 		Self {
 			consumer,
@@ -214,7 +238,7 @@ impl Track {
 	/// `config.codec`; for H.264 / H.265 the bitstream shape (inline vs out-of-band
 	/// parameter sets) is inferred from `config.description` (avc1/hvc1 vs avc3/hev1).
 	pub fn video(track: moq_net::track::Subscriber, config: &VideoConfig) -> Result<Self> {
-		let container: moq_mux::catalog::hang::Container = (&config.container).try_into()?;
+		let container: moq_mux::catalog::hang::Container = config.try_into()?;
 		let consumer = moq_mux::container::Consumer::new(track, container);
 
 		let convert = match &config.codec {
@@ -243,7 +267,7 @@ impl Track {
 				} => {
 					let prefix = frame.keyframe.then(|| keyframe_prefix.as_ref());
 					moq_mux::codec::annexb::from_length_prefixed(&frame.payload, *length_size, prefix)
-						.map_err(|err| crate::Error::Other(anyhow::anyhow!("annexb: {err}")))?
+						.map_err(moq_mux::Error::from)?
 				}
 			};
 			if payload.is_empty() {
@@ -266,17 +290,17 @@ fn h264_convert(config: &VideoConfig) -> Result<TrackConvert> {
 	let Some(avcc) = config.description.as_ref().filter(|d| !d.is_empty()) else {
 		return Ok(TrackConvert::Passthrough);
 	};
-	let params = moq_mux::codec::h264::Avcc::parse(avcc)
-		.map_err(|err| crate::Error::Other(anyhow::anyhow!("avcc parse: {err}")))?;
+	let params = moq_mux::codec::h264::Avcc::parse(avcc).map_err(moq_mux::Error::from)?;
 	// Without SPS+PPS the keyframe prefix would be empty and every keyframe
 	// would reach the peer without inline parameter sets, i.e. undecodable.
 	// Fail loudly instead, matching moq-mux's `h264::Export`.
 	if params.sps.is_empty() || params.pps.is_empty() {
-		return Err(crate::Error::Other(anyhow::anyhow!(
-			"avc1 avcC is missing parameter sets (sps={}, pps={})",
-			params.sps.len(),
-			params.pps.len()
-		)));
+		return Err(moq_mux::Error::H264(moq_mux::codec::h264::Error::MissingParamSets {
+			name: "WebRTC rendition".to_string(),
+			sps: params.sps.len(),
+			pps: params.pps.len(),
+		})
+		.into());
 	}
 	let keyframe_prefix = moq_mux::codec::annexb::build_prefix(params.sps.iter().chain(params.pps.iter()));
 	Ok(TrackConvert::LengthPrefixed {
@@ -294,17 +318,17 @@ fn h265_convert(config: &VideoConfig) -> Result<TrackConvert> {
 	let Some(hvcc) = config.description.as_ref().filter(|d| !d.is_empty()) else {
 		return Ok(TrackConvert::Passthrough);
 	};
-	let params = moq_mux::codec::h265::Hvcc::parse(hvcc)
-		.map_err(|err| crate::Error::Other(anyhow::anyhow!("hvcc parse: {err}")))?;
+	let params = moq_mux::codec::h265::Hvcc::parse(hvcc).map_err(moq_mux::Error::from)?;
 	// Same reasoning as `h264_convert`: a keyframe with no inline VPS/SPS/PPS
 	// is undecodable, so reject an hvcC that omits any of them.
 	if params.vps.is_empty() || params.sps.is_empty() || params.pps.is_empty() {
-		return Err(crate::Error::Other(anyhow::anyhow!(
-			"hvc1 hvcC is missing parameter sets (vps={}, sps={}, pps={})",
-			params.vps.len(),
-			params.sps.len(),
-			params.pps.len()
-		)));
+		return Err(moq_mux::Error::H265(moq_mux::codec::h265::Error::MissingParamSets {
+			name: "WebRTC rendition".to_string(),
+			vps: params.vps.len(),
+			sps: params.sps.len(),
+			pps: params.pps.len(),
+		})
+		.into());
 	}
 	let keyframe_prefix =
 		moq_mux::codec::annexb::build_prefix(params.vps.iter().chain(params.sps.iter()).chain(params.pps.iter()));

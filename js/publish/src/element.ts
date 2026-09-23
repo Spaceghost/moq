@@ -6,17 +6,15 @@
  * @module
  */
 import * as Moq from "@moq/net";
-import { Effect, Signal } from "@moq/signals";
+import { Effect, readonlys, Signal } from "@moq/signals";
 import * as Audio from "./audio";
 import { Broadcast } from "./broadcast";
 import * as Preview from "./preview";
 import * as Source from "./source";
+import { clearSourceState } from "./source-state";
 import * as Video from "./video";
 
 const OBSERVED = ["url", "name", "muted", "invisible", "source", "preview", "announce"] as const;
-
-/** How often the encoder's bitrate cap resamples the transport's send estimate. */
-const BANDWIDTH_POLL = 100; // ms
 type Observed = (typeof OBSERVED)[number];
 
 /** The built-in capture sources selectable via the `source` attribute. */
@@ -82,12 +80,17 @@ export default class MoqPublish extends HTMLElement {
 		invisible: new Signal(false),
 		// What a <canvas> preview renders: the raw capture, or a decoded copy of the encoded video.
 		preview: new Signal<Preview.Mode>("source"),
-		// When to announce/publish the broadcast: always, never, or only once a source is selected.
+		// When to advertise the broadcast: always, never, or only once a source is live.
 		announce: new Signal<AnnounceMode>("source"),
 	};
 
-	connection: Moq.Connection.Reload;
-	capture: Video.Capture;
+	/**
+	 * The relay connection, shared with every other element on the page pointing at the
+	 * same URL. The broadcast publishes into its `origin`, so a `<moq-watch>` on the same
+	 * page and URL resolves it locally with no round trip.
+	 */
+	connection: Moq.Connection;
+	#capture: Video.Capture;
 	broadcast: Broadcast;
 
 	// The single video and audio encoders. For multiple renditions (e.g. simulcast), drop the element
@@ -98,14 +101,15 @@ export default class MoqPublish extends HTMLElement {
 
 	// The selected input sources: the Camera/Screen, Microphone/Screen, and File holders driving capture.
 	// Read by the UI (device pickers) and written by #runSource.
-	sources = {
+	readonly #sources = {
 		video: new Signal<Source.Camera | Source.Screen | undefined>(undefined),
 		audio: new Signal<Source.Microphone | Source.Screen | undefined>(undefined),
 		file: new Signal<Source.File | undefined>(undefined),
 	};
+	readonly sources = readonlys(this.#sources);
 
-	// The captured media tracks, written by #runSource. Fed to `capture` (video) and the `audio` encoder,
-	// so consumers read them back via `capture.in.source` and `audio.in.source` rather than here.
+	// The captured media tracks, written by #runSource. Fed to the video and audio captures, so
+	// consumers read them back via `video.capture` / `audio.capture` rather than here.
 	#videoSource = new Signal<Video.Source | undefined>(undefined);
 	#audioSource = new Signal<Audio.Source | undefined>(undefined);
 
@@ -114,9 +118,6 @@ export default class MoqPublish extends HTMLElement {
 
 	// Whether to flip the video horizontally on playback. No attribute yet.
 	#flip = new Signal(false);
-
-	// The estimated send bandwidth (bits/sec), the encoder's bitrate cap.
-	#bandwidth = new Signal<number | undefined>(undefined);
 
 	// The preview element, either a <video> (raw source via srcObject) or a <canvas> (rendered frames).
 	#preview = new Signal<HTMLVideoElement | HTMLCanvasElement | undefined>(undefined);
@@ -129,8 +130,8 @@ export default class MoqPublish extends HTMLElement {
 	// Set when the element is connected to the DOM.
 	#enabled = new Signal(false);
 
-	// Whether to actually publish the broadcast: connected to the DOM and allowed by the `announce` mode.
-	#publishEnabled = new Signal(false);
+	// Whether to advertise the broadcast, driven by the `announce` mode.
+	#announcing = new Signal(false);
 
 	/**
 	 * Effects scoped to this element's lifetime, closed on disconnect.
@@ -145,7 +146,7 @@ export default class MoqPublish extends HTMLElement {
 
 		cleanup.register(this, this.signals);
 
-		this.connection = new Moq.Connection.Reload({
+		this.connection = new Moq.Connection({
 			enabled: this.#enabled,
 		});
 		this.signals.cleanup(() => this.connection.close());
@@ -165,68 +166,48 @@ export default class MoqPublish extends HTMLElement {
 		});
 
 		this.signals.run((effect) => {
-			const enabled = effect.get(this.#enabled);
 			const announce = effect.get(this.controls.announce);
 			// "source" waits until media is actually being captured -- a live audio or
 			// video track exists -- not merely a source *type* selected. Otherwise we'd
 			// announce an empty broadcast while the getUserMedia/getDisplayMedia
 			// permission prompt is still pending (or after the user denies it).
 			const hasMedia = effect.get(this.#videoSource) !== undefined || effect.get(this.#audioSource) !== undefined;
-			const announcing = announce === "always" || (announce === "source" && hasMedia);
-			this.#publishEnabled.set(enabled && announcing);
+			this.#announcing.set(announce === "always" || (announce === "source" && hasMedia));
 		});
 
-		// Track the connection's send bandwidth estimate, the encoder's bitrate cap. The
-		// transport has no event for it, so sample on our own schedule and skip a tick
-		// while the previous snapshot is outstanding.
-		this.signals.run((effect) => {
-			const connection = effect.get(this.connection.established);
-			effect.set(this.#bandwidth, undefined);
-			if (!connection) return;
+		this.#capture = new Video.Capture({ source: this.#videoSource });
+		this.signals.cleanup(() => this.#capture.close());
 
-			let pending = false;
-			const sample = async () => {
-				if (pending) return;
-				pending = true;
-				try {
-					// A snapshot that lands after this run was torn down describes a
-					// connection we no longer have, so drop it rather than capping the
-					// encoder at a dead peer's estimate.
-					const stats = await Promise.race([effect.cancel, connection.stats()]);
-					if (stats) this.#bandwidth.set(stats.estimatedSendRate);
-				} finally {
-					pending = false;
-				}
-			};
-
-			void sample();
-			effect.interval(sample, BANDWIDTH_POLL);
+		// Reached as `audio.capture` rather than a field of its own, so audio and video read alike.
+		const audioCapture = new Audio.Capture({
+			source: this.#audioSource,
+			enabled: this.#audioEnabled,
 		});
-
-		this.capture = new Video.Capture({ source: this.#videoSource });
-		this.signals.cleanup(() => this.capture.close());
+		this.signals.cleanup(() => audioCapture.close());
 
 		this.broadcast = new Broadcast({
-			connection: this.connection.established,
-			enabled: this.#publishEnabled,
+			origin: this.connection.origin,
+			enabled: this.#enabled,
+			announce: this.#announcing,
 			name: this.#name,
-			display: this.capture.out.display,
+			display: this.#capture.out.display,
 			flip: this.#flip,
 		});
 		this.signals.cleanup(() => this.broadcast.close());
 
 		this.video = new Video.Encoder("video", {
 			broadcast: this.broadcast,
-			capture: this.capture,
+			capture: this.#capture,
 			enabled: this.#videoEnabled,
-			bandwidth: this.#bandwidth,
+			bandwidth: this.connection.bandwidth,
 		});
 		this.signals.cleanup(() => this.video.close());
 
 		this.audio = new Audio.Encoder("audio", {
 			broadcast: this.broadcast,
 			enabled: this.#audioEnabled,
-			source: this.#audioSource,
+			capture: audioCapture,
+			bandwidth: this.connection.bandwidth,
 		});
 		this.signals.cleanup(() => this.audio.close());
 
@@ -247,8 +228,8 @@ export default class MoqPublish extends HTMLElement {
 			if (preview instanceof HTMLCanvasElement) {
 				const renderer = new Preview.Renderer({
 					canvas: preview,
-					frame: this.capture.out.frame,
-					display: this.capture.out.display,
+					frames: this.#capture.out.frames,
+					display: this.#capture.out.display,
 					flip: this.#flip,
 					encoder: this.video,
 					mode: this.controls.preview,
@@ -270,7 +251,15 @@ export default class MoqPublish extends HTMLElement {
 				return;
 			}
 
-			preview.srcObject = new MediaStream([source]);
+			// srcObject only takes a MediaStream, so a source that hands us frames directly (a
+			// decoded file, an image) has nothing to show here. A <canvas> renders those.
+			if ("frames" in source) {
+				preview.style.display = "none";
+				console.warn("moq-publish: this source needs a <canvas> preview; a <video> can't show it.");
+				return;
+			}
+
+			preview.srcObject = new MediaStream([Video.normalizeSource(source).track]);
 			preview.style.display = "block";
 
 			effect.cleanup(() => {
@@ -322,23 +311,27 @@ export default class MoqPublish extends HTMLElement {
 
 	#runSource(effect: Effect) {
 		const source = effect.get(this.controls.source);
+
+		// Every selection owns the complete source state. Explicitly clear every inactive slot so a
+		// switch cannot leave a holder or captured track from the previous selection observable.
+		clearSourceState(effect, {
+			holders: this.#sources,
+			video: this.#videoSource,
+			audio: this.#audioSource,
+		});
+
 		if (!source) return;
 
 		if (source === "camera") {
 			const video = new Source.Camera({ enabled: this.#videoEnabled });
-			this.signals.run((effect) => {
-				const source = effect.get(video.out.source);
-				this.#videoSource.set(source);
-			});
-
 			const audio = new Source.Microphone({ enabled: this.#audioEnabled });
-			this.signals.run((effect) => {
-				const source = effect.get(audio.out.source);
-				this.#audioSource.set(source);
-			});
 
-			effect.set(this.sources.video, video);
-			effect.set(this.sources.audio, audio);
+			effect.set(this.#sources.video, video);
+			effect.set(this.#sources.audio, audio);
+			effect.run((nested) => {
+				nested.set(this.#videoSource, nested.get(video.out.source)?.video);
+				nested.set(this.#audioSource, nested.get(audio.out.source)?.audio);
+			});
 
 			effect.cleanup(() => {
 				video.close();
@@ -353,16 +346,14 @@ export default class MoqPublish extends HTMLElement {
 				enabled: this.#eitherEnabled,
 			});
 
-			this.signals.run((effect) => {
-				const source = effect.get(screen.out.source);
-				if (!source) return;
-
-				effect.set(this.#videoSource, source.video);
-				effect.set(this.#audioSource, source.audio);
+			effect.run((nested) => {
+				const media = nested.get(screen.out.source);
+				nested.set(this.#videoSource, media?.video);
+				nested.set(this.#audioSource, media?.audio);
 			});
 
-			effect.set(this.sources.video, screen);
-			effect.set(this.sources.audio, screen);
+			effect.set(this.#sources.video, screen);
+			effect.set(this.#sources.audio, screen);
 
 			effect.cleanup(() => {
 				screen.close();
@@ -384,12 +375,12 @@ export default class MoqPublish extends HTMLElement {
 				fileSource.prompt();
 			}
 
-			effect.set(this.sources.file, fileSource);
+			effect.set(this.#sources.file, fileSource);
 
-			this.signals.run((effect) => {
-				const source = effect.get(fileSource.out.source);
-				this.#videoSource.set(source.video);
-				this.#audioSource.set(source.audio);
+			effect.run((nested) => {
+				const media = nested.get(fileSource.out.source);
+				nested.set(this.#videoSource, media?.video);
+				nested.set(this.#audioSource, media?.audio);
 			});
 
 			effect.cleanup(() => {

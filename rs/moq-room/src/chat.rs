@@ -2,13 +2,14 @@
 //! Sender identity comes from the broadcast, not the payload.
 
 use crate::Error;
-use kio::time::{Deadline, Instant};
 use moq_net::{broadcast, track};
 use std::{
 	collections::VecDeque,
+	pin::Pin,
 	task::{Poll, ready},
 	time::Duration,
 };
+use web_async::time::Instant;
 
 /// Name of the track carrying the chat window.
 pub const TRACK: &str = "chat";
@@ -19,9 +20,43 @@ pub const HISTORY: Duration = Duration::from_secs(10);
 /// A message entering, leaving, or missed from the window.
 pub type Event = moq_json::window::Event<String>;
 
+/// Poll-driven wall-clock deadline, the same shape kio::time used before that
+/// module left kio. Built on web-async so tokio::time::pause advances it in tests.
+struct Deadline {
+	at: Option<Instant>,
+	sleep: Option<Pin<Box<web_async::time::Sleep>>>,
+}
+
+impl Deadline {
+	fn new() -> Self {
+		Self { at: None, sleep: None }
+	}
+
+	fn set(&mut self, at: Option<Instant>) {
+		if self.at == at {
+			return;
+		}
+		self.at = at;
+		if let (Some(at), Some(sleep)) = (at, &mut self.sleep) {
+			sleep.as_mut().reset(at);
+		}
+	}
+
+	fn poll(&mut self, waiter: &kio::Waiter) -> Poll<()> {
+		let Some(at) = self.at else { return Poll::Pending };
+		let sleep = self
+			.sleep
+			.get_or_insert_with(|| Box::pin(web_async::time::sleep_until(at)));
+		if sleep.is_elapsed() {
+			return Poll::Ready(());
+		}
+		waiter.poll_future(sleep.as_mut())
+	}
+}
+
 /// Track settings for the latest chat window.
 pub fn info() -> track::Info {
-	track::Info::default().with_priority(PRIORITY).with_ordered(false)
+	track::Info::default().with_priority(PRIORITY)
 }
 
 /// Publishes chat messages; drive `poll_expire` or `expire` to retire them while idle.
@@ -84,7 +119,7 @@ impl Publisher {
 	}
 
 	/// Finish the track, preserving the final retained window for current readers.
-	pub fn finish(self) -> Result<(), Error> {
+	pub fn finish(mut self) -> Result<(), Error> {
 		Ok(self.producer.finish()?)
 	}
 }
@@ -103,7 +138,7 @@ impl Subscriber {
 	/// Read window changes from an existing subscription.
 	pub fn new(mut track: track::Subscriber) -> Self {
 		if let Some(latest) = track.latest() {
-			track.start_at(latest);
+			track.set_groups(latest..);
 		}
 		Self {
 			consumer: moq_json::window::Consumer::new(track, Default::default()),
@@ -156,7 +191,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn rejects_malformed_records() {
-		let mut broadcast = broadcast::Info::new().produce();
+		let broadcast = broadcast::Info::new().produce();
 		let mut track = broadcast.create_track(TRACK, info()).unwrap();
 		let mut subscriber = Subscriber::subscribe(&broadcast.consume()).await.unwrap();
 		track

@@ -32,7 +32,7 @@
 //!   a [`Publish`] into an origin, or accept a [`Play`] out of one, at a path of
 //!   your choosing (or reject it). This is how an embedder (e.g. a relay verifying
 //!   a JWT and scoping the origin per token) plugs its policy in, with no
-//!   callback. It mirrors `moq-native`'s `Server` / `Request`.
+//!   callback. It mirrors `moq-tokio`'s `Server` / `Request`.
 //!
 //! Beyond the listener, [`Client`] is the *dial-out* (client) role: connect to a
 //! remote RTMP server and either [`publish`](Client::publish) a MoQ broadcast to
@@ -80,8 +80,9 @@ mod server;
 /// bounds buffering rather than the wire rate. Zero would drop stale groups the
 /// instant a newer one arrives, which is too aggressive for RTMP's typical jitter,
 /// so the default holds a couple of seconds. Override per request with
-/// [`Play::with_latency`] / [`Client::with_latency`] or via [`Config::latency`].
-pub const DEFAULT_LATENCY: Duration = Duration::from_secs(2);
+/// [`Play::with_max_age`] / [`Client::with_export_max_age`] or via
+/// [`Config::export_max_age`].
+pub const DEFAULT_MAX_AGE: Duration = Duration::from_secs(2);
 
 pub use dial::Client;
 pub use error::{Error, Result};

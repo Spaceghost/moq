@@ -5,10 +5,10 @@
 //! Without it a Pi either republishes what `rpicam-vid` already encoded or
 //! spends its CPU on openh264.
 //!
-//! Behind the opt-in `v4l2` feature. It costs no runtime dependency (the
-//! interface is ioctls on a device node), only the `v4l` crate's build-time
-//! bindgen, and a host with no M2M node fails at open so automatic selection
-//! falls through to the next encoder.
+//! Behind the opt-in `v4l2` feature. It costs nothing at build or run time (the
+//! interface is ioctls on a device node and `moq_v4l` checks its bindings in),
+//! and a host with no M2M node fails at open so automatic selection falls
+//! through to the next encoder.
 //!
 //! Feeds the driver 8-bit 4:2:0 and takes back Annex-B with in-band SPS/PPS
 //! ahead of every IDR, which is the avc3 shape the H.264 importer expects.
@@ -39,7 +39,7 @@ use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
 use moq_net::Timestamp;
-use v4l::v4l_sys::{
+use moq_v4l::sys::{
 	V4L2_CID_MPEG_VIDEO_BITRATE, V4L2_CID_MPEG_VIDEO_BITRATE_MODE, V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME,
 	V4L2_CID_MPEG_VIDEO_GOP_SIZE, V4L2_CID_MPEG_VIDEO_H264_LEVEL, V4L2_CID_MPEG_VIDEO_H264_PROFILE,
 	V4L2_CID_MPEG_VIDEO_HEADER_MODE, V4L2_CID_MPEG_VIDEO_PREPEND_SPSPPS_TO_IDR, V4L2_CID_MPEG_VIDEO_REPEAT_SEQ_HEADER,
@@ -63,7 +63,7 @@ use v4l::v4l_sys::{
 	v4l2_mpeg_video_header_mode_V4L2_MPEG_VIDEO_HEADER_MODE_JOINED_WITH_1ST_FRAME,
 };
 
-use super::super::encoder::Config;
+use super::super::encoder::{Config, Gop};
 use super::{Backend, Encoded};
 use crate::v4l2::{self, Dequeue, Device, Dir, Planes, Queue, Rect, Request, Role};
 use crate::{Error, Frame, Size};
@@ -123,10 +123,10 @@ pub(crate) struct V4l2 {
 	/// refuses one, after which a flush can only take what the codec has already
 	/// finished.
 	drainable: bool,
-	/// Whether the driver takes `V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME`. Cleared
-	/// the first time it refuses one, which is worth saying once and not per
-	/// keyframe.
-	keyframes: bool,
+	/// Whether the driver has `V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME`, asked at
+	/// open so a cut on a driver without it is refused up front rather than
+	/// discovered on the frame it was meant for.
+	cuts: bool,
 }
 
 impl V4l2 {
@@ -144,8 +144,9 @@ impl V4l2 {
 			v4l2_mpeg_video_h264_profile_V4L2_MPEG_VIDEO_H264_PROFILE_CONSTRAINED_BASELINE as i32,
 		)?;
 		device.set_control(V4L2_CID_MPEG_VIDEO_H264_LEVEL, h264_level(config)?)?;
-		device.set_control(V4L2_CID_MPEG_VIDEO_GOP_SIZE, config.gop as i32)?;
-		set_bitrate(&device, config.resolved_bitrate())?;
+		let Gop::Keyframe { interval } = config.gop;
+		device.set_control(V4L2_CID_MPEG_VIDEO_GOP_SIZE, interval.min(i32::MAX as u32) as i32)?;
+		set_bitrate(&device, config.resolved_bitrate().as_bps())?;
 		// Constant rate is what a live uplink wants: the congestion controller
 		// already owns the rate, and a variable-rate encoder would spend it on the
 		// wrong frames.
@@ -176,6 +177,18 @@ impl V4l2 {
 				encoder = NAME,
 				device = %device.path().display(),
 				"driver repeats no parameter sets; subscribers can only join at the first keyframe"
+			);
+		}
+
+		// A driver without the control keeps to `V4L2_CID_MPEG_VIDEO_GOP_SIZE`
+		// alone, so every group falls on its boundary rather than the caller's.
+		// Said once here; each refused cut then names the backend in its error.
+		let cuts = device.has_control(V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME);
+		if !cuts {
+			tracing::info!(
+				encoder = NAME,
+				device = %device.path().display(),
+				"driver takes no keyframe request; cuts are refused and groups fall on the GOP boundary"
 			);
 		}
 
@@ -240,7 +253,7 @@ impl V4l2 {
 			size,
 			pending: Pending::default(),
 			drainable: true,
-			keyframes: true,
+			cuts,
 		}))
 	}
 
@@ -447,7 +460,7 @@ impl V4l2 {
 }
 
 impl Backend for V4l2 {
-	fn encode(&mut self, frame: &Frame, keyframe: bool) -> Result<Vec<Encoded>, Error> {
+	fn encode(&mut self, frame: &Frame, cut: bool) -> Result<Vec<Encoded>, Error> {
 		if frame.size() != self.size {
 			return Err(Error::Codec(anyhow::anyhow!(
 				"V4L2 encoder opened for {} was given a {} frame",
@@ -456,29 +469,27 @@ impl Backend for V4l2 {
 			)));
 		}
 
+		if cut {
+			// A button control: the value is ignored, the write is the request. It
+			// applies to the next frame queued, so it goes in ahead of this one, and
+			// before a raw buffer is taken so a refusal strands none. Open already
+			// asked whether the driver has the control, so a refusal here is the
+			// driver going back on its word, which is an error rather than a
+			// quietly mislaid group boundary.
+			self.device
+				.set_control(V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME, 0)
+				.map_err(|err| {
+					Error::Codec(anyhow::anyhow!(
+						"driver refused the keyframe request it advertised: {err}"
+					))
+				})?;
+		}
+
 		let i420 = frame.surface.to_i420()?;
 		// Also reclaims finished input buffers, so the codec is drained even when
 		// the caller never asks for output.
 		let index = self.free_buffer()?;
 		self.planes.write(&mut self.raw, index, &i420)?;
-
-		if keyframe && self.keyframes {
-			// A button control: the value is ignored, the write is the request. It
-			// applies to the next frame queued, so it goes in immediately before.
-			//
-			// Best-effort: a driver that answers `EINVAL` still keeps to
-			// `V4L2_CID_MPEG_VIDEO_GOP_SIZE`, so keyframes land on its own boundary
-			// rather than the caller's, which is a worse group layout and not a
-			// broken stream.
-			self.keyframes = self.device.try_control(V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME, 0);
-			if !self.keyframes {
-				tracing::warn!(
-					encoder = NAME,
-					device = %self.device.path().display(),
-					"driver takes no keyframe request; groups fall on the encoder's own GOP boundary"
-				);
-			}
-		}
 
 		let key = key(frame.timestamp);
 		let bytesused: Vec<u32> = self.raw.format().planes.iter().map(|plane| plane.sizeimage).collect();
@@ -513,7 +524,11 @@ impl Backend for V4l2 {
 		})
 	}
 
-	fn name(&self) -> &str {
+	fn can_cut(&self) -> bool {
+		self.cuts
+	}
+
+	fn name(&self) -> &'static str {
 		NAME
 	}
 }
@@ -828,8 +843,9 @@ const LEVELS: &[Level] = &[
 fn h264_level(config: &Config) -> Result<i32, Error> {
 	let size = config.size();
 	let per_frame = size.width.div_ceil(16) * size.height.div_ceil(16);
-	let per_second = per_frame as u64 * config.framerate as u64;
-	let kbps = config.resolved_bitrate().div_ceil(1_000);
+	let per_second = (u64::from(per_frame) * u64::from(config.framerate.numerator()))
+		.div_ceil(u64::from(config.framerate.denominator()));
+	let kbps = config.resolved_bitrate().as_bps().div_ceil(1_000);
 	LEVELS
 		.iter()
 		.find(|level| {
@@ -877,7 +893,7 @@ mod tests {
 	use super::*;
 
 	fn config(width: u32, height: u32, framerate: u32) -> Config {
-		Config::new(width, height, framerate)
+		Config::new(width, height, crate::Rate::new(framerate, 1).unwrap())
 	}
 
 	fn micros(micros: u64) -> Timestamp {
@@ -916,9 +932,9 @@ mod tests {
 	#[test]
 	fn the_level_clears_the_bitrate() {
 		let mut config = config(1280, 720, 30);
-		config.bitrate = Some(14_000_000);
+		config.bitrate = Some(moq_net::bandwidth::Rate::from_bps(14_000_000));
 		assert_eq!(h264_level(&config).unwrap(), 9); // 3.1
-		config.bitrate = Some(14_000_001);
+		config.bitrate = Some(moq_net::bandwidth::Rate::from_bps(14_000_001));
 		assert_eq!(h264_level(&config).unwrap(), 10); // 3.2
 	}
 

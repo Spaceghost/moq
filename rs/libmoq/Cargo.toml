@@ -20,16 +20,17 @@ crate-type = ["staticlib"]
 anyhow = { workspace = true, features = ["backtrace"] }
 bytes = { workspace = true }
 hang = { workspace = true }
+kio = { workspace = true }
 # Codecs only: OBS and the other C consumers do their own device I/O.
 moq-audio = { workspace = true, features = ["aac"] }
 moq-json = { workspace = true }
 moq-mux = { workspace = true }
-moq-native = { workspace = true, default-features = true }
 moq-net = { workspace = true }
-# Enable the NVIDIA and VAAPI hardware codecs (default-off at the workspace
-# level). Both dlopen their driver at runtime; `vaapi` also runs bindgen at build
-# time, so building libmoq on Linux needs libclang (the dev shell carries it).
-moq-video = { workspace = true, features = ["nvidia", "vaapi"] }
+moq-tokio = { workspace = true, features = ["noq", "aws-lc-rs", "websocket", "tcp", "uds"] }
+# Select the OpenH264 fallback plus NVIDIA and VAAPI hardware codecs explicitly
+# because workspace defaults are off. The hardware backends dlopen their driver;
+# `vaapi` also runs bindgen, so Linux builds need libclang.
+moq-video = { workspace = true, features = ["nvidia", "openh264", "vaapi"] }
 # Blocking on `encode::Sink` from the synchronous C entry points; see
 # `video::block_on` for why not a tokio helper.
 pollster = { workspace = true }

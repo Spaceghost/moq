@@ -1,12 +1,13 @@
 import { type Getter, Signal } from "@moq/signals";
-import * as announce from "../announced.ts";
-import type * as broadcast from "../broadcast.ts";
+import type * as announce from "../announced.ts";
 import type { Established } from "../connection/established.ts";
 import { type Probe, type Stats, transportStats } from "../connection/stats.ts";
 import { type Transport, transportOf } from "../connection/transport.ts";
-import { ProtocolViolation } from "../error.ts";
-import * as Path from "../path.ts";
+import { error, fromClose, ProtocolViolation, StreamCode, StreamError } from "../error.ts";
+import type { Consumer as OriginConsumer } from "../origin.ts";
+import type * as Path from "../path.ts";
 import { type Reader, Readers, type Stream } from "../stream.ts";
+import { registerWire } from "../wire.ts";
 import { ControlStreamAdapter, NativeSession, type Session } from "./adapter.ts";
 import * as Cluster from "./cluster.ts";
 import { GoAway } from "./goaway.ts";
@@ -82,6 +83,7 @@ export class Connection implements Established {
 		version,
 		client,
 		discovery = true,
+		publish,
 		solicit,
 		cluster,
 	}: {
@@ -93,6 +95,8 @@ export class Connection implements Established {
 		/** Whether this peer initiated the session, selecting the even request-ID space. */
 		client: boolean;
 		discovery?: boolean;
+		/** The origin whose broadcasts are served to the peer. Omit to publish nothing. */
+		publish?: OriginConsumer;
 		/**
 		 * What the peer declared about being solicited. `undefined` means it declared
 		 * nothing, which is the one case where announcing at us unasked is not a bug.
@@ -128,12 +132,14 @@ export class Connection implements Established {
 		this.#publisher = new Publisher({
 			quic: this.#quic,
 			session: this.#session,
+			publish,
 			requiresSolicitation: solicit ?? false,
 			cluster,
 		});
 		this.#solicit = solicit;
 		this.#cluster = cluster;
 		this.#subscriber = new Subscriber({ session: this.#session, cluster });
+		registerWire(this, { consume: (path) => this.#subscriber.consume(path) });
 
 		void this.#run();
 	}
@@ -151,7 +157,6 @@ export class Connection implements Established {
 
 		this.#closed = true;
 
-		this.#publisher.close();
 		this.#session.close();
 
 		try {
@@ -173,45 +178,9 @@ export class Connection implements Established {
 		}
 	}
 
-	/**
-	 * Publishes a broadcast to the connection.
-	 * @param name - The broadcast path to publish
-	 * @param broadcast - The broadcast to publish
-	 */
-	publish(path: Path.Valid, producer: broadcast.Producer) {
-		this.#publisher.publish(path, producer);
-	}
-
-	/**
-	 * Gets an announced reader for the specified prefix.
-	 * @param prefix - The prefix for announcements
-	 * @returns An Announced instance
-	 */
-	announced(prefix = Path.empty()): announce.Consumer {
-		return this.#subscriber.announced(prefix);
-	}
-
-	/**
-	 * Consumes a broadcast from the connection.
-	 *
-	 * @remarks
-	 * If the broadcast is not found, a "not found" error will be thrown when requesting any tracks.
-	 *
-	 * @param broadcast - The path of the broadcast to consume
-	 * @returns A Broadcast instance
-	 */
-	consume(path: Path.Valid): broadcast.Consumer {
-		return this.#subscriber.consume(path);
-	}
-
-	/**
-	 * Watches a broadcast, live only while it is announced.
-	 *
-	 * @param path - The path of the broadcast to watch
-	 * @returns A reactive handle to the broadcast
-	 */
-	announcedBroadcast(path: Path.Valid): announce.Broadcast {
-		return new announce.Broadcast({ connection: this, path });
+	/** Gets an announced reader for `scope`; see {@link Established.announced}. */
+	announced(scope?: Path.Pattern): announce.Consumer {
+		return this.#subscriber.announced(scope);
 	}
 
 	/**
@@ -325,7 +294,7 @@ export class Connection implements Established {
 
 			this.#runUni(stream)
 				.then(() => {
-					stream.stop(new Error("cancel"));
+					stream.stop(new StreamError(StreamCode.Cancel, { message: "cancel" }));
 				})
 				.catch((err: unknown) => {
 					console.error("error processing object stream", err);
@@ -363,11 +332,8 @@ export class Connection implements Established {
 		}
 	}
 
-	/**
-	 * Returns a promise that resolves when the connection is closed.
-	 * @returns A promise that resolves when closed
-	 */
-	get closed(): Promise<void> {
-		return this.#quic.closed.then(() => undefined);
+	/** Resolves when the session closes, decoding the peer's close code; see {@link Established.closed}. */
+	get closed(): Promise<Error | null> {
+		return this.#quic.closed.then(fromClose, (err: unknown) => error(err));
 	}
 }

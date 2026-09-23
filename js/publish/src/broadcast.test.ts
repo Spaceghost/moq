@@ -1,13 +1,9 @@
 import { expect, test } from "bun:test";
 import * as Catalog from "@moq/hang/catalog";
 import * as Json from "@moq/json";
-import { type Connection, Path, Track } from "@moq/net";
+import { Origin, Path, Track } from "@moq/net";
 import { Effect } from "@moq/signals";
 import { Broadcast } from "./broadcast.ts";
-
-// The broadcast only opens its network producer once it has a connection, so tests that drive the
-// request loop hand it a stub whose publish() is a no-op; the internal producer is exposed via `net`.
-const stubConnection = () => ({ publish() {} }) as unknown as Connection.Established;
 
 // Effects and signal writes coalesce onto microtasks, so a chain of registration -> config -> catalog
 // needs a few flushes to settle.
@@ -21,7 +17,7 @@ async function readCatalog(broadcast: Broadcast): Promise<Catalog.Root | undefin
 	const effect = new Effect();
 	const track = new Track.Producer("catalog.json");
 	broadcast.catalog.serve(track, effect);
-	const catalog = await new Json.Snapshot.Consumer<Catalog.Root>(track.subscribe()).next();
+	const catalog = await new Json.Snapshot.Consumer<Catalog.Root>({ track: track.subscribe() }).next();
 	effect.close();
 	return catalog;
 }
@@ -107,15 +103,16 @@ test("rendition.close() unregisters the name and drops it from the catalog", asy
 	broadcast.close();
 });
 
-test("serving a subscription hands the producer to the rendition and clears it when the track closes", async () => {
-	const broadcast = new Broadcast({ enabled: true, connection: stubConnection(), name: Path.from("test.hang") });
+test("subscriber demand hands the producer to the rendition and clears it when the track closes", async () => {
+	const broadcast = new Broadcast({ enabled: true, origin: new Origin.Producer(), name: Path.from("test.hang") });
 	await settle();
 
 	const net = broadcast.net.peek();
 	if (!net) throw new Error("expected a network producer once connected");
 
 	const rendition = broadcast.video("video");
-	const subscriber = net.subscribe("video");
+	await settle();
+	const subscriber = net.track("video").subscribe();
 	await settle();
 
 	// The request loop accepted the subscription and handed the producer to the rendition.
@@ -132,17 +129,16 @@ test("serving a subscription hands the producer to the rendition and clears it w
 	broadcast.close();
 });
 
-test("serves the catalog through the request loop and releases the scope when the subscriber leaves", async () => {
-	const broadcast = new Broadcast({ enabled: true, connection: stubConnection(), name: Path.from("test.hang") });
+test("serves the catalog through a shared static track", async () => {
+	const broadcast = new Broadcast({ enabled: true, origin: new Origin.Producer(), name: Path.from("test.hang") });
 	broadcast.video("video").config.set(videoConfig);
 	await settle();
 
 	const net = broadcast.net.peek();
 	if (!net) throw new Error("expected a network producer once connected");
 
-	// Subscribing to the catalog track drives the per-subscription serving scope.
-	const subscriber = net.subscribe(Broadcast.CATALOG_TRACK);
-	const catalog = await new Json.Snapshot.Consumer<Catalog.Root>(subscriber).next();
+	const subscriber = net.track(Broadcast.CATALOG_TRACK).subscribe();
+	const catalog = await new Json.Snapshot.Consumer<Catalog.Root>({ track: subscriber }).next();
 	expect(catalog?.video?.renditions.video?.codec).toBe("avc1.640028");
 
 	// Dropping the subscriber closes the served track; the broadcast keeps running for the next viewer.
@@ -151,4 +147,38 @@ test("serves the catalog through the request loop and releases the scope when th
 	expect(broadcast.net.peek()).toBe(net);
 
 	broadcast.close();
+});
+
+test("keeps the current catalog snapshot for a reconnecting viewer", async () => {
+	const real = performance.now.bind(performance);
+	let now = real();
+	performance.now = () => now;
+
+	try {
+		const broadcast = new Broadcast({
+			enabled: true,
+			origin: new Origin.Producer(),
+			name: Path.from("test.hang"),
+		});
+		broadcast.video("video").config.set(videoConfig);
+		await settle();
+
+		const net = broadcast.net.peek();
+		if (!net) throw new Error("expected a network producer once connected");
+
+		const first = net.track(Broadcast.CATALOG_TRACK).subscribe();
+		expect((await new Json.Snapshot.Consumer<Catalog.Root>({ track: first }).next())?.video).toBeDefined();
+		first.close();
+
+		// The default track retention is five seconds. A reconnect after it must still receive
+		// the catalog's sole snapshot instead of waiting forever for an edit that may never come.
+		now += 60_000;
+		const second = net.track(Broadcast.CATALOG_TRACK).subscribe();
+		expect((await new Json.Snapshot.Consumer<Catalog.Root>({ track: second }).next())?.video).toBeDefined();
+		second.close();
+
+		broadcast.close();
+	} finally {
+		performance.now = real;
+	}
 });

@@ -15,16 +15,17 @@ categories = ["multimedia", "network-programming", "web-programming"]
 [package.metadata.cargo-shear]
 ignored = ["getrandom"]
 
+[features]
 # Exposes the wire codecs to the `fuzz/` harness through the hidden `fuzz` module.
 # Off by default and hidden from the docs; nothing depends on it but that harness.
-[features]
 fuzz = []
 
 [dependencies]
 arrayvec = "0.7"
 bytes = { workspace = true }
 futures = { workspace = true }
-kio = { workspace = true, features = ["time"] }
+kio = { workspace = true }
+moq-pattern = { workspace = true, features = ["serde"] }
 num_enum = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
@@ -65,9 +66,21 @@ path = "examples/fuzz-seeds.rs"
 required-features = ["fuzz"]
 
 [[bench]]
+name = "origin"
+harness = false
+
+[[bench]]
 name = "group"
 harness = false
 
 [[bench]]
 name = "track"
+harness = false
+
+[[bench]]
+name = "priority"
+harness = false
+
+[[bench]]
+name = "stats"
 harness = false

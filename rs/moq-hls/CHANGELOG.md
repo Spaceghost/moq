@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- [**breaking**] Read the broadcast timeline from `catalog.archive`
+  instead of the removed root `timeline` entry.
+
+### Fixed
+
+- Answer 404 for a segment the relay cannot serve because the group is not cached or the publisher is gone, and 500 only for a genuine failure. Classification uses the named moq-lite stream codes (local variants and received `Error::Stream` codes), so a miss that crossed a session no longer   looks like an internal error. IETF stream-reset misses still answer 500.
+
 ## [0.4.16](https://github.com/moq-dev/moq/compare/moq-hls-v0.4.15...moq-hls-v0.4.16) - 2026-09-17
 
 ### Other

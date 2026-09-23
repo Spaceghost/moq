@@ -35,7 +35,7 @@ use crate::rml::sessions::{
 use crate::rml::time::RtmpTimestamp;
 use bytes::Bytes;
 use moq_mux::container::flv::{Export as FlvExport, Import as FlvImport};
-use moq_net::{broadcast, origin};
+use moq_net::origin;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -68,8 +68,13 @@ pub struct Client<S = TcpStream> {
 	/// The `<app>` this client connected to, logged in place of the stream key.
 	app: String,
 	/// How long [`publish`](Self::publish)'s FLV muxer waits for a stalled group
-	/// before skipping. Defaults to [`DEFAULT_LATENCY`](crate::DEFAULT_LATENCY).
-	latency: Duration,
+	/// before skipping. Defaults to [`DEFAULT_MAX_AGE`](crate::DEFAULT_MAX_AGE).
+	export_max_age: Duration,
+	/// Retention declared on the media tracks [`pull`](Self::pull) publishes, or `None`
+	/// for hang's own default.
+	import_max_age: Option<Duration>,
+	/// Connection allocator each ingested track claims its peak-hold bitrate on.
+	import_bandwidth: moq_net::bandwidth::Allocator,
 }
 
 impl Client<TcpStream> {
@@ -148,16 +153,47 @@ impl<S: Stream> Client<S> {
 			session,
 			work,
 			app: app.to_string(),
-			latency: crate::DEFAULT_LATENCY,
+			export_max_age: crate::DEFAULT_MAX_AGE,
+			import_max_age: None,
+			import_bandwidth: moq_net::bandwidth::Allocator::unlimited(),
 		})
 	}
 
 	/// Set how long [`publish`](Self::publish)'s FLV muxer waits for a stalled group
 	/// before skipping to a newer one (the moq-level frame-drop latency). Defaults
-	/// to [`DEFAULT_LATENCY`](crate::DEFAULT_LATENCY); pass [`Duration::ZERO`] to
-	/// drop stale groups aggressively.
-	pub fn with_latency(mut self, latency: Duration) -> Self {
-		self.latency = latency;
+	/// to [`DEFAULT_MAX_AGE`](crate::DEFAULT_MAX_AGE); pass
+	/// [`Duration::ZERO`] to drop stale groups aggressively.
+	pub fn with_export_max_age(mut self, max_age: Duration) -> Self {
+		self.export_max_age = max_age;
+		self
+	}
+
+	/// Set how long relays keep a non-latest group of the media tracks
+	/// [`pull`](Self::pull) publishes fetchable. `None` keeps hang's own default.
+	///
+	/// A retention budget, not a delivery one: it never makes a subscriber play further
+	/// behind live, it caps how far back a FETCH can still reach. The default suits a
+	/// segmented egress (HLS/DASH) reading the broadcast downstream, which may only
+	/// advertise segments that are still fetchable. Lower it when nothing reads history
+	/// and the memory matters.
+	///
+	/// The pull (ingest) direction only; [`publish`](Self::publish) reads a broadcast
+	/// someone else declared, and takes [`with_export_max_age`](Self::with_export_max_age) instead.
+	pub fn with_import_max_age(mut self, max_age: impl Into<Option<Duration>>) -> Self {
+		self.import_max_age = max_age.into();
+		self
+	}
+
+	/// Claim each ingested track's peak-hold catalog bitrate on `bandwidth`.
+	///
+	/// A passthrough import has no configured ceiling, so it reserves the measured
+	/// maximum instead. A co-resident encoder then targets what is left of the
+	/// uplink. Unlimited (the default) claims nothing a sender can follow.
+	///
+	/// The pull (ingest) direction only; [`publish`](Self::publish) reads a
+	/// broadcast someone else declared.
+	pub fn with_import_bandwidth(mut self, bandwidth: moq_net::bandwidth::Allocator) -> Self {
+		self.import_bandwidth = bandwidth;
 		self
 	}
 
@@ -194,7 +230,7 @@ impl<S: Stream> Client<S> {
 		let mut export = FlvExport::new(moq_mux::Source::new(origin, path))
 			.await
 			.map_err(|e| anyhow::anyhow!("init FLV export: {e}"))?
-			.with_latency(self.latency);
+			.with_max_age(self.export_max_age);
 		let mut tags = flv::TagReader::new();
 		let mut buffer = [0u8; READ_BUFFER];
 
@@ -258,7 +294,10 @@ impl<S: Stream> Client<S> {
 		// app and broadcast path stand in for it.
 		tracing::info!(app = %self.app, %path, "rtmp play accepted by remote");
 
-		let mut publisher = Publisher::new(origin, path.as_str())?;
+		let config = moq_mux::catalog::Config::default()
+			.with_max_age(self.import_max_age)
+			.with_bandwidth(self.import_bandwidth.clone());
+		let mut publisher = Publisher::new(origin, path.as_str(), config)?;
 
 		let result = self.pull_media(&mut publisher).await;
 		match &result {
@@ -455,11 +494,11 @@ struct Publisher {
 }
 
 impl Publisher {
-	fn new(origin: &origin::Producer, path: &str) -> anyhow::Result<Self> {
+	fn new(origin: &origin::Producer, path: &str, config: moq_mux::catalog::Config) -> anyhow::Result<Self> {
 		let mut broadcast = origin
-			.create_broadcast(path, broadcast::Route::new().with_announce(true))
+			.publish(path, moq_net::origin::Route::default())
 			.map_err(|err| anyhow::anyhow!("broadcast '{path}' could not be published: {err}"))?;
-		let catalog = moq_mux::catalog::Producer::new(&mut broadcast)?;
+		let catalog = moq_mux::catalog::Producer::new(&mut broadcast, config)?;
 		let handle = broadcast.clone();
 		let mut importer = FlvImport::new(broadcast, catalog.reserve());
 
@@ -522,11 +561,10 @@ mod tests {
 		let mut vframe = vec![0x17, 0x01, 0x00, 0x00, 0x00];
 		vframe.extend_from_slice(&[0, 0, 0, 5, 0x65, 0x88, 0x84, 0x21, 0x00]);
 
-		let server_origin = moq_net::Origin::random().produce();
-		let mut broadcast = server_origin
-			.create_broadcast("live/cam0", broadcast::Route::new().with_announce(true))
-			.unwrap();
-		let catalog = moq_mux::catalog::Producer::new(&mut broadcast).unwrap();
+		let server_origin = moq_tokio::origin::spawn();
+		let mut broadcast = server_origin.create_broadcast("live/cam0").unwrap();
+		broadcast.announce(Default::default()).unwrap();
+		let catalog = moq_mux::catalog::Producer::new(&mut broadcast, moq_mux::catalog::Config::default()).unwrap();
 		let mut importer = FlvImport::new(broadcast, catalog.reserve());
 		importer.decode(&flv::file_header()).unwrap();
 		importer.decode(&flv::tag(flv::TAG_VIDEO, 0, &vseq)).unwrap();
@@ -546,7 +584,7 @@ mod tests {
 		});
 
 		// Client: dial, connect(`live`), play(`cam0`), republish into our own origin.
-		let client_origin = moq_net::Origin::random().produce();
+		let client_origin = moq_tokio::origin::spawn();
 		let announced = client_origin.consume();
 		let pull_origin = client_origin.clone();
 		let pull = tokio::spawn(async move {
@@ -555,10 +593,11 @@ mod tests {
 		});
 
 		// The republished broadcast should show up in the client's origin.
-		let broadcast = tokio::time::timeout(Duration::from_secs(5), announced.announced_broadcast("pulled/cam0"))
+		tokio::time::timeout(Duration::from_secs(5), announced.routed("pulled/cam0"))
 			.await
 			.expect("client republish timed out")
 			.expect("broadcast announced in client origin");
+		let broadcast = announced.request_broadcast("pulled/cam0").await.unwrap();
 
 		// It should carry a hang catalog track (proof the FLV demux produced real
 		// media on the far side): subscribe to it and read one catalog frame.
@@ -567,10 +606,16 @@ mod tests {
 			.expect("catalog track")
 			.subscribe(None)
 			.await
-			.expect("subscribe catalog");
-		let frame = tokio::time::timeout(Duration::from_secs(5), catalog_track.read_frame())
+			.expect("subscribe catalog")
+			.ordered();
+		let mut group = tokio::time::timeout(Duration::from_secs(5), catalog_track.next_group())
 			.await
 			.expect("catalog read timed out")
+			.expect("catalog read")
+			.expect("a catalog group");
+		let frame = group
+			.read_frame()
+			.await
 			.expect("catalog read")
 			.expect("a catalog frame");
 		assert!(!frame.payload.is_empty(), "pulled broadcast should carry a catalog");

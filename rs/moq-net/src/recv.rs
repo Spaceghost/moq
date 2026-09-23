@@ -1,8 +1,11 @@
-//! Receive-side ownership: cancelled handlers explicitly abort unfinished groups and frames.
+//! Receive-side ownership: a cancelled handler explicitly aborts its unfinished group.
+//!
+//! Frames need no guard here: `frame::Raw`'s own `Drop` already aborts the group when a
+//! frame dies before its declared size is written, so a partial frame is never silent.
 
 use std::ops::{Deref, DerefMut};
 
-use crate::{Error, frame, group};
+use crate::{Error, group};
 
 /// A received group that aborts if its handler is cancelled before finishing or handing it off.
 pub(crate) struct Group(Option<group::Producer>);
@@ -46,48 +49,6 @@ impl DerefMut for Group {
 }
 
 impl Drop for Group {
-	fn drop(&mut self) {
-		if let Some(producer) = self.0.take() {
-			let _ = producer.abort(Error::Cancel);
-		}
-	}
-}
-
-/// A received frame that aborts before its borrowed group is released on cancellation.
-pub(crate) struct Frame<'a>(Option<frame::Producer<'a>>);
-
-impl<'a> Frame<'a> {
-	/// Own a frame for the lifetime of its receive handler.
-	pub fn new(producer: frame::Producer<'a>) -> Self {
-		Self(Some(producer))
-	}
-
-	/// Finish receiving without running cancellation cleanup.
-	pub fn finish(mut self) -> Result<(), Error> {
-		self.0.take().expect("frame owned until consumed").finish()
-	}
-
-	/// Abort with the receive error instead of cancellation.
-	pub fn abort(mut self, err: Error) -> Result<(), Error> {
-		self.0.take().expect("frame owned until consumed").abort(err)
-	}
-}
-
-impl<'a> Deref for Frame<'a> {
-	type Target = frame::Producer<'a>;
-
-	fn deref(&self) -> &Self::Target {
-		self.0.as_ref().expect("frame owned until consumed")
-	}
-}
-
-impl DerefMut for Frame<'_> {
-	fn deref_mut(&mut self) -> &mut Self::Target {
-		self.0.as_mut().expect("frame owned until consumed")
-	}
-}
-
-impl Drop for Frame<'_> {
 	fn drop(&mut self) {
 		if let Some(producer) = self.0.take() {
 			let _ = producer.abort(Error::Cancel);

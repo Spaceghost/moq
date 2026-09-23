@@ -30,7 +30,7 @@ moq-relay relay.toml
 The relay takes one TOML file. A local development config:
 
 ```toml
-[server]
+[listen]
 bind = "[::]:4443"
 tls.generate = ["localhost"]
 
@@ -46,6 +46,47 @@ Every option is also a `--flag` or `MOQ_*` environment variable, and
 [configuration reference](/bin/relay/config) covers every section, and
 [`demo/relay/`](https://github.com/moq-dev/moq/tree/main/demo/relay) has
 working configs for development, production, and a cluster.
+
+## Embed
+
+`moq-relay` is also a library. An application that wants extra HTTP routes
+or in-process workers against the cluster origin loads a `Relay` and calls
+`run`. The owner keeps the listeners, QUIC workers, and shutdown joins, so a
+new socket added in a library update cannot be dropped by a `..` pattern that
+still compiles.
+
+```rust
+use axum::routing::get;
+use moq_relay::{Config, Relay};
+
+let relay = Relay::load(config).await?;
+let origin = relay.cluster().origin.clone();
+let trigger = relay.shutdown_trigger().clone();
+let web = relay.web().routes().route("/hello", get(|| async { "hello" }));
+relay.with_web(web).run().await?;
+```
+
+`Relay::load` binds QUIC and web sockets. Read their actual addresses with
+`quic_addr()` and `web_addrs()`, including ports assigned for `:0`. Clone
+`ready()` before spawning `run`, then await `ready.wait()` when startup must
+finish before other workers begin. `config()` returns the resolved settings;
+`cluster().id()` returns the chosen origin ID. `with_listeners()` registers an
+extra TCP listener's accept health at the relay's `/metrics`. The
+`test-support` feature provides `test_relay()` with ephemeral ports, generated
+TLS, and a certificate fingerprint for client pinning.
+
+The accessors borrow and `run` consumes the relay, so clone `cluster`,
+`auth`, `client`, `stats`, `shutdown`, and `shutdown_trigger` for application
+tasks before calling it. `trigger.start()` drains every session with a GOAWAY
+and `run` returns once the drain window elapses, with the listeners released
+and the workers joined. Build routes from `web().routes()` (or
+`internal().routes()`): `with_web` replaces the router, so `Router::new()`
+drops the built-in routes. Extra listeners (RTMP, SRT, ...) sit beside `run`
+in the application's `select!`. `runtime.workers` and `runtime.io_uring` stay
+inside the owner; do not split the worker group yourself. An application that
+decides admissions itself leaves `[auth]` empty and answers
+`relay.admissions()`; see [Authentication](/bin/relay/auth#in-process). See
+[`rs/moq-relay/examples/embed.rs`](https://github.com/moq-dev/moq/blob/main/rs/moq-relay/examples/embed.rs).
 
 ## Operate
 

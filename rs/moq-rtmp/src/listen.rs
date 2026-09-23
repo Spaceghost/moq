@@ -15,7 +15,7 @@
 //!
 //! Auth: this listener is currently unauthenticated. Anyone who can reach the
 //! TCP port can publish or play, so gate it with the host firewall / a private
-//! network. Treating the stream key as a token (a moq-token JWT, as moq-edge
+//! network. Treating the stream key as a token (a moq-auth JWT, as moq-edge
 //! does) is the obvious next step.
 
 use std::collections::HashSet;
@@ -23,7 +23,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use moq_net::origin;
+use moq_net::{Path, PathOwned, origin};
 
 use crate::Result;
 use crate::server::{Request, Server};
@@ -41,20 +41,30 @@ pub struct Config {
 	/// RTMP ingest is disabled.
 	pub listen: Option<SocketAddr>,
 
-	/// Prefix prepended to every ingested broadcast path. Lets one listener
-	/// namespace all of its streams (e.g. `live/`).
-	pub prefix: String,
+	/// Path prefix prepended to every ingested broadcast path. Lets one listener
+	/// namespace all of its streams (e.g. `live`).
+	pub prefix: PathOwned,
 
 	/// How long a play's FLV muxer waits for a stalled group before skipping to a
 	/// newer one (the moq-level frame-drop latency). Defaults to
-	/// [`DEFAULT_LATENCY`](crate::DEFAULT_LATENCY); set [`Duration::ZERO`] to drop
-	/// stale groups aggressively. Only affects egress (plays); ingest ignores it.
-	pub latency: Duration,
+	/// [`DEFAULT_MAX_AGE`](crate::DEFAULT_MAX_AGE); set [`Duration::ZERO`]
+	/// to drop stale groups aggressively. Only affects egress (plays); ingest ignores it.
+	pub export_max_age: Duration,
+
+	/// How long relays keep a non-latest group of an ingested media track fetchable, or
+	/// `None` for hang's own default.
+	///
+	/// A retention budget, not a delivery one: it never makes a subscriber play further
+	/// behind live, it caps how far back a FETCH can still reach. The default suits a
+	/// segmented egress (HLS/DASH) reading the broadcast downstream, which may only
+	/// advertise segments that are still fetchable. Lower it when nothing reads history
+	/// and the memory matters. Only affects ingest (publishes); egress ignores it.
+	pub import_max_age: Option<Duration>,
 
 	/// TLS configuration for RTMPS (RTMP over TLS). When set, the
 	/// [`listen`](Self::listen) address speaks RTMPS instead of plaintext RTMP,
 	/// so clients connect with `rtmps://`. Build it with
-	/// `moq_native::tls::Server::server_config` (pass an empty ALPN list) or
+	/// `moq_tokio::tls::Listen::server_config` (pass an empty ALPN list) or
 	/// any [`rustls::ServerConfig`]. Leave `None` for plaintext.
 	///
 	/// To serve both RTMP and RTMPS, clone one base config and call [`run`] for
@@ -69,8 +79,9 @@ impl Default for Config {
 	fn default() -> Self {
 		Self {
 			listen: None,
-			prefix: String::new(),
-			latency: crate::DEFAULT_LATENCY,
+			prefix: Path::empty().to_owned(),
+			export_max_age: crate::DEFAULT_MAX_AGE,
+			import_max_age: None,
 			#[cfg(feature = "tls")]
 			tls: None,
 			active: ActivePaths::default(),
@@ -119,8 +130,9 @@ pub async fn run(origin: origin::Producer, config: Config) -> Result<()> {
 	// of clobbering the live one. This lives on Config so cloned RTMP/RTMPS
 	// listeners share the same claim table.
 	let active = config.active.clone();
-	let prefix = Arc::new(config.prefix);
-	let latency = config.latency;
+	let prefix = config.prefix;
+	let export_max_age = config.export_max_age;
+	let import_max_age = config.import_max_age;
 	// Players are served out of the same origin the publishers write into.
 	let consumer = origin.consume();
 
@@ -142,12 +154,12 @@ pub async fn run(origin: origin::Producer, config: Config) -> Result<()> {
 					};
 					// Claim the path before accepting; the guard releases it when the
 					// connection task ends (success, error, or panic).
-					let Some(_guard) = active.claim(&path) else {
+					let Some(_guard) = active.claim(path.as_str()) else {
 						tracing::warn!(%peer, %path, "rejecting RTMP publish: path already being published");
 						let _ = publish.reject("path already being published").await;
 						return;
 					};
-					if let Err(err) = publish.accept(&origin, &path).await {
+					if let Err(err) = publish.with_max_age(import_max_age).accept(&origin, &path).await {
 						tracing::warn!(%peer, %path, %err, "RTMP ingest ended with error");
 					}
 				});
@@ -163,7 +175,7 @@ pub async fn run(origin: origin::Producer, config: Config) -> Result<()> {
 						let _ = play.reject("missing broadcast path (RTMP app/key)").await;
 						return;
 					};
-					if let Err(err) = play.with_latency(latency).accept(&consumer, &path).await {
+					if let Err(err) = play.with_max_age(export_max_age).accept(&consumer, &path).await {
 						tracing::warn!(%peer, %path, %err, "RTMP play ended with error");
 					}
 				});
@@ -171,7 +183,9 @@ pub async fn run(origin: origin::Producer, config: Config) -> Result<()> {
 		}
 	}
 
-	Err(anyhow::anyhow!("RTMP listener stopped accepting connections").into())
+	Err(crate::Error::Session(
+		"listener stopped accepting connections".to_string(),
+	))
 }
 
 /// Derive a broadcast path from an RTMP app and stream key, applying `prefix`.
@@ -179,7 +193,7 @@ pub async fn run(origin: origin::Producer, config: Config) -> Result<()> {
 /// `rtmp://host/<app>/<key>` maps to `<prefix><app>/<key>`, falling back to just
 /// the app (or just the key) when the other half is empty. Returns `None` when
 /// there's nothing usable to route on.
-pub(crate) fn resolve_path(prefix: &str, app: &str, key: &str) -> Option<String> {
+pub(crate) fn resolve_path(prefix: &Path, app: &str, key: &str) -> Option<PathOwned> {
 	let app = app.trim_matches('/').trim();
 	let key = key.trim_matches('/').trim();
 	let name = match (app.is_empty(), key.is_empty()) {
@@ -188,7 +202,7 @@ pub(crate) fn resolve_path(prefix: &str, app: &str, key: &str) -> Option<String>
 		(true, false) => key.to_string(),
 		(false, false) => format!("{app}/{key}"),
 	};
-	Some(format!("{prefix}{name}"))
+	Some(prefix.join(name))
 }
 
 /// The set of broadcast paths with a live ingest, used to reject duplicate
@@ -229,27 +243,36 @@ mod tests {
 
 	#[test]
 	fn app_and_key() {
-		assert_eq!(resolve_path("", "live", "cam0").as_deref(), Some("live/cam0"));
+		assert_eq!(
+			resolve_path(&Path::empty(), "live", "cam0").unwrap().as_str(),
+			"live/cam0"
+		);
 	}
 
 	#[test]
 	fn app_only() {
-		assert_eq!(resolve_path("", "cam0", "").as_deref(), Some("cam0"));
+		assert_eq!(resolve_path(&Path::empty(), "cam0", "").unwrap().as_str(), "cam0");
 	}
 
 	#[test]
 	fn prefix_is_prepended() {
-		assert_eq!(resolve_path("live/", "cam0", "").as_deref(), Some("live/cam0"));
+		assert_eq!(
+			resolve_path(&Path::new("live"), "cam0", "").unwrap().as_str(),
+			"live/cam0"
+		);
 	}
 
 	#[test]
 	fn slashes_are_trimmed() {
-		assert_eq!(resolve_path("", "/live/", "/cam0/").as_deref(), Some("live/cam0"));
+		assert_eq!(
+			resolve_path(&Path::empty(), "/live/", "/cam0/").unwrap().as_str(),
+			"live/cam0"
+		);
 	}
 
 	#[test]
 	fn empty_is_rejected() {
-		assert_eq!(resolve_path("", "", ""), None);
+		assert_eq!(resolve_path(&Path::empty(), "", ""), None);
 	}
 
 	#[test]

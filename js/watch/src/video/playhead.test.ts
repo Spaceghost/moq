@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import type * as Catalog from "@moq/hang/catalog";
 import type { Time } from "@moq/net";
-import { caughtUp, renditionJitter } from "./playhead";
+import { caughtUp, renditionJitter, switchJitter } from "./playhead";
 
 // `jitter` is a branded u53 in the catalog schema, so build the config through a cast.
 function config(props: { jitter?: number; framerate?: number }): Catalog.VideoConfig {
@@ -48,5 +48,18 @@ describe("caughtUp", () => {
 		// outgoing playhead. Promoting at the live edge would replay everything in between, so the
 		// bar stays the outgoing playhead however far live falls behind it.
 		expect(caughtUp({ playhead: ms(8000), active: ms(10_000) })).toBe(false);
+	});
+});
+
+describe("switchJitter", () => {
+	it("covers both renditions until promotion", () => {
+		expect(switchJitter({ active: ms(20), pending: ms(100) })).toBe(ms(100));
+		expect(switchJitter({ active: ms(100), pending: ms(20) })).toBe(ms(100));
+	});
+
+	it("settles to the remaining rendition", () => {
+		expect(switchJitter({ active: ms(20) })).toBe(ms(20));
+		expect(switchJitter({ pending: ms(100) })).toBe(ms(100));
+		expect(switchJitter({})).toBeUndefined();
 	});
 });

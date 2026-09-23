@@ -6,7 +6,6 @@
 
 use std::time::Duration;
 
-use clap::Args;
 use moq_net::cache;
 use serde::{Deserialize, Serialize};
 
@@ -15,16 +14,16 @@ const GOVERNOR_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Configuration for the relay's group cache.
 ///
-/// Non-latest groups stay cached until their track's retention window expires,
-/// the `duration` ceiling is reached, or the pool runs out of room, whichever
-/// comes first (the latest group of every track is always retained). With none
-/// of the knobs set the pool is unbounded and only each track's own window
-/// bounds memory.
-#[derive(Args, Clone, Debug, Default, Deserialize, Serialize)]
+/// Non-latest groups stay cached until they sit unaccessed past the wall-clock
+/// LRU window (`duration`, 30s by default) or the pool runs out of room,
+/// whichever comes first (the latest group of every track is always retained).
+/// With none of the knobs set the pool is unbounded in bytes and only the
+/// default LRU window bounds memory.
+#[derive(usage::Args, Clone, Debug, Default, Deserialize, Serialize)]
+#[usage(unknown_flags = "error", args_override_self = false)]
 #[serde(default, deny_unknown_fields)]
 #[non_exhaustive]
-#[group(id = "cache-config")]
-pub struct CacheConfig {
+pub struct Config {
 	/// Target bytes of cached group payload, e.g. "8GiB", "512MB", or a
 	/// percentage of memory like "75%" (respecting the cgroup limit when set).
 	/// Unbounded when unset.
@@ -32,7 +31,7 @@ pub struct CacheConfig {
 	/// A target that usage converges toward as tracks write, not a hard limit, and it
 	/// counts cached group bytes (payload plus a fixed cost per group), not process
 	/// RSS; leave some slack below physical memory or combine with `headroom`.
-	#[arg(long = "cache-capacity", env = "MOQ_CACHE_CAPACITY")]
+	#[usage(long = "cache-capacity", env = "MOQ_CACHE_CAPACITY", setting = "cache.capacity")]
 	pub capacity: Option<String>,
 
 	/// Keep at least this much system memory available, e.g. "2GiB" or "10%".
@@ -41,54 +40,61 @@ pub struct CacheConfig {
 	/// so the cache soaks up idle memory but is the first thing reclaimed when
 	/// the rest of the system needs it. Combine with `capacity` to also cap the
 	/// absolute size.
-	#[arg(long = "cache-headroom", env = "MOQ_CACHE_HEADROOM")]
+	#[usage(long = "cache-headroom", env = "MOQ_CACHE_HEADROOM", setting = "cache.headroom")]
 	pub headroom: Option<String>,
 
-	/// Maximum time a non-latest cached group is retained since it was last
-	/// written or served from cache by a FETCH, e.g. "30s" or "500ms".
+	/// Maximum time a non-latest cached group is retained, e.g. "30s" or "500ms".
 	///
-	/// Caps each track's own retention window: a publisher advertising a longer
-	/// window is clamped down to this, bounding how much history a track can
-	/// accumulate no matter what upstream asks for. A FETCH cache hit restarts
-	/// the clock, so actively-read history stays cached. This bounds memory by
-	/// age where `capacity` bounds it by bytes. Unbounded (each track keeps its
-	/// own window) when unset.
+	/// Sets both halves of the retention bound. The pool's wall-clock LRU window
+	/// becomes this: a group nobody has read or written for this long is
+	/// reclaimed, so actively-read history stays cached. Each track's own media-timestamp
+	/// retention window is also clamped down to this, so a publisher advertising
+	/// a longer window can't promise more history than the relay keeps. This
+	/// bounds memory by age where `capacity` bounds it by bytes. When unset, the
+	/// LRU window keeps its 30 second default and each track keeps its own
+	/// retention window.
 	///
-	/// Two caveats on the ceiling. The latest group of every track is always
-	/// retained, since it is the live edge. And expiry is evaluated when a track
-	/// writes its next group, so a publisher that stops writing without
-	/// disconnecting keeps whatever it had cached until it resumes or the
-	/// broadcast closes; under memory pressure the `capacity` budget is repaid by
-	/// the tracks that are still writing.
-	#[arg(long = "cache-duration", env = "MOQ_CACHE_DURATION", value_parser = humantime::parse_duration)]
-	#[serde(default, with = "humantime_serde")]
+	/// One caveat: the latest group of every track is always retained, since it is
+	/// the live edge. This window otherwise holds whether or not a publisher is
+	/// still writing, since the relay sweeps every cached track on a wall-clock
+	/// cadence. The `capacity` budget is the one that depends on writes: a
+	/// publisher that stops writing pays none of it down, so under memory pressure
+	/// it is repaid by the tracks that are still writing.
+	#[usage(skip)]
+	#[serde(with = "crate::duration::serde_option")]
 	pub duration: Option<Duration>,
+
+	#[usage(long = "cache-duration", env = "MOQ_CACHE_DURATION", setting = "cache.duration")]
+	#[serde(default, rename = "__cli_duration", skip_serializing_if = "Option::is_none")]
+	duration_arg: Option<crate::duration::Duration>,
 }
 
 /// The relay's resolved cache settings: the shared byte-budget pool plus the
-/// age ceiling applied to every track.
+/// retention ceiling applied to every track.
+#[non_exhaustive]
 ///
 /// The headroom governor, when configured, is owned by [`Self::pool`] rather than
 /// by this struct: it holds only a [`cache::PoolWeak`] and stops on its next tick
 /// once every [`cache::Pool`] clone has dropped. Handing this to
-/// [`Cluster::with_cache`](crate::Cluster::with_cache) therefore moves the
-/// governor's lifetime onto the cluster, and dropping this struct afterwards keeps
-/// it running. Conversely, holding a clone of [`Self::pool`] past the relay keeps
-/// the governor running too, deliberately: as long as anything can still cache into
-/// the budget, resizing it is still the right thing to do.
+/// [`Cluster::new`](crate::cluster::Cluster::new) therefore moves the governor's lifetime
+/// onto the cluster, and dropping this struct afterwards keeps it running.
+/// Conversely, holding a clone of [`Self::pool`] past the relay keeps the governor
+/// running too, deliberately: as long as anything can still cache into the budget,
+/// resizing it is still the right thing to do.
 pub struct Cache {
-	/// The shared byte-budget pool every session's groups register with.
+	/// The shared pool every session's groups register with: the byte budget plus
+	/// the wall-clock LRU window that reclaims idle groups.
 	///
 	/// Also what owns the headroom governor; see the type docs.
 	pub pool: cache::Pool,
 
-	/// Ceiling on how long a non-latest group is retained (the latest group of every
-	/// track is always kept). [`Duration::MAX`] imposes no ceiling, leaving each
-	/// track's own window in force.
+	/// Ceiling on each track's media-timestamp retention window (the latest group of
+	/// every track is always kept). [`Duration::MAX`] imposes no ceiling, leaving
+	/// each track's own window in force.
 	pub duration: Duration,
 }
 
-impl CacheConfig {
+impl Config {
 	/// Resolve the size knobs into a shared [`cache::Pool`] and age ceiling,
 	/// spawning the headroom governor when configured. Requires a tokio runtime.
 	///
@@ -97,10 +103,14 @@ impl CacheConfig {
 	/// point, say) leaves nothing sampling memory behind.
 	pub fn init(&self) -> anyhow::Result<Cache> {
 		let capacity = self.capacity.as_deref().map(parse_limit).transpose()?;
-		let pool = match capacity {
-			Some(bytes) => cache::Pool::new(bytes),
-			None => cache::Pool::unbounded(),
-		};
+		let duration = self
+			.duration_arg
+			.map(crate::duration::Duration::into_std)
+			.or(self.duration);
+		let config = cache::Config::default()
+			.with_capacity(capacity)
+			.with_expiry(duration.unwrap_or(cache::DEFAULT_EXPIRY));
+		let pool = cache::Pool::new(config);
 
 		if let Some(headroom) = self.headroom.as_deref() {
 			let headroom = parse_limit(headroom)?;
@@ -111,13 +121,13 @@ impl CacheConfig {
 			tracing::info!(capacity, "cache capacity set");
 		}
 
-		if let Some(duration) = self.duration {
+		if let Some(duration) = duration {
 			tracing::info!(?duration, "cache duration ceiling set");
 		}
 
 		Ok(Cache {
 			pool,
-			duration: self.duration.unwrap_or(Duration::MAX),
+			duration: duration.unwrap_or(Duration::MAX),
 		})
 	}
 }
@@ -197,6 +207,25 @@ mod tests {
 	use super::*;
 
 	#[test]
+	fn default_config_enables_expiry_without_clamping_media_time() {
+		let cache = Config::default().init().unwrap();
+		assert_eq!(cache.pool.expiry(), Some(cache::DEFAULT_EXPIRY));
+		assert_eq!(cache.duration, Duration::MAX);
+	}
+
+	#[test]
+	fn explicit_duration_configures_both_bounds() {
+		let duration = Duration::from_secs(5);
+		let config = Config {
+			duration: Some(duration),
+			..Default::default()
+		};
+		let cache = config.init().unwrap();
+		assert_eq!(cache.pool.expiry(), Some(duration));
+		assert_eq!(cache.duration, duration);
+	}
+
+	#[test]
 	fn parse_limit_bytes() {
 		assert_eq!(parse_limit("8GiB").unwrap(), 8 * 1024 * 1024 * 1024);
 		assert_eq!(parse_limit("512MB").unwrap(), 512 * 1000 * 1000);
@@ -220,8 +249,8 @@ mod tests {
 	}
 
 	/// A config whose only knob is the headroom governor.
-	fn governed() -> CacheConfig {
-		CacheConfig {
+	fn governed() -> Config {
+		Config {
 			headroom: Some("10%".to_string()),
 			..Default::default()
 		}
@@ -243,9 +272,9 @@ mod tests {
 
 	/// The prefix of [`crate::Relay::load`] that owns the cache: resolve it, then
 	/// hand it to a cluster whose construction can still fail.
-	fn attach(cache: &CacheConfig, cluster: crate::ClusterConfig) -> anyhow::Result<crate::Cluster> {
+	fn attach(cache: &Config, cluster: crate::cluster::Config) -> anyhow::Result<crate::cluster::Cluster> {
 		let cache = cache.init()?;
-		Ok(crate::Cluster::new(cluster)?.with_cache(cache))
+		crate::cluster::Cluster::new(crate::cluster::Options::new(cluster).with_cache(cache))
 	}
 
 	#[tokio::test(start_paused = true)]
@@ -279,23 +308,38 @@ mod tests {
 		let before = spawned();
 
 		// `--cluster-id 0` is rejected, so the cache is dropped before it is attached.
-		let cluster = crate::ClusterConfig {
-			id: Some(0),
-			..Default::default()
-		};
+		let mut cluster = crate::cluster::Config::default();
+		cluster.id = Some(0);
 		assert!(attach(&governed(), cluster).is_err(), "cluster id 0 is rejected");
 
 		settle().await;
 		assert_eq!(spawned(), before, "a failed setup should not strand the governor");
 	}
 
+	/// Tasks a cluster spawns on its own (its origin driver), measured rather than
+	/// assumed so the governor's task can be told apart from them.
+	async fn cluster_tasks() -> usize {
+		let before = spawned();
+		let cluster = attach(&Config::default(), crate::cluster::Config::default()).unwrap();
+		settle().await;
+		let own = spawned() - before;
+		drop(cluster);
+		settle().await;
+		own
+	}
+
 	#[tokio::test(start_paused = true)]
 	async fn last_owner_drop_stops_governor() {
+		let own = cluster_tasks().await;
 		let before = spawned();
-		let cluster = attach(&governed(), crate::ClusterConfig::default()).unwrap();
+		let cluster = attach(&governed(), crate::cluster::Config::default()).unwrap();
 
 		settle().await;
-		assert_eq!(spawned(), before + 1, "the cluster should keep the governor running");
+		assert_eq!(
+			spawned(),
+			before + own + 1,
+			"the cluster should keep the governor running"
+		);
 
 		drop(cluster);
 		settle().await;
@@ -304,13 +348,18 @@ mod tests {
 
 	#[tokio::test(start_paused = true)]
 	async fn extra_cluster_handle_keeps_governor() {
+		let own = cluster_tasks().await;
 		let before = spawned();
-		let cluster = attach(&governed(), crate::ClusterConfig::default()).unwrap();
+		let cluster = attach(&governed(), crate::cluster::Config::default()).unwrap();
 		let session = cluster.clone();
 
 		drop(cluster);
 		settle().await;
-		assert_eq!(spawned(), before + 1, "a surviving cluster clone keeps the governor");
+		assert_eq!(
+			spawned(),
+			before + own + 1,
+			"a surviving cluster clone keeps the governor"
+		);
 
 		drop(session);
 		settle().await;

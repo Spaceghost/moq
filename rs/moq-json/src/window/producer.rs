@@ -50,7 +50,9 @@ impl<T> Producer<T> {
 		self.inner.lock().unwrap().track.inner.subscribe(None)
 	}
 
-	/// The retained window, oldest first.
+	/// The retained checkpoint suffix, oldest first.
+	///
+	/// This is the complete window unless [`ProducerConfig::checkpoint_records`] is set.
 	pub fn window(&self) -> Vec<Value> {
 		self.inner.lock().unwrap().encoder.window()
 	}
@@ -69,7 +71,11 @@ impl<T> Producer<T> {
 	}
 
 	/// Finish the track, closing any open group.
-	pub fn finish(self) -> Result<()> {
+	///
+	/// Borrows rather than consumes, matching snapshot and stream, so the handle stays
+	/// usable afterwards (reads, a second finish). Writes after this fail with
+	/// [`moq_net::Error::Closed`].
+	pub fn finish(&mut self) -> Result<()> {
 		self.inner.lock().unwrap().finish()
 	}
 }
@@ -158,7 +164,7 @@ impl Track {
 	/// Close the open group and write the header as the first frame of a new one.
 	fn write_header(&mut self, payload: bytes::Bytes) -> Result<()> {
 		// The previous group is complete; no more frames will be appended to it.
-		if let Some(mut group) = self.group.take() {
+		if let Some(group) = self.group.take() {
 			group.finish()?;
 		}
 
@@ -185,7 +191,7 @@ impl Track {
 	}
 
 	fn finish(&mut self) -> Result<()> {
-		if let Some(mut group) = self.group.take() {
+		if let Some(group) = self.group.take() {
 			group.finish()?;
 		}
 		self.inner.finish()?;

@@ -25,8 +25,12 @@ are eligible when a matching decoder is available. On an NVIDIA GPU the pipeline
 is fully GPU-resident: NVDEC decodes and scales in hardware and NVENC encodes the
 CUDA frame in place, with no CPU copies. macOS also resizes on the GPU. Windows
 uses the Direct3D11 video processor by default; set
-`Config::resize.acceleration` to `resize::Acceleration::Cpu` to force a download
-and CPU resize.
+`Config::resize.output` to `Output::Cpu` to decode to CPU pixels and resize
+there.
+
+The default `openh264` and `nvidia` features mirror `moq-video`. A hardware-only
+Linux build can use `--no-default-features --features nvidia`; a software-only
+build can use `--no-default-features --features openh264`.
 
 ## Library
 
@@ -38,12 +42,10 @@ broadcast.
 let mut config = moq_transcode::Config::default();
 // The derivative is announced at `<source>/transcode.hang`, so the source
 // renditions are referenced through its parent.
-config.source = Some(moq_net::PathRelativeOwned::from(".".to_string()));
+config.source = Some(moq_net::path::RelativeOwned::from(".".to_string()));
 
-let output = origin.create_broadcast(
-    format!("{path}/transcode.hang"),
-    moq_net::broadcast::Route::new().with_announce(true),
-)?;
+let output = origin.create_broadcast(format!("{path}/transcode.hang"))?;
+output.announce(Default::default())?;
 
 moq_transcode::run(source, output, config).await?;
 ```
@@ -56,8 +58,8 @@ undercuts a known source bitrate.
 
 ```rust
 config.ladder = moq_transcode::Ladder::new([
-    moq_transcode::Rung::new(720, 2_500_000),
-    moq_transcode::Rung::new(360, 600_000),
+    moq_transcode::Rung::new(720, moq_net::bandwidth::Rate::from_bps(2_500_000)),
+    moq_transcode::Rung::new(360, moq_net::bandwidth::Rate::from_bps(600_000)),
 ])?;
 ```
 
@@ -69,7 +71,7 @@ below which. Filtering against the source drops rungs but never reorders them.
 
 ## Example
 
-Publish something first (e.g. `moq publish camera` from
+Publish something first (e.g. `moq import capture` from
 [`moq-cli`](../moq-cli)), then:
 
 ```bash

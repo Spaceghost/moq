@@ -1,12 +1,12 @@
 # An example of a production configuration.
 # Here's a real one: https://github.com/moq-dev/moq.dev/blob/b4da7dd8f09879cefb593d5e35f99f064caa3943/infra/relay.yml.tpl#L56
 
-[server]
+[listen]
 # Listen for QUIC connections on UDP:443
 # This is the default port for WebTransport
-listen = "[::]:443"
+bind = "[::]:443"
 
-[server.tls]
+[listen.tls]
 # You'll need to provide a real certificate and key in production.
 # You can get this via a service like Let's Encrypt.
 cert = "cert.pem"
@@ -27,18 +27,16 @@ key = "key.pem"
 
 # See docs/auth.md for more information.
 [auth]
-# A single JWK key file for authentication. No kid required in JWTs.
-key = "root.jwk"
-
-# Allow anonymous subscribing for anon/** and demo/**
-# Allow anonymous publishing for anon/** only
-[auth.public]
-subscribe = ["anon", "demo"]
-publish = ["anon", "demo/viewer"]
-
-# For multiple keys with rotation, use a directory instead:
-# key_dir = "/path/to/keys/"
-# Keys are named {kid}.jwk and resolved by the kid in the JWT header.
+# The auth server asked once per session event. The policy lives there:
+#
+#   moq auth serve --listen 127.0.0.1:4440 --key root.jwk \
+#     --public-subscribe 'anon/**' --public-subscribe 'demo/**' \
+#     --public-publish 'anon/**' --public-publish 'demo/viewer/**' \
+#     --mtls-publish '**' --mtls-subscribe '**'
+#
+# For multiple keys with rotation, give it `--key-dir /path/to/keys/` instead:
+# keys are named {kid}.jwk and resolved by the kid in the JWT header.
+url = "http://127.0.0.1:4440/"
 
 # Or use a URL for remote key management:
 # key_dir = "https://api.example.com/keys"

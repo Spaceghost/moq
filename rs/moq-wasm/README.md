@@ -17,13 +17,13 @@ that path is unrelated to this crate.)
 
 What works today:
 
-- **The architecture is right.** `moq-net` is generic over
-  `web_transport_trait::Session` and spawns via `web_async::spawn` (not
-  `tokio::spawn`), so it is not tied to native QUIC.
-- **The WebTransport adapter is complete** (`src/transport.rs`): a newtype
-  bridge from `web-transport-wasm` (browser WebTransport) to the
-  `web-transport-trait` abstraction `moq-net` consumes. The orphan rule forces
-  the newtypes; the shapes line up almost 1:1.
+- **Executor-independent sessions.** `moq-net` is generic over
+  `web_transport_trait::poll::Session` and returns a driver for the caller to
+  run. `moq-wasm` spawns `moq_net::time::run` via `web_async::spawn`, which
+  supplies the browser clock and sleeps until the driver's next deadline.
+- **The browser transport needs no adapter**: `web-transport-wasm` implements
+  the poll traits `moq-net` consumes, so `src/transport.rs` is just the dial
+  (the ALPN list and the browser's two trust modes).
 - **It compiles to `wasm32-unknown-unknown` and produces `@moq/wasm`**: `just
   wasm` emits a typed, importable package (`Session` / `Broadcast` / `Track` /
   `Group`, used as `Moq.Session` etc. via `import * as Moq`, `Promise`-returning
@@ -45,22 +45,17 @@ What works today:
    transport is `!Send`, but `SessionInner` used to hard-code `Send`.
    `web_async::MaybeSendBoxFuture` picks a `Send` boxed future on native and a
    local boxed future on wasm. Native behavior is unchanged.
-3. Timers and `Instant` routed through `web_async::time` instead of
-   `tokio::time` (session poll interval, subscriber linger, probe interval,
-   track-cache eviction). `web-async` re-exports `tokio::time` on native
-   and `wasmtimer` (a `performance.now()` + `setTimeout` shim) on wasm, so the
-   same code runs on both. tokio's clock is `std::time::Instant::now()`, which
-   *panics* on wasm (no clock) under `spawn_local` (no time driver); wasmtimer
-   fixes that. Native unchanged: `web_async::time::Instant` *is*
-   `tokio::time::Instant` there, so `tokio::time::pause`/`advance` test clocks
-   still work.
+3. Drivers accept `moq_net::time::Instant` and return their next deadline.
+   `moq_net::time::run` supplies the clock and one re-armable sleep through
+   `web_async::time`, backed by `performance.now()` and `setTimeout` here.
+   `moq-net` handles session sampling, linger, probes, and cache expiration
+   using the supplied time and never spawns tasks.
 
 ### Timestamp fallback
 
-`model/time.rs` uses `web_async::time::{Instant, SystemTime}` for timestamp
-generation. Native keeps the Tokio-backed instant so paused-time tests still
-work; browser wasm uses wasmtimer-backed clocks, avoiding the `std::time` and
-Tokio paths that panic or lack a driver on `wasm32-unknown-unknown`.
+`moq_net::time::Instant` is `std::time::Instant` on native and the
+wasmtimer-backed instant from `web_async::time` in the browser, where
+`std::time::Instant` panics. `model/time.rs` anchors its timestamps on it.
 
 ### Out of scope here: moq-mux
 

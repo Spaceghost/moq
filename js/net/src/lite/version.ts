@@ -7,6 +7,7 @@ export const Version = {
 	/// Work-in-progress lite-06, advertised as the preferred WebTransport subprotocol.
 	/// Adds announce ids: each active ANNOUNCE_BROADCAST implicitly assigns the next
 	/// ordinal, and ended/restart reference that id instead of repeating the path.
+	/// Also adds frame-precise subscribe/fetch bounds and a GROUP frame offset.
 	DRAFT_06: 0xff0dad06,
 } as const;
 
@@ -109,7 +110,7 @@ export function hasAnnounceId(version: Version): boolean {
 }
 
 /** Whether ANNOUNCE_REQUEST carries the Exclude Hop field: the subscriber's own
- * origin id, which the publisher uses to skip announces whose hop chain already
+ * Hop ID, which the publisher uses to skip announces whose hop chain already
  * passed through the subscriber. Present in lite-04 and lite-05 only.
  *
  * The receiver's own reflected-announce check drops those announces anyway (and
@@ -128,11 +129,75 @@ export function hasExcludeHop(version: Version): boolean {
 	}
 }
 
-/** Whether announcements carry a route cost varint alongside the hop chain: the
- * marginal cost of pulling the broadcast via this route, accumulated per link.
- * Added in lite-06. Older versions carry nothing, so a received route stays at
- * zero and routing falls back to the hop-count tie-break. */
+/** Whether announcements carry the route cost varints alongside the hop chain: the
+ * warm and cold cost of pulling the broadcast via this route, accumulated per link.
+ * Added in lite-06. Older versions carry neither, so a received route has no cost
+ * at all and routing falls back to the hop-count tie-break. */
 export function hasRouteCost(version: Version): boolean {
+	// Explicitly list older versions so future versions keep the lite-06+ behavior.
+	switch (version) {
+		case Version.DRAFT_01:
+		case Version.DRAFT_02:
+		case Version.DRAFT_03:
+		case Version.DRAFT_04:
+		case Version.DRAFT_05:
+			return false;
+		default:
+			return true;
+	}
+}
+
+/** Whether SUBSCRIBE, SUBSCRIBE_UPDATE, FETCH, and GROUP carry frame indices alongside
+ * their group sequences, so a subscription or fetch can start and end partway through a
+ * group. Added in lite-06. Older versions only address whole groups, so a route change
+ * has to wait for the next group before it can resume.
+ *
+ * SUBSCRIBE_OK is deliberately not in that list: the resolved start frame follows from
+ * its group plus the subscriber's own request, so it needs no frame field. */
+export function hasFrameBounds(version: Version): boolean {
+	// Explicitly list older versions so future versions keep the lite-06+ behavior.
+	switch (version) {
+		case Version.DRAFT_01:
+		case Version.DRAFT_02:
+		case Version.DRAFT_03:
+		case Version.DRAFT_04:
+		case Version.DRAFT_05:
+			return false;
+		default:
+			return true;
+	}
+}
+
+/** Whether SUBSCRIBE, SUBSCRIBE_UPDATE, SUBSCRIBE_OK, and TRACK_INFO carry the retired
+ * `Ordered` byte.
+ *
+ * The field is gone from the model: a publisher transmits newest-first within a track,
+ * always. Deployed drafts still have the byte in their layout, so it is written as 0 and
+ * ignored on read rather than shifting every field behind it. */
+export function hasGroupOrder(version: Version): boolean {
+	// Explicitly list older versions so future versions keep the lite-06+ behavior.
+	switch (version) {
+		case Version.DRAFT_01:
+		case Version.DRAFT_02:
+		case Version.DRAFT_03:
+		case Version.DRAFT_04:
+		case Version.DRAFT_05:
+			return true;
+		default:
+			return false;
+	}
+}
+
+/**
+ * Whether SUBSCRIBE's `Group Start` is an absolute floor the publisher resolves a start
+ * from: the raw minimum group sequence (default 0), with `Subscriber Max Age` as the only
+ * gate on how far back delivery begins. Changed in lite-06.
+ *
+ * Older versions encode `Group Start` as the sequence + 1, with 0 meaning the latest
+ * group, so an absent start there pins the cursor to the live edge instead of letting the
+ * budget reach back.
+ */
+export function resolvesStart(version: Version): boolean {
 	// Explicitly list older versions so future versions keep the lite-06+ behavior.
 	switch (version) {
 		case Version.DRAFT_01:

@@ -3,7 +3,6 @@ import { ContainerSchema } from "./container";
 import { hexSchema } from "./hex";
 import { u53Schema } from "./integers";
 import { RelativeBroadcastSchema } from "./path";
-import { TimelineSchema } from "./timeline";
 
 // Backwards compatibility: old track schema
 const TrackSchema = z.object({
@@ -16,6 +15,9 @@ export const VideoConfigSchema = z.object({
 	// relative to the broadcast that served this catalog (e.g. "./source").
 	// If unset, the track lives in the same broadcast as the catalog.
 	broadcast: z.optional(RelativeBroadcastSchema),
+
+	// Human-readable rendition name for track pickers.
+	label: z.optional(z.string()),
 
 	// See: https://w3c.github.io/webcodecs/codec_registry.html
 	codec: z.string(),
@@ -54,18 +56,23 @@ export const VideoConfigSchema = z.object({
 	// Default: true
 	optimizeForLatency: z.optional(z.boolean()),
 
-	// The maximum jitter before the next frame is emitted in milliseconds.
-	// The player's jitter buffer should be larger than this value.
+	// The maximum delay between a frame being ready and the publisher flushing it, in whole
+	// milliseconds rounded up. The player's jitter buffer should be larger than this value.
 	// If not provided, the player should assume each frame is flushed immediately.
+	//
+	// This is measured at the publisher (encoder latency, segment size, B-frame reordering),
+	// never on the network a consumer sees. It only ever grows over the life of a stream.
 	//
 	// ex:
 	// - If each frame is flushed immediately, this would be 1000/fps.
 	// - If there can be up to 3 b-frames in a row, this would be 3 * 1000/fps.
 	// - If frames are buffered into 2s segments, this would be 2s.
-	jitter: z.optional(u53Schema),
-
-	// The companion timeline track indexing this rendition's groups, if the publisher offers one.
-	timeline: z.optional(TimelineSchema),
+	jitter: z.optional(
+		z.pipe(
+			u53Schema,
+			z.transform((value) => (value === 0 ? undefined : value)),
+		),
+	),
 });
 
 /**

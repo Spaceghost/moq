@@ -18,8 +18,8 @@ export const HISTORY = 10_000;
 export type Event = Json.Window.Event<string>;
 
 /** Track settings for the latest chat window. */
-export function info(): Pick<Track.Info, "priority" | "ordered"> {
-	return { priority: PRIORITY, ordered: false };
+export function info(): Pick<Track.Info, "priority"> {
+	return { priority: PRIORITY };
 }
 
 /** Publishes chat messages and retires them after ten seconds, including while idle. */
@@ -36,7 +36,7 @@ export class Publisher {
 	/** Publish a chat window over an existing track. */
 	constructor(track: Track.Producer) {
 		// Every edit restates the retained window, so a late reader never replays expired records.
-		this.#producer = new Json.Window.Producer(track, { opRatio: 0 });
+		this.#producer = new Json.Window.Producer({ track, opRatio: 0 });
 		this.#signals.run((effect) => {
 			const next = effect.get(this.#expires)[0];
 			if (next === undefined) return;
@@ -77,15 +77,15 @@ export class Subscriber {
 
 	/** Subscribe to the newest retained window on a broadcast. */
 	static subscribe(broadcast: Broadcast.Consumer): Subscriber {
-		return new Subscriber(broadcast.track(TRACK).subscribe({ ordered: false }));
+		return new Subscriber(broadcast.track(TRACK).subscribe());
 	}
 
 	/** Read window changes from an existing subscription. */
 	constructor(track: Track.Subscriber) {
 		const latest = track.latest();
-		if (latest !== undefined) track.startAt(latest);
+		if (latest !== undefined) track.setGroups({ start: { included: latest } });
 		this.#track = track;
-		this.#consumer = new Json.Window.Consumer(track);
+		this.#consumer = new Json.Window.Consumer({ track });
 	}
 
 	/** Return the next window change, or undefined on clean completion; failures throw. */

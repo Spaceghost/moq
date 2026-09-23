@@ -18,21 +18,27 @@ use crate::{Error, Result, ingest::IngestSink, sdp, server::Server, session};
 
 pub use crate::server::Response;
 
+#[derive(Clone)]
+struct RouterState {
+	server: Server,
+	publisher: moq_net::origin::Producer,
+}
+
 /// Build the WHIP axum router.
-pub fn router(server: Server) -> Router {
+pub fn router(server: Server, publisher: moq_net::origin::Producer) -> Router {
 	Router::new()
-		.route("/{*path}", post(handle).delete(crate::server::delete))
-		.with_state(server)
+		.route("/{*path}", post(handle).delete(delete))
+		.with_state(RouterState { server, publisher })
 }
 
 async fn handle(
-	State(server): State<Server>,
+	State(state): State<RouterState>,
 	Path(path): Path<String>,
 	OriginalUri(uri): OriginalUri,
 	headers: HeaderMap,
 	body: Bytes,
 ) -> HttpResponse {
-	match accept_offer(&server, &path, &headers, body).await {
+	match accept_offer(&state.server, &state.publisher, &path, &headers, body).await {
 		Ok(response) => {
 			let Response {
 				resource_id,
@@ -58,12 +64,22 @@ async fn handle(
 
 /// Router glue: enforce the WHIP `Content-Type` then hand the raw offer to
 /// [`accept`], using the request path as the (unauthenticated) broadcast name.
-async fn accept_offer(server: &Server, path: &str, headers: &HeaderMap, body: Bytes) -> Result<Response> {
+async fn accept_offer(
+	server: &Server,
+	publisher: &moq_net::origin::Producer,
+	path: &str,
+	headers: &HeaderMap,
+	body: Bytes,
+) -> Result<Response> {
 	if !is_sdp(headers) {
 		return Err(Error::InvalidSdp("expected Content-Type: application/sdp".into()));
 	}
 	let offer = std::str::from_utf8(&body).map_err(|err| Error::InvalidSdp(err.to_string()))?;
-	accept(server, server.publisher(), path, offer).await
+	accept(server, publisher, path, offer).await
+}
+
+async fn delete(State(state): State<RouterState>, Path(path): Path<String>) -> StatusCode {
+	crate::server::delete(&state.server, &path)
 }
 
 /// Accept a WHIP SDP offer and publish the negotiated WebRTC media into
@@ -85,7 +101,7 @@ async fn accept_offer(server: &Server, path: &str, headers: &HeaderMap, body: By
 /// `offer` is the raw SDP body; the caller is responsible for checking the
 /// `Content-Type: application/sdp` request header. Fails with
 /// [`Error::InvalidSdp`] on a malformed offer and surfaces
-/// [`moq_net::Error::Unauthorized`] (as [`Error::Other`]) if `broadcast` is
+/// [`moq_net::Error::Unauthorized`] if `broadcast` is
 /// outside `publisher`'s scope.
 pub async fn accept(
 	server: &Server,
@@ -94,16 +110,19 @@ pub async fn accept(
 	offer: &str,
 ) -> Result<Response> {
 	let offer = sdp::parse_offer(offer)?;
+	let broadcast = broadcast.as_path();
 
 	// Create the broadcast on the publish origin before negotiating, so a
 	// fast subscriber doesn't see a 404 in the gap between the SDP answer
 	// and the first RTP packet.
-	let producer = publisher
-		.create_broadcast(broadcast, moq_net::broadcast::Route::new().with_announce(true))
-		.map_err(|err| Error::Other(anyhow::anyhow!("failed to create broadcast: {err}")))?;
+	let producer = publisher.create_broadcast(&broadcast)?;
+	producer.announce(moq_net::origin::Route::default())?;
 
 	let handle = producer.clone();
-	let sink = Box::new(IngestSink::new(producer)?);
+	let config = moq_mux::catalog::Config::default()
+		.with_max_age(server.config().max_age)
+		.with_bandwidth(server.config().bandwidth.clone());
+	let sink = Box::new(IngestSink::new(producer, config)?);
 
 	// Register a session on the shared media mux: known ICE credentials (so the
 	// demux routes this peer's STUN by ufrag), an inbox to read datagrams from,
@@ -114,11 +133,11 @@ pub async fn accept(
 		.set_local_ice_credentials(creds)
 		.build(std::time::Instant::now());
 	for addr in mux.candidates() {
-		let cand = Candidate::host(*addr, "udp").map_err(str0m::RtcError::from)?;
+		let cand = Candidate::host(*addr, "udp").map_err(Error::rtc)?;
 		rtc.add_local_candidate(cand);
 	}
 
-	let answer = rtc.sdp_api().accept_offer(offer).map_err(Error::Rtc)?;
+	let answer = rtc.sdp_api().accept_offer(offer).map_err(Error::rtc)?;
 	let resource_id = sdp::new_resource_id();
 	let session = session::Session::ingest(rtc, mux.socket(), mux.candidates().to_vec(), inbound, sink);
 
@@ -154,6 +173,7 @@ fn status_for(err: &Error) -> StatusCode {
 		Error::InvalidSdp(_) => StatusCode::BAD_REQUEST,
 		Error::UnsupportedCodec(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
 		Error::SessionNotFound => StatusCode::NOT_FOUND,
+		Error::Moq(moq_net::Error::Unauthorized) => StatusCode::UNAUTHORIZED,
 		_ => StatusCode::INTERNAL_SERVER_ERROR,
 	}
 }

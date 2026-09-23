@@ -1,3 +1,20 @@
+/// Renders an error and its `source()` chain into a single message.
+///
+/// Dependency errors are stored as messages so their crates stay out of this crate's public
+/// API. Several of them keep the actionable half in `source()` and nothing but a category in
+/// `Display`, so a plain `to_string()` would drop the only detail worth reporting.
+pub(crate) fn message(err: impl std::error::Error) -> String {
+	use std::fmt::Write;
+
+	let mut out = err.to_string();
+	let mut source = err.source();
+	while let Some(err) = source {
+		let _ = write!(out, ": {err}");
+		source = err.source();
+	}
+	out
+}
+
 /// Errors from moq-mux operations.
 ///
 /// Most variants are delegations to underlying layers: [`moq_net::Error`] for
@@ -18,6 +35,18 @@ pub enum Error {
 	/// Error publishing or consuming JSON over a track.
 	#[error("json: {0}")]
 	Json(#[from] moq_json::Error),
+
+	/// Error publishing or consuming binary payloads over a track.
+	#[error("binary: {0}")]
+	Binary(#[from] moq_binary::Error),
+
+	/// A catalog entry declares a track mode this build does not implement.
+	#[error("unsupported track mode: {0}")]
+	UnsupportedMode(String),
+
+	/// A catalog entry declares a compression this build does not implement.
+	#[error("unsupported track compression: {0}")]
+	UnsupportedCompression(String),
 
 	/// Error parsing or building CMAF moof+mdat fragments.
 	#[error("cmaf: {0}")]
@@ -93,20 +122,50 @@ pub enum Error {
 
 	/// URL parse error.
 	#[error("url: {0}")]
-	Url(#[from] url::ParseError),
-
-	/// Video metadata was supplied for an audio track.
-	#[error("video hint is not supported for audio tracks")]
-	UnexpectedVideoHint,
+	Url(String),
 
 	/// Unknown media format.
 	#[error("unknown format: {0}")]
 	UnknownFormat(String),
 
+	/// A video format that a raw byte stream cannot be split into.
+	///
+	/// Only the self-delimiting codecs (Annex-B H.264/H.265, AV1 OBUs) carry their own frame
+	/// boundaries. The rest need length prefixes or an out-of-band config record, so they can only
+	/// be imported as whole frames via [`Track::video`](crate::import::Track::video).
+	#[error("{0} is not self-describing, so its frame boundaries can't be inferred from a stream")]
+	NotSelfDescribing(String),
+
+	/// A format was handed to a constructor for a different kind of import.
+	///
+	/// Each entry point takes only the fields its kind can honor, so the format has to match: an
+	/// audio format carries no video hint, and a container has no single rendition to label.
+	#[error("{format} is a {actual} format, not {wanted}")]
+	WrongKind {
+		/// The format string the caller passed.
+		format: String,
+		/// The kind that actually handles it.
+		actual: &'static str,
+		/// The kind the constructor expected.
+		wanted: &'static str,
+	},
+
 	/// A non-keyframe frame was received before any keyframe opened a group.
 	/// A track joining mid-stream should skip frames until the first keyframe.
 	#[error("{0}")]
 	MissingKeyframe(#[from] crate::container::MissingKeyframe),
+
+	/// An explicit video endpoint precedes its last frame.
+	#[error("{0}")]
+	InvalidEnd(#[from] crate::container::InvalidEnd),
+
+	/// A frame's timestamp sits below the live edge earlier groups reached.
+	#[error("{0}")]
+	TimestampRewind(#[from] crate::container::TimestampRewind),
+
+	/// A rendition was modified before its initial config was published.
+	#[error("rendition is not published")]
+	NotPublished,
 
 	/// A FLV video frame resolved to a negative presentation timestamp.
 	#[error("negative FLV video presentation timestamp: dts={dts_ms}ms composition_time={composition_time_ms}ms")]
@@ -116,6 +175,30 @@ pub enum Error {
 		/// The signed FLV composition-time offset in milliseconds.
 		composition_time_ms: i32,
 	},
+
+	/// A segment ran past the [`duration_max`](crate::timeline::Config::duration_max) the
+	/// catalog advertised, so the timeline stopped publishing rather than contradict it. The
+	/// publisher declared a bound its media can't honor.
+	#[error("timeline segment {segment} lasted {duration:?}, over the declared maximum {duration_max:?}")]
+	TimelineOverrun {
+		/// The segment that broke the bound.
+		segment: u64,
+		/// How long it actually ran.
+		duration: std::time::Duration,
+		/// The bound the catalog advertised.
+		duration_max: std::time::Duration,
+	},
+
+	/// [`timeline::Producer::finish`](crate::timeline::Producer::finish) was called before its
+	/// deferred [`timeline::Segmenter`](crate::timeline::Segmenter) completed and every record
+	/// was committed.
+	#[error("finish and commit every deferred timeline record before closing the Producer")]
+	TimelineDeferredPending,
+
+	/// [`timeline::Producer::push`](crate::timeline::Producer::push) received a pending record that
+	/// its [`timeline::Deferred`](crate::timeline::Deferred) did not yield.
+	#[error("timeline segment {0} was not yielded for deferred publication")]
+	TimelineDeferredRecord(u64),
 
 	/// Error from a muxer/demuxer that reports via `anyhow` (currently MPEG-TS).
 	/// Boxed in an `Arc` so the enum stays `Clone` (`anyhow::Error` is not).
@@ -127,6 +210,10 @@ pub enum Error {
 	#[error("invalid timeline timescale: {0}")]
 	InvalidTimescale(u32),
 
+	/// A source timestamp cannot be mapped onto the broadcast clock: it would land before the
+	/// broadcast began or outside the representable range.
+	#[error("timestamp cannot be mapped onto the broadcast clock: {0}")]
+	UnmappableTimestamp(String),
 	/// Tried to set an application catalog section whose name collides with a
 	/// reserved media section (`video`/`audio`).
 	#[error("reserved catalog section: {0}")]
@@ -137,9 +224,15 @@ pub enum Error {
 	#[error("unsupported container: {0}")]
 	UnsupportedContainer(String),
 
-	/// A rendition's relative broadcast reference escaped above the origin root.
-	#[error("broadcast reference escapes above the root: {0}")]
-	InvalidBroadcastReference(String),
+	/// A rendition's `broadcast` reference walks above the root, so it names no broadcast.
+	///
+	/// The root is the consumer's authorized subtree, so such a reference is an attempt to
+	/// name content the consumer cannot reach. It rejects the whole catalog
+	/// ([`catalog::hang::Consumer`](crate::catalog::hang::Consumer)) rather than the one
+	/// rendition, and is also what a direct [`Source::resolve`](crate::Source::resolve) /
+	/// [`Source::subscribe_track`](crate::Source::subscribe_track) reports.
+	#[error("broadcast reference escapes the root: {0}")]
+	EscapingBroadcast(String),
 }
 
 impl Error {
@@ -158,6 +251,13 @@ impl From<anyhow::Error> for Error {
 impl From<mp4_atom::Error> for Error {
 	fn from(err: mp4_atom::Error) -> Self {
 		Error::Mp4(std::sync::Arc::new(err))
+	}
+}
+
+// Flattened to its message so `url` stays out of this crate's public API.
+impl From<url::ParseError> for Error {
+	fn from(err: url::ParseError) -> Self {
+		Error::Url(message(err))
 	}
 }
 

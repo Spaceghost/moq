@@ -4,11 +4,11 @@ use bytes::Bytes;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-	// Optional: Use moq_native to configure a logger.
-	moq_native::Log::new(tracing::Level::DEBUG).init()?;
+	// Optional: Use moq_tokio to configure a logger.
+	moq_tokio::Log::new(tracing::Level::DEBUG).init()?;
 
 	// Create an origin that we can publish to and the session can consume from.
-	let origin = moq_net::Origin::random().produce();
+	let origin = moq_tokio::origin::spawn();
 
 	// Run the broadcast production and the session in parallel.
 	// This is a simple example of how you can concurrently run multiple tasks.
@@ -22,8 +22,8 @@ async fn main() -> anyhow::Result<()> {
 // Connect to the server and publish our origin of broadcasts.
 // Automatically reconnects if the connection drops.
 async fn run_session(origin: moq_net::origin::Producer) -> anyhow::Result<()> {
-	// Optional: Use moq_native to make a QUIC client.
-	let client = moq_native::ClientConfig::default().init()?;
+	// Optional: Use moq_tokio to make a QUIC client.
+	let client = moq_tokio::connect::Config::default().init(Default::default())?;
 
 	// For local development, use: http://localhost:4443
 	// The "anon" path is usually configured to bypass authentication; be careful!
@@ -33,7 +33,7 @@ async fn run_session(origin: moq_net::origin::Producer) -> anyhow::Result<()> {
 	// with_publisher() registers an OriginProducer. moq-net reads from its
 	// consumer view internally. Pair with with_subscriber() if you also want
 	// to subscribe to remote announcements.
-	let reconnect = client.with_publisher(&origin).reconnect(url);
+	let reconnect = client.with_publisher(&origin).connect(url);
 
 	// Wait until the reconnect loop stops (e.g. timeout exceeded).
 	Ok(reconnect.closed().await?)
@@ -61,33 +61,38 @@ fn create_track(broadcast: &mut moq_net::broadcast::Producer) -> anyhow::Result<
 
 	// Create the catalog describing our video track.
 	// Multiple renditions allow the viewer to choose based on their capabilities.
-	let mut catalog = hang::catalog::Catalog::default();
+	let mut catalog = hang::catalog::Catalog::<()>::default();
 	catalog.video.insert(video_track, video_config)?;
 
 	// Publish the catalog as a "catalog.json" track in the broadcast.
-	let mut catalog_track = broadcast.create_track(hang::Catalog::DEFAULT_NAME, hang::Catalog::default_track_info())?;
+	let catalog_track = broadcast.create_track(hang::Catalog::DEFAULT_NAME, hang::Catalog::default_track_info())?;
 	let mut group = catalog_track.append_group()?;
 	group.write_frame(moq_net::Timestamp::now(), catalog.to_json()?)?;
 	group.finish()?;
 
 	// Actually create the media track now.
-	// track_info() pins the microsecond timescale that the legacy container encodes with.
-	let track = broadcast.create_track(video_track, hang::container::track_info())?;
+	// track_info() pins the microsecond timescale that the legacy container encodes with, and
+	// declares the publisher priority so a subscriber orders this against a broadcast's audio.
+	let track = broadcast.create_track(video_track, hang::container::track_info(hang::catalog::PRIORITY.video))?;
 
 	Ok(track)
 }
 
 // Produce a broadcast and publish it to the origin.
 async fn run_broadcast(origin: moq_net::origin::Producer) -> anyhow::Result<()> {
-	// Create a broadcast on the origin; the live route announces it.
+	// Create a broadcast on the origin and announce its path.
 	// NOTE: The path is empty because we're using the URL to scope the broadcast.
-	let mut broadcast = origin
-		.create_broadcast("", moq_net::broadcast::Route::new().with_announce(true))
-		.context("failed to create broadcast")?;
+	let mut broadcast = origin.create_broadcast("").context("failed to create broadcast")?;
+	broadcast
+		.announce(Default::default())
+		.context("failed to announce broadcast")?;
 	let track = create_track(&mut broadcast)?;
 
 	// Wrap in a Producer for keyframe-based group management.
-	let mut producer = moq_mux::container::Producer::new(track, moq_mux::catalog::hang::Container::Legacy);
+	let mut producer = moq_mux::container::Producer::new(
+		track,
+		moq_mux::catalog::hang::Container::Legacy(moq_mux::container::Kind::Video),
+	);
 
 	// Not real frames of course. The first frame is a keyframe and starts the first group.
 	let frame = moq_mux::container::Frame {

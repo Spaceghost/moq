@@ -30,11 +30,11 @@ in sync at the latency you ask for.
 | --- | --- |
 | `url`, `name` | Relay URL (with `?jwt=` if needed) and broadcast name. |
 | `paused`, `muted`, `volume` | The usual player controls, mirrored as reactive properties. |
-| `latency` | Target latency: `"real-time"` (derived from RTT, the default), a number of ms, or `"instant"` to paint frames as they decode with no pacing at all. |
-| `latency-min`, `latency-max` | Open a range instead: buffer freely between the floor and the ceiling and only skip ahead past the ceiling. |
-| `jitter` | The jitter buffer in ms. |
+| `delay` | How far playback trails the live edge: `"auto"` (derived from RTT, the default), a duration like `"300ms"`, or `"instant"` to paint frames as they decode with no pacing at all. |
+| `buffer` | Future-dated media held beyond the live edge before playback skips ahead, e.g. `"30s"`. Defaults to none. |
+| `captions` | The caption track to show, or absent for off. `el.text.out.available` lists the renditions for a picker. |
 | `visible` | Only subscribe to video while the element is on screen: a margin (`"20%"` default, `"200px"`), `"always"`, or `"never"`. |
-| `reload` | Wait for the broadcast to be announced before subscribing (default on), so a player can be mounted before the stream exists. |
+| `announced` | Wait for the broadcast to be announced before subscribing (default on), so a player can be mounted before the stream exists. |
 | `catalog-format` | `hang` (default, from the `.hang` suffix), `hangz` (compressed), `msf`, or `manual` to supply the catalog yourself. |
 
 The overlay adds play/pause, volume, fullscreen, a quality selector, a
@@ -103,7 +103,7 @@ const dispose = el.signals.run((effect) => {
     const track = active.track(name).subscribe({ priority: Hang.Catalog.PRIORITY.catalog });
     effect.cleanup(() => track.close());
 
-    const consumer = new Json.Snapshot.Consumer<unknown>(track);
+    const consumer = new Json.Snapshot.Consumer<unknown>({ track });
     effect.spawn(async () => {
         for (;;) {
             const value = await Promise.race([effect.cancel, consumer.next()]);
@@ -132,28 +132,41 @@ of the pipeline through `el.broadcast`, `el.video`, `el.audio`, and
 ## Without the element
 
 ```ts
+import * as Moq from "@moq/net";
 import * as Watch from "@moq/watch";
 
-const broadcast = new Watch.Broadcast({ connection, enabled: true, name: "alice.hang" });
+// Shared with every other component pointed at the same relay; the broadcast
+// handle reads from its origin and spans reconnects.
+const connection = new Moq.Connection({ url: new URL("https://relay.example.com/anon") });
+const player = new Watch.Player({
+    origin: connection.origin,
+    probe: connection.probe,
+    name: Moq.Path.from("alice.hang"),
+    canvas,
+});
+// player.broadcast, player.video, player.audio, player.text, player.sync,
+// player.renderer, and player.emitter expose the pipeline.
+// Call player.close() when playback ends.
 ```
 
-`Watch.Broadcast`, `Video.Decoder`, `Video.Renderer`, `Audio.Decoder`, and
-`Audio.Emitter` are the pieces the element assembles; every input and output
-is a signal from [`@moq/signals`](/lib/js/signals). Load from a CDN
+Pass a signal from [`@moq/signals`](/lib/js/signals) for any control you want
+to change later, such as `muted` or `delay`. `Player` owns the same pipeline as
+`<moq-watch>`; `Watch.Broadcast`, `Sync`, and the per-track components remain
+available for custom composition. Load the element from a CDN
 (`https://esm.sh/@moq/watch/element`) for a no-build embed.
 
 ## Buffered playback
 
-By default the player minimizes latency: it skips ahead whenever the buffer
-grows past the target. Content produced faster than real time, such as a TTS
+By default the player minimizes latency: it skips ahead whenever media piles
+up past the delay. Content produced faster than real time, such as a TTS
 response emitted in one burst with future timestamps, wants the opposite. Set
-`latency-max` above `latency-min` to play through at the encoded pace:
+`buffer` to how far ahead it may run and it plays through at the encoded pace:
 
 ```html
-<moq-watch url="..." name="bot/tts.hang" latency-min="100" latency-max="30000"></moq-watch>
+<moq-watch url="..." name="bot/tts.hang" delay="100ms" buffer="30s"></moq-watch>
 ```
 
-Only the floor is held as decoded PCM; the rest stays as encoded frames with
-backpressure on the decoder, so a large ceiling is cheap. `el.reset()`
-flushes and re-anchors at the next frame, which is how a producer interrupts
-an utterance.
+Durations need a unit; a bare number is rejected. Only the delay is held as
+decoded PCM; the buffer stays as encoded frames with backpressure on the
+decoder, so a large one is cheap. `el.reset()` flushes and re-anchors at the
+next frame, which is how a producer interrupts an utterance.

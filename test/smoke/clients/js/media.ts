@@ -22,8 +22,8 @@ import {
 	type BrowserErrors,
 	check,
 	command,
-	drainPageErrors,
 	Failure,
+	finishTraces,
 	launch,
 	open,
 	type PlayerState,
@@ -40,7 +40,7 @@ import {
 	waitForState,
 	waitForWatch,
 } from "./harness";
-import { FAULTS, SAMPLE_MS, SAMPLE_RATE } from "./src/contract";
+import { FAULTS, KEYFRAME_INTERVAL_MS, leakedPlayerStarted, SAMPLE_MS, SAMPLE_RATE } from "./src/contract";
 import * as Pattern from "./src/pattern";
 
 /** Cases beyond the mandatory capability probe, publisher readiness, and cold start. */
@@ -104,6 +104,9 @@ const MIN_RATE = 0.5;
  */
 const MAX_SKEW_STEPS = 1;
 
+/** The first decodable frame may start at the current GOP's keyframe, but never in older history. */
+const MAX_LATE_JOIN_LAG_FRAMES = Math.ceil((Pattern.FPS * KEYFRAME_INTERVAL_MS) / 1000);
+
 const percentile = (values: number[], p: number) => {
 	if (values.length === 0) return Number.NaN;
 	const sorted = [...values].sort((a, b) => a - b);
@@ -141,14 +144,12 @@ async function waitFrozen(
 	errors: BrowserErrors,
 	assertion: string,
 	description: string,
-	tolerateErrors = false,
 ): Promise<number> {
 	const deadline = Date.now() + SETTLE_MS;
 	let frame: number | undefined;
 	let since = Date.now();
 	while (Date.now() < deadline) {
-		if (tolerateErrors) drainPageErrors(errors);
-		else throwPageErrors(errors);
+		throwPageErrors(errors);
 		const current = (await readPlayerState(page).catch(() => undefined))?.frameId;
 		if (current !== frame) {
 			frame = current;
@@ -158,7 +159,7 @@ async function waitFrozen(
 		}
 		await sleep(POLL_INTERVAL_MS);
 	}
-	if (!tolerateErrors) throwPageErrors(errors);
+	throwPageErrors(errors);
 	throw new Failure(assertion, `${description}: the presented frame is still advancing, now ${frame}`);
 }
 
@@ -330,6 +331,7 @@ async function subscriber(broadcast: string, label: string): Promise<[Page, Brow
 		// policy would stop downloading video and leave the canvas black.
 		pageUrl(server.origin, "subscribe", { url: relay, broadcast, visible: "always" }),
 		label,
+		true,
 	);
 	await waitForWatch(page);
 	return [page, errors];
@@ -446,14 +448,11 @@ try {
 	if (wants("rejoin")) {
 		console.error("=== unsubscribe and rejoin ===");
 		await player.locator(SELECTORS.watch).evaluate((el) => el.setAttribute("name", "smoke-media-nowhere.hang"));
-		// Leaving a broadcast aborts its subscriptions, which the player reports; that is the change
-		// taking effect, not a fault.
 		const left = await waitFrozen(
 			player,
 			playerErrors,
 			"unsubscribe stops playback",
 			"the player kept presenting a broadcast it no longer subscribes to",
-			true,
 		);
 
 		await player.locator(SELECTORS.watch).evaluate((el, name) => el.setAttribute("name", name), broadcast);
@@ -462,7 +461,6 @@ try {
 			assertion: "rejoin resumes playback",
 			description: `the presented frame to move past the ${left} it stopped on`,
 			predicate: (state) => (state.frameId ?? 0) > left,
-			tolerateErrors: true,
 		});
 		assertMedia(await collect(player, playerErrors, WINDOW_MS), "after rejoin");
 	}
@@ -485,8 +483,8 @@ try {
 			await waitForResources(player, playerErrors, {
 				deadline: Date.now() + SETTLE_MS,
 				assertion: "resource instrumentation",
-				description: `the deliberately leaked player to open another session beyond ${JSON.stringify(busy.resources)}`,
-				predicate: (r) => r.transports + r.sockets > busy.resources.transports + busy.resources.sockets,
+				description: `the deliberately leaked player to open another audio graph beyond ${JSON.stringify(busy.resources)}`,
+				predicate: (r) => leakedPlayerStarted(busy.resources, r),
 			});
 		}
 		await command(player, "detach");
@@ -513,13 +511,11 @@ try {
 		console.error("=== stop and republish ===");
 		const before = await readPlayerState(player);
 		await command(publisher, "stop");
-		// The publisher going away aborts the subscriptions reading it, and the player says so.
 		await waitFrozen(
 			player,
 			playerErrors,
 			"playback stops with the publisher",
 			"the player kept presenting new frames after the publisher went away",
-			true,
 		);
 
 		await command(publisher, "start");
@@ -530,7 +526,6 @@ try {
 			assertion: "republish serves the new stream",
 			description: `a presented frame below the ${before.frameId} reached before the publisher stopped`,
 			predicate: (state) => state.frameId !== undefined && state.frameId < (before.frameId ?? 0),
-			tolerateErrors: true,
 		});
 		console.error(`  recovered at frame ${recovered.frameId}, restarted from ${before.frameId}`);
 		assertMedia(await collect(player, playerErrors, WINDOW_MS), "after republish");
@@ -551,39 +546,46 @@ try {
 			description: "the latecomer to present the fixture",
 			predicate: (state) => state.frameId !== undefined && state.audioContext === "running",
 		});
+		// The fixture sample names the frame painted immediately before the page opens. The first
+		// decodable frame can be the keyframe at the start of the current GOP, so require it to be
+		// within that GOP rather than requiring an impossible zero-frame capture/encode delay.
+		const lag = live.frameId - (joined.frameId ?? 0);
 		check(
-			(joined.frameId ?? 0) >= live.frameId,
+			lag <= MAX_LATE_JOIN_LAG_FRAMES,
 			"late join starts live",
-			() => `joined at frame ${joined.frameId}, behind the ${live.frameId} already published when it opened`,
+			() =>
+				`joined at frame ${joined.frameId}, ${lag} frames behind the ${live.frameId} already published when it opened (one GOP is ${MAX_LATE_JOIN_LAG_FRAMES})`,
 		);
 		console.error(`  joined at frame ${joined.frameId}, live edge was ${live.frameId}`);
 		assertMedia(await collect(player, playerErrors, WINDOW_MS), "late join");
 	}
 } catch (err) {
 	failure = err instanceof Error ? err : new Error(String(err));
-} finally {
-	for (const browser of browsers) await browser.close().catch(() => {});
-	server.stop();
 }
 
+// The verdict decides whether the trace is evidence: a negative control passes by failing, so a
+// caught error alone is not a failure.
+let code = 0;
 if (expectFail !== undefined) {
 	// A negative control. The run has to fail, and fail on the assertion it was aimed at: a pass, or
 	// a failure somewhere else, both mean the assertion does not measure what it claims to.
 	if (!failure) {
 		console.error(`negative control passed, but it must fail on "${expectFail}"`);
-		process.exit(1);
-	}
-	if (!(failure instanceof Failure) || failure.assertion !== expectFail) {
+		code = 1;
+	} else if (!(failure instanceof Failure) || failure.assertion !== expectFail) {
 		console.error(`negative control was aimed at "${expectFail}" but broke elsewhere: ${failure.message}`);
-		process.exit(1);
+		code = 1;
+	} else {
+		console.error(`negative control failed as required: ${failure.message}`);
 	}
-	console.error(`negative control failed as required: ${failure.message}`);
-	process.exit(0);
+} else if (failure) {
+	console.error(`FAIL ${failure.message}`);
+	code = 1;
+} else {
+	console.error("media: all checks passed");
 }
 
-if (failure) {
-	console.error(`FAIL ${failure.message}`);
-	process.exit(1);
-}
-console.error("media: all checks passed");
-process.exit(0);
+await finishTraces(code !== 0);
+for (const browser of browsers) await browser.close().catch(() => {});
+server.stop();
+process.exit(code);

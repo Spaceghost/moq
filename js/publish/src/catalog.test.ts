@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import type * as Catalog from "@moq/hang/catalog";
+import * as Catalog from "@moq/hang/catalog";
 import * as Json from "@moq/json";
 import { Track } from "@moq/net";
 import { Effect } from "@moq/signals";
@@ -16,7 +16,7 @@ test("catalog producer seeds subscribers and fans out edits", async () => {
 	const effect = new Effect();
 	const track = new Track.Producer("catalog.json");
 	catalog.serve(track, effect);
-	const consumer = new Json.Snapshot.Consumer<Catalog.Root>(track.subscribe());
+	const consumer = new Json.Snapshot.Consumer<Catalog.Root>({ track: track.subscribe() });
 
 	// A new subscriber is seeded with the current catalog.
 	expect((await consumer.next())?.video).toEqual({ renditions: {} });
@@ -41,7 +41,7 @@ test("catalog producer publishes every update as a snapshot group", async () => 
 	const effect = new Effect();
 	const track = new Track.Producer("catalog.json");
 	catalog.serve(track, effect);
-	const subscriber = track.subscribe();
+	const subscriber = track.subscribe().ordered();
 
 	const first = await subscriber.nextGroup();
 	expect(first?.sequence).toBe(0);
@@ -76,9 +76,87 @@ test("a reconnecting subscriber is seeded with the full current catalog", async 
 	const effect = new Effect();
 	const track = new Track.Producer("catalog.json");
 	catalog.serve(track, effect);
-	const seeded = await new Json.Snapshot.Consumer<Catalog.Root>(track.subscribe()).next();
+	const seeded = await new Json.Snapshot.Consumer<Catalog.Root>({ track: track.subscribe() }).next();
 	expect(seeded?.video).toEqual({ renditions: {} });
 	expect(seeded?.scte35).toEqual({ splices: [] });
 
 	effect.close();
 });
+
+test("catalog producer refuses zero jitter before retaining an edit", () => {
+	const catalog = new CatalogProducer();
+	for (const section of ["audio", "video"] as const) {
+		expect(() =>
+			catalog.mutate((value) => {
+				Object.assign(value, {
+					[section]: {
+						renditions: {
+							media: {
+								codec: "opus",
+								container: { kind: "legacy" },
+								sampleRate: 48000,
+								numberOfChannels: 2,
+								jitter: 0,
+							},
+						},
+					},
+				});
+			}),
+		).toThrow("omit jitter");
+	}
+	catalog.mutate((value) => {
+		expect(value).toEqual({});
+	});
+});
+
+for (const section of ["audio", "video"] as const) {
+	test(`catalog refuses ${section} jitter decreases without retaining them`, () => {
+		const catalog = new CatalogProducer();
+		catalog.mutate((value) => {
+			Object.assign(value, {
+				[section]: {
+					renditions: {
+						media: {
+							codec: "opus",
+							container: { kind: "legacy" },
+							sampleRate: 48000,
+							numberOfChannels: 2,
+							jitter: 100,
+						},
+					},
+				},
+			});
+		});
+
+		// The section is optional on the loose root type, so re-read it through a guard.
+		const retained = (value: Catalog.Root) => {
+			const sectionValue = value[section];
+			if (!sectionValue) throw new Error(`expected a retained ${section} section`);
+			return sectionValue;
+		};
+		for (const jitter of [Catalog.u53(50), undefined]) {
+			expect(() =>
+				catalog.mutate((value) => {
+					retained(value).renditions.media.jitter = jitter;
+				}),
+			).toThrow("jitter cannot decrease");
+			catalog.mutate((value) => {
+				expect(retained(value).renditions.media.jitter).toBe(Catalog.u53(100));
+			});
+		}
+		catalog.mutate((value) => {
+			delete retained(value).renditions.media;
+		});
+		catalog.mutate((value) => {
+			Object.assign(retained(value).renditions, {
+				media: {
+					codec: "opus",
+					container: { kind: "legacy" },
+					sampleRate: 48000,
+					numberOfChannels: 2,
+					jitter: 50,
+				},
+			});
+		});
+	});
+}

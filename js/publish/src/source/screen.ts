@@ -1,10 +1,12 @@
 import { Effect, type Getter, getter, type Inputs, type Readonlys, readonlys, Signal } from "@moq/signals";
 import type * as Audio from "../audio";
 import type * as Video from "../video";
+import type { Media } from "./types";
 
 // Signals the screen capture reads.
 export type ScreenInput = {
-	// Whether to hold the capture open. Enabling it prompts the user to pick a surface.
+	// Whether to hold the capture open. Defaults to true. Enabling prompts the user to pick a surface,
+	// so construct an enabled screen source during a user gesture or start it later with a live input.
 	enabled: Getter<boolean>;
 };
 
@@ -18,7 +20,7 @@ export interface ScreenProps extends Inputs<ScreenInput> {
 
 type ScreenOutput = {
 	// The captured surface, or undefined while disabled or dismissed.
-	source: Signal<{ audio?: Audio.Source; video?: Video.Source } | undefined>;
+	source: Signal<Media | undefined>;
 };
 
 /** Captures a screen, window, or tab that the user picks. */
@@ -31,7 +33,7 @@ export class Screen {
 	audio: Signal<Audio.Constraints | boolean | undefined>;
 
 	readonly #out: ScreenOutput = {
-		source: new Signal<{ audio?: Audio.Source; video?: Video.Source } | undefined>(undefined),
+		source: new Signal<Media | undefined>(undefined),
 	};
 	readonly out = readonlys(this.#out);
 
@@ -45,7 +47,7 @@ export class Screen {
 
 	constructor(props?: ScreenProps) {
 		this.in = {
-			enabled: getter(props?.enabled ?? false),
+			enabled: getter(props?.enabled ?? true),
 		};
 		this.video = Signal.from(props?.video);
 		this.audio = Signal.from(props?.audio);
@@ -119,7 +121,15 @@ export class Screen {
 			}
 
 			effect.set(this.#out.source, {
-				video: v,
+				video: v
+					? {
+							track: v,
+							get scale() {
+								return (v.getSettings() as MediaTrackSettings & { screenPixelRatio?: number })
+									.screenPixelRatio;
+							},
+						}
+					: undefined,
 				audio: a ? { track: a, kind: "music" } : undefined,
 			});
 		});

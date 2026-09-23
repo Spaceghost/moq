@@ -9,6 +9,7 @@ mod whep;
 mod whip;
 
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use url::Url;
 
@@ -19,6 +20,19 @@ pub struct Config {
 	/// Public UDP socket addresses to advertise as ICE host candidates in
 	/// our outbound offer. Same semantics as [`crate::server::Config::ice_candidates`].
 	pub ice_candidates: Vec<SocketAddr>,
+
+	/// How long relays keep a non-latest group of an ingested media track fetchable.
+	/// Same semantics as [`crate::server::Config::max_age`].
+	///
+	/// Ingest only ([`subscribe`](Client::subscribe) / WHEP): a WHIP
+	/// [`publish`](Client::publish) reads a broadcast someone else declared, so it
+	/// ignores this.
+	pub max_age: Option<Duration>,
+
+	/// Connection allocator each ingested track claims its peak-hold bitrate on.
+	/// Ingest only ([`subscribe`](Client::subscribe) / WHEP); a WHIP
+	/// [`publish`](Client::publish) ignores this.
+	pub bandwidth: moq_net::bandwidth::Allocator,
 }
 
 /// Outbound WHIP/WHEP dialer.

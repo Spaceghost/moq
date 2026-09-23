@@ -14,15 +14,16 @@ import {
 	Signal,
 } from "@moq/signals";
 import { base64ToBytes } from "../base64";
+import { nextMedia, subscribeMedia } from "../media";
 
-import { type Bound, latencyBounds, type Sync } from "../sync";
+import type { Sync } from "../sync";
 import { type AudioBuffer, createAudioBuffer } from "./buffer";
 import { type DecoderConfig, decoderConfig, type PlaybackIdentity, playbackIdentity } from "./config";
 import { Handover } from "./handover";
+import { reanchorFloor, ringSamples } from "./latency";
 // Compiled and inlined as a blob URL via vite-plugin-worklet.
 import RenderWorklet from "./render-worklet.ts?worklet";
 import type { Source } from "./source";
-import { subscribe } from "./subscription";
 import { type DecodedSpan, Terminal } from "./terminal";
 import { unlockOnGesture } from "./unlock";
 import { Warmup } from "./warmup";
@@ -30,11 +31,20 @@ import { Warmup } from "./warmup";
 // How long the latency target must hold steady before a floor increase re-anchors. Coalesces a
 // slider drag (many small steps) into a single re-anchor once the user settles on a value.
 const LATENCY_REANCHOR_DEBOUNCE_MS = 150;
+
 const LEGACY_WARMUP_CALLBACKS = 3;
 
 export type DecoderInput = {
-	// Enable to download the audio track.
+	// Whether to download the audio track. Defaults to true.
 	enabled: Getter<boolean>;
+};
+
+/** Constructor properties for {@link Decoder}. */
+export type DecoderProps = Inputs<DecoderInput> & {
+	/** Rendition selector supplying encoded audio. */
+	source: Source;
+	/** Shared playback clock. */
+	sync: Sync;
 };
 
 type DecoderOutput = {
@@ -101,7 +111,7 @@ export class Decoder {
 
 	// The latency floor as of the last settled change, to detect a floor *increase* (needs a deeper
 	// cushion) versus a decrease or a real-time RTT wiggle. See #runLatencyReanchor.
-	#prevFloor?: Bound;
+	#prevFloor?: Time.Milli;
 
 	// Which subscription the ring's buffered samples came from. See #runDecoder.
 	#handover = new Handover();
@@ -115,13 +125,14 @@ export class Decoder {
 	// context, worklet, and ring alone.
 	readonly #config: Computed<DecoderConfig | undefined>;
 
-	constructor(source: Source, sync: Sync, props?: Inputs<DecoderInput>) {
+	constructor(props: DecoderProps) {
 		this.in = {
-			enabled: getter(props?.enabled ?? false),
+			enabled: getter(props?.enabled ?? true),
 		};
 
-		this.source = source;
-		this.sync = sync;
+		this.source = props.source;
+		this.sync = props.sync;
+		this.#signals.cleanup(this.sync.register(this.source.out.jitter));
 		this.#identity = this.#signals.computed((effect) => {
 			const config = effect.get(this.source.out.config);
 			return config ? playbackIdentity(config) : undefined;
@@ -187,9 +198,9 @@ export class Decoder {
 			});
 			effect.cleanup(() => worklet.disconnect());
 
-			// Initial target latency in samples.
-			const latency = this.sync.out.buffer.peek();
-			const latencySamples = Math.ceil(sampleRate * Time.Second.fromMilli(latency));
+			// Initial ring depth in samples.
+			const delay = this.sync.out.delay.peek();
+			const latencySamples = ringSamples(sampleRate, delay);
 			const buffered = this.sync.out.buffered.peek();
 
 			// Let the factory pick the best transport (SharedArrayBuffer or postMessage).
@@ -217,6 +228,10 @@ export class Decoder {
 	#runEnabled(effect: Effect): void {
 		const enabled = effect.get(this.in.enabled);
 		if (!enabled) return;
+		if (effect.get(this.sync.in.delay) === "instant") {
+			this.reset();
+			return;
+		}
 
 		const context = effect.get(this.#out.context);
 		if (!context) return;
@@ -236,21 +251,25 @@ export class Decoder {
 		const ring = this.#ring;
 		if (!ring) return;
 
-		const latency = effect.get(this.sync.out.buffer);
-		const latencySamples = Math.ceil(ring.rate * Time.Second.fromMilli(latency));
-		ring.setLatency(latencySamples);
+		const delay = effect.get(this.sync.out.delay);
+		ring.setLatency(ringSamples(ring.rate, delay));
 	}
 
-	// Re-anchor when the latency floor *increases*. A larger floor needs a deeper cushion: video
+	// Re-anchor when the delay floor *increases*. A larger floor needs a deeper cushion: video
 	// rebuilds it implicitly (its per-frame sync.wait() reads the live buffer, so it just holds
 	// longer), but the audio ring keeps draining at its old depth -- resize() (via setLatency) only
 	// re-stalls an *empty* ring, so a mid-playback ring never refills to the new floor and audio runs
 	// ahead of video (the "raise latency, only video re-buffers" desync). reset() re-stalls the ring
-	// so it refills to the new floor. Watch the latency *target* (not the derived buffer) so real-time
-	// RTT jitter never triggers this, and debounce so a slider drag coalesces into one re-anchor.
-	// Decreases are left to natural catch-up.
+	// so it refills to the new floor. Watch the latency target and media delay, excluding adaptive
+	// RTT jitter, and debounce so a slider drag coalesces into one re-anchor. Decreases are left to
+	// natural catch-up.
 	#runLatencyReanchor(effect: Effect): void {
-		const floor = latencyBounds(effect.get(this.sync.in.latency)).min;
+		const delay = effect.get(this.sync.out.delay);
+		const jitter = effect.get(this.sync.out.jitter);
+		const floor = reanchorFloor({
+			delay: effect.get(this.sync.in.delay),
+			media: Time.Milli.sub(delay, jitter),
+		});
 		if (this.#prevFloor === undefined) {
 			// Startup: the initial fill already builds the cushion; just record the baseline.
 			this.#prevFloor = floor;
@@ -260,8 +279,7 @@ export class Decoder {
 		// this effect (tearing down the timer), so compare it against the pre-change baseline directly.
 		const baseline = this.#prevFloor;
 		effect.timer(() => {
-			const toMs = (b: Bound): number => (b === "real-time" ? 0 : b);
-			if (toMs(floor) > toMs(baseline)) this.reset();
+			if (floor > baseline) this.reset();
 			this.#prevFloor = floor;
 		}, LATENCY_REANCHOR_DEBOUNCE_MS);
 	}
@@ -269,6 +287,7 @@ export class Decoder {
 	#runDecoder(effect: Effect): void {
 		const enabled = effect.get(this.in.enabled);
 		if (!enabled) return;
+		if (effect.get(this.sync.in.delay) === "instant") return;
 
 		const broadcast = effect.get(this.source.in.broadcast);
 		if (!broadcast) return;
@@ -293,9 +312,13 @@ export class Decoder {
 		// of tail beyond them. Drop that once the replacement's first frame says where it starts.
 		this.#handover.opened();
 
-		// The Sync ceiling is the maximum age of a non-latest group before both the network and
-		// container consumers skip it. Omitting startGroup keeps a new subscription at the live edge.
-		const sub = subscribe(effect, { broadcast: active, track, maxLatency: this.sync.out.maxBuffer });
+		const sub = subscribeMedia(effect, {
+			broadcast: active,
+			track,
+			priority: Catalog.PRIORITY.audio,
+			maxAge: this.sync.out.maxAge,
+		});
+		if (!sub) return;
 
 		if (config.container.kind === "cmaf") {
 			this.#runCmafDecoder(effect, sub, config);
@@ -308,12 +331,13 @@ export class Decoder {
 		const preSkip =
 			config.codec === "opus" && config.description ? Util.Opus.preSkip(Util.Hex.toBytes(config.description)) : 0;
 		this.#terminal.clear(preSkip);
-		const format = config.container.kind === "loc" ? new Container.Loc.Format() : new Container.Legacy.Format();
+		const format =
+			config.container.kind === "loc" ? new Container.Loc.Format("audio") : new Container.Legacy.Format(config);
 		// Create consumer with slightly less latency than the render worklet to avoid underflowing.
 		// TODO include JITTER_UNDERHEAD
 		const consumer = new Container.Consumer(sub, {
 			format,
-			latency: this.sync.out.maxBuffer,
+			maxAge: this.sync.out.maxAge,
 		});
 		effect.cleanup(() => consumer.close());
 
@@ -362,7 +386,7 @@ export class Decoder {
 			decoder.configure(decoderConfig);
 
 			for (;;) {
-				const next = await consumer.next();
+				const next = await nextMedia(consumer);
 				if (!next) break;
 				if (this.#onNext(next)) {
 					decoder.reset();
@@ -420,7 +444,7 @@ export class Decoder {
 
 		const consumer = new Container.Consumer(sub, {
 			format: new Container.Cmaf.Format(init),
-			latency: this.sync.out.maxBuffer,
+			maxAge: this.sync.out.maxAge,
 		});
 		effect.cleanup(() => consumer.close());
 
@@ -453,7 +477,7 @@ export class Decoder {
 			decoder.configure(decoderConfig);
 
 			for (;;) {
-				const next = await consumer.next();
+				const next = await nextMedia(consumer);
 				if (!next) break;
 
 				// Reset and re-anchor before decoding the first frame of a new codec epoch.

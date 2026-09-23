@@ -49,7 +49,7 @@ client; the relay enables it with `[web.https]`.
 Native clients dial the relay directly with the MoQ ALPN, skipping the HTTP/3
 handshake. The URL path and `?jwt=` token travel in the MoQ `SETUP` message
 instead of a `CONNECT` request, so the server sees the same thing either way.
-`moq-native` picks this automatically for `https://` URLs; use `moql://` or
+`moq-tokio` picks this automatically for `https://` URLs; use `moql://` or
 `moqt://` to force it.
 
 ## TCP and Unix sockets (local workers)
@@ -70,7 +70,7 @@ and its TLS identity.
 
 ```bash
 moq --iroh-enabled --iroh-disable-relay \
-    --client-connect "iroh://<endpoint-id>/anon" --broadcast cam.hang play
+    --connect "iroh://<endpoint-id>/anon" --broadcast cam.hang play
 ```
 
 Keep it on the local network. Across the internet iroh falls back to an n0

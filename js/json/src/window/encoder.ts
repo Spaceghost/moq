@@ -1,16 +1,16 @@
 import { DEFAULT_MAX_FRAME_SIZE, Encoder as Flate } from "@moq/flate";
 import { Group } from "@moq/net";
 
-/** Frames (header included) in one group before a new group is forced, matching the Snapshot cap. */
-const MAX_GROUP_FRAMES = 256;
+/** Frames (header included) in one group before a new group is forced, matching the Snapshot cap. Kept well below the net per-group cap so a roll always precedes GroupTooLarge. */
+const MAX_GROUP_FRAMES = 1024;
 
-/** Op ratio used when {@link ProducerConfig.opRatio} is left unset. */
+/** Op ratio used when {@link Config.opRatio} is left unset. */
 export const DEFAULT_OP_RATIO = 8;
 
 type Edit = { push: string } | { pop: number };
 
-/** Options shared by an {@link Encoder} and the {@link Producer} that wraps one. */
-export interface ProducerConfig {
+/** Options for an {@link Encoder}. */
+export interface Config {
 	/**
 	 * How much the ops in a group may cost before a fresh group is emitted.
 	 *
@@ -28,6 +28,15 @@ export interface ProducerConfig {
 	 * Defaults to `false`.
 	 */
 	compression?: boolean;
+
+	/**
+	 * Maximum records retained and repeated in a group checkpoint.
+	 *
+	 * By default a header repeats the complete window. A bound keeps checkpoints finite for an
+	 * unbounded window: readers following every group retain earlier records, while one joining a
+	 * later group receives one `skip` for the omitted prefix.
+	 */
+	checkpointRecords?: number;
 }
 
 /** One encoded frame, and the group boundary it implies. */
@@ -67,12 +76,14 @@ export interface Pending extends Encoded {
 export class Encoder<T> {
 	#opRatio: number;
 	#compress: boolean;
+	#checkpointRecords?: number;
 
-	// The retained window. Records are stored as encoded JSON text so a header restates exactly the
-	// bytes a push would have carried, and so re-encoding never re-visits the caller's value.
+	// The decodable checkpoint suffix. Without a checkpoint bound this is the complete window.
 	#window: string[] = [];
-	// Absolute index of #window[0]. Only a group header puts this on the wire.
+	// Absolute index of the oldest logically retained record.
 	#offset = 0;
+	// Absolute index of #window[0], which may follow #offset in checkpoint mode.
+	#start = 0;
 
 	#flate?: Flate;
 	// Bytes of pushes and pops in this group, excluding its header frame.
@@ -88,15 +99,22 @@ export class Encoder<T> {
 	// flag belonging to a newer frame.
 	#generation = 0;
 
-	constructor(config: ProducerConfig = {}) {
+	constructor(config: Config = {}) {
 		this.#opRatio = config.opRatio ?? DEFAULT_OP_RATIO;
 		if (!Number.isSafeInteger(this.#opRatio) || this.#opRatio < 0 || this.#opRatio > 0xffffffff) {
 			throw new Error("opRatio must be an unsigned 32-bit integer");
 		}
 		this.#compress = config.compression ?? false;
+		this.#checkpointRecords = config.checkpointRecords;
+		if (
+			this.#checkpointRecords !== undefined &&
+			(!Number.isSafeInteger(this.#checkpointRecords) || this.#checkpointRecords <= 0)
+		) {
+			throw new Error("checkpointRecords must be a positive safe integer");
+		}
 	}
 
-	/** The retained window, oldest first. */
+	/** The retained checkpoint suffix, oldest first. This is complete unless bounded in the config. */
 	get window(): T[] {
 		return this.#window.map((text) => JSON.parse(text) as T);
 	}
@@ -108,7 +126,7 @@ export class Encoder<T> {
 
 	/** Absolute index the next pushed record will take. */
 	get end(): number {
-		return this.#offset + this.#window.length;
+		return this.#start + this.#window.length;
 	}
 
 	/** Discard group-local state after an encoded frame did not reach the wire. */
@@ -136,12 +154,12 @@ export class Encoder<T> {
 
 		const edit: Edit = { push: text };
 		if (this.#resync || !this.#opAllowed()) {
-			return this.#emitHeader(this.#offset, [...this.#window, text], edit);
+			return this.#emitPushHeader(text, edit);
 		}
 
 		const payload = this.#emitOp(`{"push":${text}}`);
 		if (payload) return this.#pendingFrame(payload, false, edit);
-		return this.#emitHeader(this.#offset, [...this.#window, text], edit);
+		return this.#emitPushHeader(text, edit);
 	}
 
 	/**
@@ -156,18 +174,18 @@ export class Encoder<T> {
 		}
 		if (this.#pending) this.#resyncGroup();
 
-		const dropped = Math.min(count, this.#window.length);
+		const dropped = Math.min(count, this.end - this.#offset);
 		if (dropped <= 0) return undefined;
 
 		const offset = this.#offset + dropped;
 		const edit: Edit = { pop: dropped };
 		if (this.#resync || !this.#opAllowed()) {
-			return this.#emitHeader(offset, this.#window.slice(dropped), edit);
+			return this.#emitPopHeader(offset, edit);
 		}
 
 		const payload = this.#emitOp(`{"pop":${dropped}}`);
 		if (payload) return this.#pendingFrame(payload, false, edit);
-		return this.#emitHeader(offset, this.#window.slice(dropped), edit);
+		return this.#emitPopHeader(offset, edit);
 	}
 
 	/** Whether the pending edit may ride as an op in the open group. */
@@ -198,11 +216,23 @@ export class Encoder<T> {
 		return payload;
 	}
 
-	/** Emit the header restating the whole window and opening a new group. */
-	#emitHeader(offset: number, window: string[], edit: Edit): Pending {
+	#emitPushHeader(text: string, edit: Edit): Pending {
+		const records = [...this.#window, text];
+		const skip = this.#checkpointRecords === undefined ? 0 : Math.max(records.length - this.#checkpointRecords, 0);
+		return this.#emitHeader(this.#offset, this.#start + skip, records.slice(skip), edit);
+	}
+
+	#emitPopHeader(offset: number, edit: Edit): Pending {
+		const skip = Math.min(Math.max(offset - this.#start, 0), this.#window.length);
+		return this.#emitHeader(offset, this.#start + skip, this.#window.slice(skip), edit);
+	}
+
+	/** Emit a checkpoint header and open a new group. */
+	#emitHeader(offset: number, start: number, window: string[], edit: Edit): Pending {
 		// The records are already JSON text, so splice them in rather than re-encoding each one; the
 		// bytes a reader sees are then identical to what the matching push carried.
-		const text = `{"offset":${offset},"records":[${window.join(",")}]}`;
+		const checkpoint = start === offset ? "" : `,"start":${start}`;
+		const text = `{"offset":${offset}${checkpoint},"records":[${window.join(",")}]}`;
 		const bytes = new TextEncoder().encode(text);
 		if (bytes.length > DEFAULT_MAX_FRAME_SIZE) {
 			throw new Error("window header exceeds the decoder's decompressed size limit");
@@ -244,9 +274,17 @@ export class Encoder<T> {
 	#commit(edit: Edit): void {
 		if ("push" in edit) {
 			this.#window.push(edit.push);
+			if (this.#checkpointRecords !== undefined && this.#window.length > this.#checkpointRecords) {
+				const dropped = this.#window.length - this.#checkpointRecords;
+				this.#window.splice(0, dropped);
+				this.#start += dropped;
+			}
 		} else {
-			this.#window.splice(0, edit.pop);
-			this.#offset += edit.pop;
+			const offset = this.#offset + edit.pop;
+			const stored = Math.min(Math.max(offset - this.#start, 0), this.#window.length);
+			this.#window.splice(0, stored);
+			this.#start += stored;
+			this.#offset = offset;
 		}
 	}
 }

@@ -50,7 +50,7 @@ Local check before moq.pro (requires a CLI built with the `transcode` feature):
 ```bash
 cargo install --locked moq-cli --features transcode
 # OBS Go Live to e.g. my-obs.hang on a local relay, then:
-moq --client-connect https://localhost:4443/anon --broadcast my-obs.hang transcode
+moq --connect https://localhost:4443/anon --broadcast my-obs.hang transcode
 # Watch my-obs.hang/transcode.hang
 ```
 

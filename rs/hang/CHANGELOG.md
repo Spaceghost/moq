@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- [**breaking**] Replace the catalog root `timeline` entry with `archive`. The
+  flattened timeline fields (`track`, `timescale`, `durationMax`) stay;
+  optional `replay`, `store`, and `version` advertise a durable recording.
+- [**breaking**] Replace the archive timeline `wall` field with a root `clock`
+  section (`{wall, timescale}`). Wall time is one fixed broadcast mapping: PTS zero in the
+  clock timescale since the moq epoch, with every track and the archive index converting
+  into it. Zero timescales, explicit null timescales, and wall values past the JSON-safe integer
+  range are refused.
+
+### Added
+
+- Human-readable labels for audio and video renditions.
+- Shared `catalog::stalled::Detector` for publishers to set the per-rendition `stalled` catalog flag.
+
 ## [0.20.13](https://github.com/moq-dev/moq/compare/hang-v0.20.12...hang-v0.20.13) - 2026-09-17
 
 ### Other

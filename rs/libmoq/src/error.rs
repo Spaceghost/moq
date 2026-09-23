@@ -2,6 +2,126 @@ use std::sync::Arc;
 
 use crate::ffi;
 
+// Keep these public constants as the single source for both Rust's return mapping and the
+// generated C header. -1, -11, -12, and -39 are retired and remain reserved.
+pub const MOQ_ERROR_MOQ: i32 = -2;
+pub const MOQ_ERROR_URL: i32 = -3;
+pub const MOQ_ERROR_UTF8: i32 = -4;
+pub const MOQ_ERROR_CONNECT: i32 = -5;
+pub const MOQ_ERROR_INVALID_POINTER: i32 = -6;
+pub const MOQ_ERROR_INVALID_ID: i32 = -7;
+pub const MOQ_ERROR_NOT_FOUND: i32 = -8;
+pub const MOQ_ERROR_UNKNOWN_FORMAT: i32 = -9;
+pub const MOQ_ERROR_INIT_FAILED: i32 = -10;
+pub const MOQ_ERROR_TIMESTAMP_OVERFLOW: i32 = -13;
+pub const MOQ_ERROR_LEVEL: i32 = -14;
+pub const MOQ_ERROR_INVALID_CODE: i32 = -15;
+pub const MOQ_ERROR_PANIC: i32 = -16;
+pub const MOQ_ERROR_OFFLINE: i32 = -17;
+pub const MOQ_ERROR_HANG: i32 = -18;
+pub const MOQ_ERROR_NO_INDEX: i32 = -19;
+pub const MOQ_ERROR_NUL: i32 = -20;
+pub const MOQ_ERROR_SESSION_NOT_FOUND: i32 = -21;
+pub const MOQ_ERROR_ORIGIN_NOT_FOUND: i32 = -22;
+pub const MOQ_ERROR_ANNOUNCEMENT_NOT_FOUND: i32 = -23;
+pub const MOQ_ERROR_BROADCAST_NOT_FOUND: i32 = -24;
+pub const MOQ_ERROR_CATALOG_NOT_FOUND: i32 = -25;
+pub const MOQ_ERROR_MEDIA_NOT_FOUND: i32 = -26;
+pub const MOQ_ERROR_TRACK_NOT_FOUND: i32 = -27;
+pub const MOQ_ERROR_FRAME_NOT_FOUND: i32 = -28;
+pub const MOQ_ERROR_MUX: i32 = -29;
+pub const MOQ_ERROR_AUDIO: i32 = -30;
+pub const MOQ_ERROR_BUFFER_NOT_CONSUMED: i32 = -31;
+pub const MOQ_ERROR_GROUP_NOT_FOUND: i32 = -32;
+pub const MOQ_ERROR_NATIVE: i32 = -33;
+pub const MOQ_ERROR_UNAUTHORIZED: i32 = -34;
+pub const MOQ_ERROR_FORBIDDEN: i32 = -35;
+pub const MOQ_ERROR_VIDEO: i32 = -36;
+pub const MOQ_ERROR_JSON: i32 = -37;
+pub const MOQ_ERROR_JSON_TRACK: i32 = -38;
+pub const MOQ_ERROR_INVALID_CONFIG: i32 = -40;
+pub const MOQ_ERROR_UNRESOLVABLE_BROADCAST: i32 = -41;
+
+/// Whether a protocol code is from the session or stream registry.
+#[repr(C)]
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, Debug)]
+pub enum moq_error_scope {
+	/// A session close code.
+	MOQ_ERROR_SCOPE_SESSION = 0,
+	/// A stream reset or stop code.
+	MOQ_ERROR_SCOPE_STREAM = 1,
+}
+
+/// A recognized protocol kind. Pair with [`moq_error_scope`]: `CANCEL` is 0 on a session
+/// and 1 on a stream. `APP` and `UNKNOWN` keep the numeric code in [`moq_protocol_error`].
+#[repr(C)]
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, Debug)]
+pub enum moq_protocol_kind {
+	/// Cancel.
+	MOQ_PROTOCOL_KIND_CANCEL = 0,
+	/// Internal.
+	MOQ_PROTOCOL_KIND_INTERNAL = 1,
+	/// Unauthorized.
+	MOQ_PROTOCOL_KIND_UNAUTHORIZED = 2,
+	/// Protocol violation.
+	MOQ_PROTOCOL_KIND_PROTOCOL_VIOLATION = 3,
+	/// Key value formatting.
+	MOQ_PROTOCOL_KIND_KEY_VALUE_FORMATTING = 4,
+	/// Goaway timeout.
+	MOQ_PROTOCOL_KIND_GOAWAY_TIMEOUT = 5,
+	/// Timeout.
+	MOQ_PROTOCOL_KIND_TIMEOUT = 6,
+	/// Version.
+	MOQ_PROTOCOL_KIND_VERSION = 7,
+	// 8 through 10 are unassigned; the values that follow stay put for compiled consumers.
+	/// Delivery timeout.
+	MOQ_PROTOCOL_KIND_DELIVERY_TIMEOUT = 11,
+	/// Session closed.
+	MOQ_PROTOCOL_KIND_SESSION_CLOSED = 12,
+	/// Going away.
+	MOQ_PROTOCOL_KIND_GOING_AWAY = 13,
+	/// Too far behind.
+	MOQ_PROTOCOL_KIND_TOO_FAR_BEHIND = 14,
+	/// Malformed track.
+	MOQ_PROTOCOL_KIND_MALFORMED_TRACK = 15,
+	/// Not found.
+	MOQ_PROTOCOL_KIND_NOT_FOUND = 16,
+	/// Unroutable.
+	MOQ_PROTOCOL_KIND_UNROUTABLE = 17,
+	/// Old.
+	MOQ_PROTOCOL_KIND_OLD = 18,
+	/// Evicted.
+	MOQ_PROTOCOL_KIND_EVICTED = 19,
+	/// Wrong size.
+	MOQ_PROTOCOL_KIND_WRONG_SIZE = 20,
+	/// Frame too large.
+	MOQ_PROTOCOL_KIND_FRAME_TOO_LARGE = 21,
+	/// Timestamp mismatch.
+	MOQ_PROTOCOL_KIND_TIMESTAMP_MISMATCH = 22,
+	/// App.
+	MOQ_PROTOCOL_KIND_APP = 23,
+	/// Unknown.
+	MOQ_PROTOCOL_KIND_UNKNOWN = 24,
+}
+
+/// A protocol failure a peer sent: scope, verbatim wire code, and recognized kind.
+///
+/// Filled by [`crate::moq_error_protocol`] after a call returned a negative code. Do not parse
+/// [`crate::moq_error`] for this; that string is diagnostics only.
+#[repr(C)]
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, Debug)]
+pub struct moq_protocol_error {
+	/// [`moq_error_scope`] discriminant.
+	pub scope: u32,
+	/// The integer on the wire, kept verbatim.
+	pub code: u32,
+	/// [`moq_protocol_kind`] discriminant.
+	pub kind: u32,
+}
+
 /// Status code returned by FFI functions.
 ///
 /// Negative values indicate errors, zero indicates success,
@@ -19,13 +139,13 @@ pub enum Error {
 	#[error("moq error: {0}")]
 	Moq(#[from] moq_net::Error),
 
-	/// Error from the native helper layer (moq-native).
+	/// Error from the native helper layer (moq-tokio).
 	#[error("native error: {0}")]
-	Native(#[from] moq_native::Error),
+	Native(#[from] moq_tokio::Error),
 
 	/// URL parsing error.
 	#[error("url error: {0}")]
-	Url(#[from] url::ParseError),
+	Url(String),
 
 	/// UTF-8 string validation error.
 	#[error("utf8 error: {0}")]
@@ -101,7 +221,7 @@ pub enum Error {
 
 	/// Log level parsing error.
 	#[error("level error: {0}")]
-	Level(Arc<tracing::metadata::ParseLevelError>),
+	Level(String),
 
 	/// Invalid error code conversion.
 	#[error("invalid code")]
@@ -149,19 +269,20 @@ pub enum Error {
 
 	/// Invalid JSON passed for a catalog section.
 	#[error("json error: {0}")]
-	Json(Arc<serde_json::Error>),
+	Json(String),
 
 	/// Error from the moq-json snapshot/stream layer.
 	#[error("json track error: {0}")]
 	JsonTrack(Arc<moq_json::Error>),
 
-	/// Client configuration handle not found.
-	#[error("client not found")]
-	ClientNotFound,
-
 	/// A client configuration value could not be parsed or initialized.
 	#[error("invalid config: {0}")]
 	InvalidConfig(String),
+
+	/// A catalog rendition named another broadcast, but the broadcast it came from was not
+	/// resolved through an origin, so there is nothing to resolve the reference against.
+	#[error("unresolvable broadcast reference: {0}")]
+	UnresolvableBroadcast(String),
 }
 
 impl From<moq_json::Error> for Error {
@@ -173,9 +294,23 @@ impl From<moq_json::Error> for Error {
 	}
 }
 
+// Dependency errors are flattened to their message so their crates stay out of this crate's
+// public API.
 impl From<serde_json::Error> for Error {
 	fn from(err: serde_json::Error) -> Self {
-		Error::Json(Arc::new(err))
+		Error::Json(err.to_string())
+	}
+}
+
+impl From<moq_net::InvalidPattern> for Error {
+	fn from(err: moq_net::InvalidPattern) -> Self {
+		Error::InvalidConfig(err.to_string())
+	}
+}
+
+impl From<url::ParseError> for Error {
+	fn from(err: url::ParseError) -> Self {
+		Error::Url(err.to_string())
 	}
 }
 
@@ -193,7 +328,81 @@ impl From<moq_video::Error> for Error {
 
 impl From<tracing::metadata::ParseLevelError> for Error {
 	fn from(err: tracing::metadata::ParseLevelError) -> Self {
-		Error::Level(Arc::new(err))
+		Error::Level(err.to_string())
+	}
+}
+
+impl Error {
+	/// Structured protocol details when this is a session or stream code, not a local failure.
+	pub(crate) fn protocol(&self) -> Option<moq_protocol_error> {
+		std::iter::successors(Some(self as &(dyn std::error::Error + 'static)), |err| err.source())
+			.find_map(|err| err.downcast_ref::<moq_net::Error>().and_then(protocol_of_net))
+	}
+}
+
+fn protocol_of_net(err: &moq_net::Error) -> Option<moq_protocol_error> {
+	match err {
+		moq_net::Error::Transport(_) => None,
+		moq_net::Error::Session(err) => Some(from_session(err)),
+		moq_net::Error::Stream(err) => Some(from_stream(err)),
+		moq_net::Error::App(app) => Some(from_stream(&moq_net::StreamError::App(*app))),
+		_ => None,
+	}
+}
+
+fn from_session(err: &moq_net::SessionError) -> moq_protocol_error {
+	moq_protocol_error {
+		scope: moq_error_scope::MOQ_ERROR_SCOPE_SESSION as u32,
+		code: err.to_code(),
+		kind: session_kind(err) as u32,
+	}
+}
+
+fn from_stream(err: &moq_net::StreamError) -> moq_protocol_error {
+	moq_protocol_error {
+		scope: moq_error_scope::MOQ_ERROR_SCOPE_STREAM as u32,
+		code: err.to_code(),
+		kind: stream_kind(err) as u32,
+	}
+}
+
+fn session_kind(err: &moq_net::SessionError) -> moq_protocol_kind {
+	use moq_protocol_kind::*;
+	match err {
+		moq_net::SessionError::Cancel => MOQ_PROTOCOL_KIND_CANCEL,
+		moq_net::SessionError::Internal => MOQ_PROTOCOL_KIND_INTERNAL,
+		moq_net::SessionError::Unauthorized => MOQ_PROTOCOL_KIND_UNAUTHORIZED,
+		moq_net::SessionError::ProtocolViolation => MOQ_PROTOCOL_KIND_PROTOCOL_VIOLATION,
+		moq_net::SessionError::KeyValueFormatting => MOQ_PROTOCOL_KIND_KEY_VALUE_FORMATTING,
+		moq_net::SessionError::GoawayTimeout => MOQ_PROTOCOL_KIND_GOAWAY_TIMEOUT,
+		moq_net::SessionError::Timeout => MOQ_PROTOCOL_KIND_TIMEOUT,
+		moq_net::SessionError::Version => MOQ_PROTOCOL_KIND_VERSION,
+		moq_net::SessionError::App(_) => MOQ_PROTOCOL_KIND_APP,
+		moq_net::SessionError::Unknown(_) => MOQ_PROTOCOL_KIND_UNKNOWN,
+		_ => MOQ_PROTOCOL_KIND_UNKNOWN,
+	}
+}
+
+fn stream_kind(err: &moq_net::StreamError) -> moq_protocol_kind {
+	use moq_protocol_kind::*;
+	match err {
+		moq_net::StreamError::Session(_) => MOQ_PROTOCOL_KIND_SESSION_CLOSED,
+		moq_net::StreamError::Internal => MOQ_PROTOCOL_KIND_INTERNAL,
+		moq_net::StreamError::Cancel => MOQ_PROTOCOL_KIND_CANCEL,
+		moq_net::StreamError::DeliveryTimeout => MOQ_PROTOCOL_KIND_DELIVERY_TIMEOUT,
+		moq_net::StreamError::GoingAway => MOQ_PROTOCOL_KIND_GOING_AWAY,
+		moq_net::StreamError::TooFarBehind => MOQ_PROTOCOL_KIND_TOO_FAR_BEHIND,
+		moq_net::StreamError::MalformedTrack => MOQ_PROTOCOL_KIND_MALFORMED_TRACK,
+		moq_net::StreamError::NotFound => MOQ_PROTOCOL_KIND_NOT_FOUND,
+		moq_net::StreamError::Unroutable => MOQ_PROTOCOL_KIND_UNROUTABLE,
+		moq_net::StreamError::Old => MOQ_PROTOCOL_KIND_OLD,
+		moq_net::StreamError::Evicted => MOQ_PROTOCOL_KIND_EVICTED,
+		moq_net::StreamError::WrongSize => MOQ_PROTOCOL_KIND_WRONG_SIZE,
+		moq_net::StreamError::FrameTooLarge => MOQ_PROTOCOL_KIND_FRAME_TOO_LARGE,
+		moq_net::StreamError::TimestampMismatch => MOQ_PROTOCOL_KIND_TIMESTAMP_MISMATCH,
+		moq_net::StreamError::App(_) => MOQ_PROTOCOL_KIND_APP,
+		moq_net::StreamError::Unknown(_) => MOQ_PROTOCOL_KIND_UNKNOWN,
+		_ => MOQ_PROTOCOL_KIND_UNKNOWN,
 	}
 }
 
@@ -204,43 +413,43 @@ impl ffi::ReturnCode for Error {
 
 	fn code(&self) -> i32 {
 		match self {
-			Error::Moq(_) => -2,
-			Error::Url(_) => -3,
-			Error::Utf8(_) => -4,
-			Error::Connect(_) => -5,
-			Error::InvalidPointer => -6,
-			Error::InvalidId => -7,
-			Error::NotFound => -8,
-			Error::UnknownFormat(_) => -9,
-			Error::InitFailed(_) => -10,
-			Error::TimestampOverflow(_) => -13,
-			Error::Level(_) => -14,
-			Error::InvalidCode => -15,
-			Error::Panic => -16,
-			Error::Offline => -17,
-			Error::Hang(_) => -18,
-			Error::NoIndex => -19,
-			Error::NulError(_) => -20,
-			Error::SessionNotFound => -21,
-			Error::OriginNotFound => -22,
-			Error::AnnouncementNotFound => -23,
-			Error::BroadcastNotFound => -24,
-			Error::CatalogNotFound => -25,
-			Error::MediaNotFound => -26,
-			Error::TrackNotFound => -27,
-			Error::FrameNotFound => -28,
-			Error::Mux(_) => -29,
-			Error::Audio(_) => -30,
-			Error::BufferNotConsumed => -31,
-			Error::GroupNotFound => -32,
-			Error::Native(_) => -33,
-			Error::Unauthorized => -34,
-			Error::Forbidden => -35,
-			Error::Video(_) => -36,
-			Error::Json(_) => -37,
-			Error::JsonTrack(_) => -38,
-			Error::ClientNotFound => -39,
-			Error::InvalidConfig(_) => -40,
+			Error::Moq(_) => MOQ_ERROR_MOQ,
+			Error::Url(_) => MOQ_ERROR_URL,
+			Error::Utf8(_) => MOQ_ERROR_UTF8,
+			Error::Connect(_) => MOQ_ERROR_CONNECT,
+			Error::InvalidPointer => MOQ_ERROR_INVALID_POINTER,
+			Error::InvalidId => MOQ_ERROR_INVALID_ID,
+			Error::NotFound => MOQ_ERROR_NOT_FOUND,
+			Error::UnknownFormat(_) => MOQ_ERROR_UNKNOWN_FORMAT,
+			Error::InitFailed(_) => MOQ_ERROR_INIT_FAILED,
+			Error::TimestampOverflow(_) => MOQ_ERROR_TIMESTAMP_OVERFLOW,
+			Error::Level(_) => MOQ_ERROR_LEVEL,
+			Error::InvalidCode => MOQ_ERROR_INVALID_CODE,
+			Error::Panic => MOQ_ERROR_PANIC,
+			Error::Offline => MOQ_ERROR_OFFLINE,
+			Error::Hang(_) => MOQ_ERROR_HANG,
+			Error::NoIndex => MOQ_ERROR_NO_INDEX,
+			Error::NulError(_) => MOQ_ERROR_NUL,
+			Error::SessionNotFound => MOQ_ERROR_SESSION_NOT_FOUND,
+			Error::OriginNotFound => MOQ_ERROR_ORIGIN_NOT_FOUND,
+			Error::AnnouncementNotFound => MOQ_ERROR_ANNOUNCEMENT_NOT_FOUND,
+			Error::BroadcastNotFound => MOQ_ERROR_BROADCAST_NOT_FOUND,
+			Error::CatalogNotFound => MOQ_ERROR_CATALOG_NOT_FOUND,
+			Error::MediaNotFound => MOQ_ERROR_MEDIA_NOT_FOUND,
+			Error::TrackNotFound => MOQ_ERROR_TRACK_NOT_FOUND,
+			Error::FrameNotFound => MOQ_ERROR_FRAME_NOT_FOUND,
+			Error::Mux(_) => MOQ_ERROR_MUX,
+			Error::Audio(_) => MOQ_ERROR_AUDIO,
+			Error::BufferNotConsumed => MOQ_ERROR_BUFFER_NOT_CONSUMED,
+			Error::GroupNotFound => MOQ_ERROR_GROUP_NOT_FOUND,
+			Error::Native(_) => MOQ_ERROR_NATIVE,
+			Error::Unauthorized => MOQ_ERROR_UNAUTHORIZED,
+			Error::Forbidden => MOQ_ERROR_FORBIDDEN,
+			Error::Video(_) => MOQ_ERROR_VIDEO,
+			Error::Json(_) => MOQ_ERROR_JSON,
+			Error::JsonTrack(_) => MOQ_ERROR_JSON_TRACK,
+			Error::InvalidConfig(_) => MOQ_ERROR_INVALID_CONFIG,
+			Error::UnresolvableBroadcast(_) => MOQ_ERROR_UNRESOLVABLE_BROADCAST,
 		}
 	}
 }

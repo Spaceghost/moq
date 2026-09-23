@@ -22,6 +22,7 @@ Don't block on it, ask the rest of the frontier now.
 The *decisions* are the user's: put each to them and wait.
 
 Search other quests and questlines to keep the larger plan consistent.
+When the work changes what a user sees (a wire, an API, a flag, a dashboard), ask whether it needs documentation the feature quest cannot carry inline (a new page or guide), and recommend a quest for that; docs a change makes stale stay in that change.
 When the frontier disagrees with a settled quest/plan, challenge the user and resolve the conflict.
 
 Begin the interview by scoping the goal: the observable outcome, why it matters, and its important boundaries and non-goals.
@@ -33,6 +34,7 @@ The session is done when the frontier is empty.
 The result may be one quest or multiple quests and questlines, split based on what can be completed independently.
 Prefix each quest title with `[XS]`, `[S]`, `[M]`, `[L]`, or `[XL]`, including implementation, verification, and landing work.
 Once complete, create, update, or delete the relevant quests and questlines.
+New work goes in a roadmap line at its rank unless it starts now; a questline groups only quests that ship together, and its README holds the work no child owns (the end-to-end test, the docs page).
 
 When done, commit and create a draft PR following `CONTRIBUTING.md`.
 After local checks pass, mark it ready and monitor CI and the automatic reviews.

@@ -18,8 +18,8 @@ MoQ broadcasts.
 | `export rtc --connect <url>` | WHIP client | Push a broadcast to a remote WHIP endpoint |
 
 ```bash
-moq --client-connect https://relay.example.com/anon --broadcast cam.hang import rtc --listen '[::]:8080'
-moq --client-connect https://relay.example.com/anon --broadcast cam.hang export rtc --listen '[::]:8080'
+moq --connect https://relay.example.com/anon --broadcast cam.hang import rtc --listen '[::]:8080'
+moq --connect https://relay.example.com/anon --broadcast cam.hang export rtc --listen '[::]:8080'
 ```
 
 Peers reach the broadcast at `http://host:8080/<broadcast>`. Opus, H.264,

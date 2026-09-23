@@ -5,7 +5,6 @@ import type * as Moq from "@moq/net";
 import { Time } from "@moq/net";
 import {
 	type Computed,
-	type Dispose,
 	Effect,
 	type Getter,
 	getter,
@@ -15,6 +14,7 @@ import {
 	Signal,
 } from "@moq/signals";
 import { base64ToBytes } from "../base64";
+import { nextMedia, subscribeMedia } from "../media";
 
 import type { Sync } from "../sync";
 import {
@@ -24,7 +24,7 @@ import {
 	playbackIdentity,
 	supportCacheKey,
 } from "./config";
-import { caughtUp } from "./playhead";
+import { caughtUp, renditionJitter, switchJitter } from "./playhead";
 import { rotateVideoDimensions } from "./presentation";
 import type { Source } from "./source";
 
@@ -32,18 +32,16 @@ import type { Source } from "./source";
 const BUFFERING = Time.Milli(500);
 
 export type DecoderInput = {
-	/** Whether to download the video track. Wired from the renderer's output by the parent. */
+	/** Whether to download the video track. Defaults to true; the parent may wire it from the renderer's output. */
 	enabled: Getter<boolean>;
+};
 
-	/**
-	 * Whether to pace playback off the clock, holding each decoded frame until its presentation
-	 * time. Defaults to true.
-	 *
-	 * False paints on decode instead, trading smooth motion for the lowest latency the display can
-	 * offer. The clock stays wired either way and keeps tracking receipts and rewinds, so anything
-	 * else reading it (captions, the UI) still works and re-enabling this resumes cleanly.
-	 */
-	paced: Getter<boolean>;
+/** Constructor properties for {@link Decoder}. */
+export type DecoderProps = Inputs<DecoderInput> & {
+	/** Rendition selector supplying encoded video. */
+	source: Source;
+	/** Shared playback clock. */
+	sync: Sync;
 };
 
 /** Cumulative video statistics since the decoder started. */
@@ -68,6 +66,9 @@ type DecoderOutput = {
 	stalled: Signal<boolean>;
 	stats: Signal<Stats | undefined>;
 
+	// The rendition delay Sync must cover while switching tracks.
+	jitter: Signal<Time.Milli | undefined>;
+
 	// Combined buffered ranges (network jitter + decode buffer)
 	buffered: Signal<Container.BufferedRanges>;
 };
@@ -84,12 +85,14 @@ export class Decoder {
 		display: new Signal<{ width: number; height: number } | undefined>(undefined),
 		stalled: new Signal<boolean>(false),
 		stats: new Signal<Stats | undefined>(undefined),
+		jitter: new Signal<Time.Milli | undefined>(undefined),
 		buffered: new Signal<Container.BufferedRanges>([]),
 	};
 	readonly out = readonlys(this.#out);
 
 	// The current track running, held so we can cancel it when the new track is ready.
 	#active = new Signal<DecoderTrack | undefined>(undefined);
+	#pendingJitter = new Signal<Time.Milli | undefined>(undefined);
 	readonly #identity: Computed<PlaybackIdentity | undefined>;
 
 	#signals = new Effect();
@@ -102,23 +105,30 @@ export class Decoder {
 		this.#out.timestamp.set(undefined);
 	}
 
-	constructor(source: Source, sync: Sync, props?: Inputs<DecoderInput>) {
+	constructor(props: DecoderProps) {
 		this.in = {
-			enabled: getter(props?.enabled ?? false),
-			paced: getter(props?.paced ?? true),
+			enabled: getter(props?.enabled ?? true),
 		};
 
-		this.source = source;
-		this.sync = sync;
+		this.source = props.source;
+		this.sync = props.sync;
+		this.#signals.cleanup(this.sync.register(this.out.jitter));
 		this.#identity = this.#signals.computed((effect) => {
 			const config = effect.get(this.source.out.config);
 			return config ? playbackIdentity(config) : undefined;
 		});
 
+		this.#signals.run(this.#runJitter.bind(this));
 		this.#signals.run(this.#runPending.bind(this));
 		this.#signals.run(this.#runActive.bind(this));
 		this.#signals.run(this.#runDisplay.bind(this));
 		this.#signals.run(this.#runBuffering.bind(this));
+	}
+
+	#runJitter(effect: Effect): void {
+		const active = effect.get(this.#active)?.jitter;
+		const pending = effect.get(this.#pendingJitter);
+		effect.set(this.#out.jitter, switchJitter({ active, pending }));
 	}
 
 	#runPending(effect: Effect): void {
@@ -150,12 +160,12 @@ export class Decoder {
 		// Start a new pending effect.
 		let pending: DecoderTrack | undefined = new DecoderTrack({
 			sync: this.sync,
-			paced: this.in.paced,
 			broadcast: active,
 			track,
 			config: identity.decoder,
 			stats: this.#out.stats,
 		});
+		effect.set(this.#pendingJitter, pending.jitter);
 
 		effect.cleanup(() => pending?.close());
 
@@ -175,6 +185,7 @@ export class Decoder {
 			// Upgrade the pending track to active.
 			// #runActive will be in charge of it now.
 			this.#active.set(pending);
+			this.#pendingJitter.set(undefined);
 			pending = undefined;
 
 			// This effect is done; close it to avoid a useless re-run.
@@ -253,7 +264,6 @@ export class Decoder {
 
 interface DecoderTrackProps {
 	sync: Sync;
-	paced: Getter<boolean>;
 	broadcast: Moq.Broadcast.Consumer;
 	track: string;
 	config: DecoderConfig;
@@ -263,11 +273,11 @@ interface DecoderTrackProps {
 
 class DecoderTrack {
 	sync: Sync;
-	paced: Getter<boolean>;
 	broadcast: Moq.Broadcast.Consumer;
 	track: string;
 	config: DecoderConfig;
 	stats: Signal<Stats | undefined>;
+	jitter: Time.Milli | undefined;
 
 	timestamp = new Signal<Time.Milli | undefined>(undefined);
 	frame = new Signal<VideoFrame | undefined>(undefined);
@@ -278,10 +288,6 @@ class DecoderTrack {
 	// Decoded frames waiting to be rendered.
 	#buffered = new Signal<Container.BufferedRanges>([]);
 
-	// The container's reorder/skip budget, mirroring the sync buffer. Zero when unpaced,
-	// matching the consumer's own default: don't wait, skip to the live edge.
-	#latency = new Signal<Time.Milli>(Time.Milli.zero);
-
 	// The last discontinuity count seen from the container consumer; doubles as a generation
 	// so in-flight decodes from before a rewind can be dropped on output.
 	#discontinuity = 0;
@@ -290,23 +296,23 @@ class DecoderTrack {
 
 	constructor(props: DecoderTrackProps) {
 		this.sync = props.sync;
-		this.paced = props.paced;
 		this.broadcast = props.broadcast;
 		this.track = props.track;
 		this.config = props.config;
 		this.stats = props.stats;
-
-		this.#signals.run((effect) => {
-			const paced = effect.get(this.paced);
-			this.#latency.set(paced ? effect.get(this.sync.out.buffer) : Time.Milli.zero);
-		});
+		this.jitter = renditionJitter(props.config);
 
 		this.#signals.run(this.#run.bind(this));
 	}
 
 	#run(effect: Effect): void {
-		const sub = this.broadcast.track(this.track).subscribe({ priority: Catalog.PRIORITY.video });
-		effect.cleanup(() => sub.close());
+		const sub = subscribeMedia(effect, {
+			broadcast: this.broadcast,
+			track: this.track,
+			priority: Catalog.PRIORITY.video,
+			maxAge: this.sync.out.maxAge,
+		});
+		if (!sub) return;
 
 		const decoder = new VideoDecoder({
 			output: async (frame: VideoFrame) => {
@@ -321,26 +327,27 @@ class DecoderTrack {
 						return;
 					}
 
-					if (this.paced.peek()) {
-						// `received()` runs at submit, so a frame is anchored by the time it decodes.
-						// Reaching here unanchored means a rewind reset the clock after this frame's
-						// received(), so it predates the current timeline. Drop it: painting it would
-						// set `timestamp` from the old timeline and late-reject the whole rewind.
-						if (this.sync.out.reference.peek() === undefined) return;
+					// `received()` runs at submit, so a frame is anchored by the time it decodes.
+					// Reaching here unanchored means a rewind reset the clock after this frame's
+					// received(), so it predates the current timeline. Drop it: painting it would
+					// set `timestamp` from the old timeline and late-reject the whole rewind.
+					if (this.sync.out.reference.peek() === undefined) return;
 
-						if (this.frame.peek() === undefined) {
-							// Render something while we wait for the sync to catch up.
-							this.frame.set(frame.clone());
-						}
+					if (this.frame.peek() === undefined) {
+						// Render something while we wait for the sync to catch up.
+						this.frame.set(frame.clone());
+					}
 
-						if (!(await this.#park(timestamp, effect))) return;
-						if (generation !== this.#discontinuity) return; // a rewind happened while waiting
+					// Returns immediately when the latency is "instant".
+					const wait = this.sync.wait(timestamp).then(() => true);
+					const ok = await Promise.race([wait, effect.cancel]);
+					if (!ok) return;
+					if (generation !== this.#discontinuity) return; // a rewind happened while waiting
 
-						if (timestamp < (this.timestamp.peek() ?? 0)) {
-							// Late frame, don't render it.
-							// NOTE: This can happen when the ref is updated, such as on playback start.
-							return;
-						}
+					if (timestamp < (this.timestamp.peek() ?? 0)) {
+						// Late frame, don't render it.
+						// NOTE: This can happen when the ref is updated, such as on playback start.
+						return;
 					}
 
 					this.timestamp.set(timestamp);
@@ -358,7 +365,7 @@ class DecoderTrack {
 			},
 			// TODO bubble up error
 			error: (error) => {
-				console.error(error);
+				console.error("video decoder error", error);
 				effect.close();
 			},
 		});
@@ -376,11 +383,13 @@ class DecoderTrack {
 
 	#runLegacy(effect: Effect, sub: Moq.Track.Subscriber, decoder: VideoDecoder): void {
 		const format =
-			this.config.container.kind === "loc" ? new Container.Loc.Format() : new Container.Legacy.Format();
+			this.config.container.kind === "loc"
+				? new Container.Loc.Format("video")
+				: new Container.Legacy.Format(this.config);
 		// Create consumer that reorders groups/frames up to the provided latency.
 		const consumer = new Container.Consumer(sub, {
 			format,
-			latency: this.#latency,
+			maxAge: this.sync.out.maxAge,
 		});
 		effect.cleanup(() => consumer.close());
 
@@ -405,7 +414,7 @@ class DecoderTrack {
 
 		effect.spawn(async () => {
 			for (;;) {
-				const next = await consumer.next();
+				const next = await nextMedia(consumer);
 				if (!next) break;
 
 				// Publisher rewound: flush queued/in-flight video and re-anchor before decoding.
@@ -456,7 +465,7 @@ class DecoderTrack {
 
 		const consumer = new Container.Consumer(sub, {
 			format: new Container.Cmaf.Format(init),
-			latency: this.#latency,
+			maxAge: this.sync.out.maxAge,
 		});
 		effect.cleanup(() => consumer.close());
 
@@ -482,7 +491,7 @@ class DecoderTrack {
 
 		effect.spawn(async () => {
 			for (;;) {
-				const next = await consumer.next();
+				const next = await nextMedia(consumer);
 				if (!next) break;
 
 				// Publisher rewound: flush queued/in-flight video and re-anchor before decoding.
@@ -535,28 +544,6 @@ class DecoderTrack {
 		this.#buffered.set([]);
 		this.sync.reset();
 		return true;
-	}
-
-	// Sleep until the clock says to paint this frame, waking early if pacing is turned off or the
-	// run is torn down. Returns false when the frame should be dropped.
-	//
-	// Turning pacing off has to release parked frames, otherwise a deep buffer holds them (and their
-	// GPU memory) until deadlines that no longer apply. They paint rather than drop: a parked frame
-	// is early, not stale, so it is the freshest picture available the moment pacing stops.
-	//
-	// Dispose the registration once the race settles: one that outlives the frame retains an entry
-	// per decoded frame for as long as the track lives, which is unbounded during steady playback.
-	async #park(timestamp: Time.Milli, effect: Effect): Promise<boolean> {
-		let release: Dispose | undefined;
-		try {
-			const released = new Promise<boolean>((resolve) => {
-				release = this.paced.changed(() => resolve(!this.paced.peek()));
-			});
-			const wait = this.sync.wait(timestamp).then(() => true);
-			return (await Promise.race([wait, released, effect.cancel])) ?? false;
-		} finally {
-			release?.();
-		}
 	}
 
 	// Add a range to the decode buffer (decoded, waiting to render)

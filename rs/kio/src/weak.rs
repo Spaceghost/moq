@@ -75,8 +75,8 @@ impl<T> std::fmt::Debug for Weak<T> {
 
 /// A weak handle from the producing side ([`Producer::weak`](crate::Producer::weak)).
 ///
-/// Holds no ref count, so it never keeps the channel open. Upgrade it back to a [`Producer`]
-/// (write access) or a [`Consumer`] (read access) while the channel is still live.
+/// Holds no ref count, so it never keeps the channel open. Upgrade it to a [`Producer`]
+/// while the channel is live, or create a [`Consumer`] to read even after closure.
 ///
 /// It does keep the state *allocated*, which is what lets it read a closed channel's final
 /// value. Reach for [`Weak`] instead when the handle is stored inside that same state.
@@ -106,20 +106,18 @@ impl<T> ProducerWeak<T> {
 		})
 	}
 
-	/// Create a new [`Consumer`] that shares this state.
+	/// Create a consumer that can read the final value even after the channel closes.
 	pub fn consume(&self) -> Consumer<T> {
-		let prev = self.counts.consumers.fetch_add(1, Ordering::AcqRel);
+		crate::consumer::consume(&self.state, &self.counts)
+	}
 
-		// Wake `used()` waiters when the first consumer appears.
-		if prev == 0 {
-			let mut waiters = self.state.lock().waiters_consumer.take();
-			waiters.wake();
-		}
-
-		Consumer {
-			state: self.state.clone(),
-			counts: self.counts.clone(),
-		}
+	/// Create a consumer only if the channel is open.
+	///
+	/// The closed check and count increment share the lock held by
+	/// [`Producer::write_unused`], so an idle teardown either sees this consumer
+	/// or closes the channel before this returns `None`.
+	pub fn try_consume(&self) -> Option<Consumer<T>> {
+		crate::consumer::consume_open(&self.state, &self.counts)
 	}
 
 	/// Get read-only access to the shared state.
@@ -252,20 +250,9 @@ pub struct ConsumerWeak<T> {
 }
 
 impl<T> ConsumerWeak<T> {
-	/// Create a new [`Consumer`] that shares this state.
+	/// Create a consumer that can read the final value even after the channel closes.
 	pub fn consume(&self) -> Consumer<T> {
-		let prev = self.counts.consumers.fetch_add(1, Ordering::AcqRel);
-
-		// Wake `used()` waiters when the first consumer appears.
-		if prev == 0 {
-			let mut waiters = self.state.lock().waiters_consumer.take();
-			waiters.wake();
-		}
-
-		Consumer {
-			state: self.state.clone(),
-			counts: self.counts.clone(),
-		}
+		crate::consumer::consume(&self.state, &self.counts)
 	}
 
 	/// Get read-only access to the shared state.
@@ -273,6 +260,32 @@ impl<T> ConsumerWeak<T> {
 		Ref {
 			state: self.state.lock(),
 		}
+	}
+
+	/// Poll the shared state with a closure, exactly as [`Consumer::poll`] does.
+	///
+	/// Available here so a watcher can register for changes without joining the
+	/// consumer count, which is what [`Producer::unused`](crate::Producer::unused)
+	/// keys off.
+	pub fn poll<F, R>(&self, waiter: &Waiter, mut f: F) -> Poll<Result<R, Ref<'_, T>>>
+	where
+		F: FnMut(&Ref<'_, T>) -> Poll<R>,
+	{
+		let state = self.state.lock();
+		let consumer_state = Ref { state };
+
+		if let Poll::Ready(res) = f(&consumer_state) {
+			return Poll::Ready(Ok(res));
+		}
+
+		if consumer_state.state.closed {
+			return Poll::Ready(Err(consumer_state));
+		}
+
+		let mut state = consumer_state.state;
+		waiter.register(&mut state.waiters_value);
+
+		Poll::Pending
 	}
 
 	/// Returns `true` if the channel has been closed.

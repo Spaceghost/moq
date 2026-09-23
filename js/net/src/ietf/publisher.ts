@@ -1,18 +1,24 @@
-import { type Dispose, Signal } from "@moq/signals";
+import { type Dispose, type Getter, Signal } from "@moq/signals";
 import type * as broadcast from "../broadcast.ts";
-import { error, reason } from "../error.ts";
+import { controlTimeout, error, reason, StreamCode, StreamError } from "../error.ts";
 import type * as group from "../group.ts";
+import { type Route, routesEqual } from "../hop.ts";
+import { hooks } from "../internal.ts";
+import type { Consumer as OriginConsumer } from "../origin.ts";
 import * as Path from "../path.ts";
 import { type Stream, Writer } from "../stream.ts";
-import type { Timescale } from "../time.ts";
+import { Milli, type Timescale } from "../time.ts";
 import type { Subscriber as TrackSubscriber } from "../track.ts";
-import { withTimeout } from "../util/timeout.ts";
+import { TimeoutError, withTimeout } from "../util/timeout.ts";
+import * as Varint from "../varint.ts";
+import { type Advertised, wireOf } from "../wire.ts";
 import type { Session } from "./adapter.ts";
 import * as Cluster from "./cluster.ts";
+import { requestReason, toRequestCode } from "./error.ts";
 import { FetchHeader } from "./fetch.ts";
 import * as Filter from "./filter.ts";
 import { FetchFrame, Frame, Group as GroupMessage } from "./object.ts";
-import { fromWire } from "./priority.ts";
+import { fromWire, toWire } from "./priority.ts";
 import * as Properties from "./properties.ts";
 import { PublishDone } from "./publish.ts";
 import { PublishNamespace, PublishNamespaceDone, PublishNamespaceOk } from "./publish_namespace.ts";
@@ -32,6 +38,19 @@ const RETRY_BASE = 100;
 
 /** Ceiling on that wait. The loop retries for the life of the session, so it must not spin. */
 const RETRY_MAX = 5000;
+
+/** Cluster parameters for one snapshot: the advertised hops, then our own id last. */
+function clusterFor(base: Cluster.Advert | undefined, route: Route): Cluster.Advert | undefined {
+	if (!base) return undefined;
+	const self = base.hops.at(-1);
+	if (self === undefined) return undefined;
+	const hops = route.hops.at(-1) === self ? [...route.hops] : [...route.hops, self];
+	return { hops, cost: route.cost.warm };
+}
+
+function sameAdvert(a: Advertised | undefined, b: Advertised | undefined): boolean {
+	return a !== undefined && b !== undefined && a.identity === b.identity && routesEqual(a.route, b.route);
+}
 
 /** PUBLISH_DONE statuses this implementation emits. Stable across drafts 14 through 19. */
 const PUBLISH_DONE_STATUS = {
@@ -71,6 +90,9 @@ interface RunGroup {
 
 	/** The track's advertised timescale, applied to every frame timestamp. */
 	timescale: Timescale;
+
+	/** The publisher's tie-break priority, already converted to the IETF wire convention. */
+	publisherPriority: number;
 
 	/**
 	 * Whether objects carry their presentation timestamp.
@@ -132,14 +154,19 @@ export class Publisher {
 	#session: Session;
 	#requiresSolicitation: boolean;
 
+	// The published broadcasts, borrowed from the origin this session serves. The origin
+	// outlives the session, so this is read-only here: subscribe_namespace streams watch it
+	// for changes, and closing the session leaves the broadcasts alone. The namespaces are
+	// advertised with an unsolicited PUBLISH_NAMESPACE (see {@link runPublishNamespaces}), or on
+	// request if the peer asked for that (see {@link runSubscribeNamespace}).
+	#broadcasts: Getter<ReadonlyMap<Path.Valid, broadcast.Consumer> | undefined>;
+	#advertised: Getter<ReadonlyMap<Path.Valid, Advertised> | undefined>;
+	#publish?: OriginConsumer;
+
 	// What every advertisement carries on a session that negotiated the MoQ Cluster
 	// extension: a hop path holding our own id, so the peer can tell that what it hears
 	// back came from us. `undefined` when nothing negotiated it.
 	#advert?: Cluster.Advert;
-
-	// Our published broadcasts.
-	// It's a signal so we can live update any subscribe_namespace streams.
-	#broadcasts = new Signal<Map<Path.Valid, broadcast.Producer> | undefined>(new Map());
 
 	/**
 	 * Creates a new Publisher instance.
@@ -149,6 +176,7 @@ export class Publisher {
 	constructor({
 		quic,
 		session,
+		publish,
 		requiresSolicitation,
 		cluster,
 	}: {
@@ -156,6 +184,8 @@ export class Publisher {
 		quic: WebTransport;
 		/** The session abstraction for bidi streams and request IDs. */
 		session: Session;
+		/** The origin whose broadcasts this session serves; omit to publish nothing. */
+		publish?: OriginConsumer;
 		/** Whether the peer's SETUP asked to be told on request (MoQ Solicit). */
 		requiresSolicitation: boolean;
 		/** The Hop IDs the SETUP exchange settled (MoQ Cluster). */
@@ -163,29 +193,12 @@ export class Publisher {
 	}) {
 		this.#quic = quic;
 		this.#session = session;
+		const origin = publish && wireOf(publish);
+		this.#broadcasts = origin?.broadcasts ?? new Signal(new Map());
+		this.#advertised = origin?.advertised ?? new Signal(new Map());
+		this.#publish = publish;
 		this.#requiresSolicitation = requiresSolicitation;
 		this.#advert = Cluster.advertise(cluster);
-	}
-
-	/**
-	 * Publishes a broadcast with any associated tracks.
-	 * The namespace is advertised with an unsolicited PUBLISH_NAMESPACE, or on request
-	 * if the peer asked for that (see {@link runPublishNamespaces}).
-	 */
-	publish(path: Path.Valid, broadcast: broadcast.Producer) {
-		this.#broadcasts.mutate((broadcasts) => {
-			if (!broadcasts) throw new Error("closed");
-			broadcasts.set(path, broadcast);
-		});
-
-		// Remove the broadcast from the lookup when it's closed, unless the path was republished.
-		void broadcast.closed.then(() => {
-			this.#broadcasts.mutate((broadcasts) => {
-				if (broadcasts?.get(path) === broadcast) {
-					broadcasts.delete(path);
-				}
-			});
-		});
 	}
 
 	/**
@@ -197,40 +210,69 @@ export class Publisher {
 	async runSubscribe(msg: Subscribe, stream: Stream) {
 		const version = this.#session.version;
 		const name = msg.trackNamespace;
-		const broadcast = this.#broadcasts.peek()?.get(name);
+		let broadcast: broadcast.Consumer | undefined;
+		let refusal: { errorCode: number; reasonPhrase: string } | undefined;
+		try {
+			broadcast =
+				this.#broadcasts.peek()?.get(name) ?? (this.#publish && (await wireOf(this.#publish).demand(name)));
+			if (!broadcast) {
+				refusal = {
+					errorCode: toRequestCode("does_not_exist", "subscribe", version),
+					reasonPhrase: "broadcast not found",
+				};
+			}
+		} catch (err: unknown) {
+			const e = error(err);
+			const condition =
+				e instanceof StreamError && e.code === StreamCode.NotFound ? "does_not_exist" : "internal";
+			refusal = { errorCode: toRequestCode(condition, "subscribe", version), reasonPhrase: reason(e) };
+		}
 
-		if (!broadcast) {
-			// Write error response
+		if (refusal) {
 			if (version === Version.DRAFT_14) {
 				await stream.writer.u53(SubscribeError.id);
 				const err = new SubscribeError({
 					requestId: msg.requestId,
-					errorCode: 404,
-					reasonPhrase: "Broadcast not found",
+					errorCode: refusal.errorCode,
+					reasonPhrase: refusal.reasonPhrase,
 				});
 				await err.encode(stream.writer, version);
 			} else {
 				await stream.writer.u53(RequestError.id);
 				const err = new RequestError({
 					requestId: version === Version.DRAFT_15 || version === Version.DRAFT_16 ? msg.requestId : undefined,
-					errorCode: 404,
-					reasonPhrase: "Broadcast not found",
+					errorCode: refusal.errorCode,
+					reasonPhrase: refusal.reasonPhrase,
 				});
 				await err.encode(stream.writer, version);
 			}
 			stream.close();
 			return;
 		}
+		if (!broadcast) return;
 
 		const priority = fromWire(msg.subscriberPriority);
-		const track = broadcast.subscribe(msg.trackName, { priority });
+		const track = wireOf(broadcast).subscribe(msg.trackName, {
+			priority,
+			// moq-transport has no subscriber latency parameter. Keep everything the
+			// producer retained and let the receiving subscriber enforce its own budget.
+			// Keep the sentinel encodable if this demand crosses a Lite hop before the
+			// producer's retention bound is known.
+			maxAge: Milli(Varint.MAX_U53),
+		});
 
-		// Hoisted so the cleanup below reaches it: the fork happens before SUBSCRIBE_OK is
-		// written, and a write that throws must not strand the sink it attached.
 		let cache: TrackSubscriber | undefined;
 
 		try {
-			const timescale = (await track.info()).timescale;
+			// Declaring the timescale is what opts the track into timestamps; every object
+			// Timestamp below is in these units.
+			const info = await track.info();
+			const timescale = info.timescale;
+			// The model ranks higher-first, the IETF wire lower-first. Every group this
+			// subscription serves carries the same publisher priority, which is what lets a
+			// relay prefer catalog and audio over video when it has no subscriber preference
+			// to go on.
+			const publisherPriority = toWire(info.priority);
 
 			// The filter and any fill are relative to the live edge, so snapshot it once: the
 			// fill ends exactly where a Next Object subscription begins, which is what lets
@@ -242,14 +284,18 @@ export class Publisher {
 			// The wire request tells an upstream what we need; the cursor is what actually
 			// trims this subscriber, since the producer fans every cached group out to every
 			// sink regardless. An absent start joins at the latest group, which is what
-			// moq-lite means by joining a live track.
+			// moq-lite means by joining a live track. The range's end is the inclusive last
+			// group; the model's `endGroup` is exclusive.
 			track.update({
 				priority,
-				startGroup: range.start && Number(range.start.group),
-				endGroup: range.end && Number(range.end.group),
+				maxAge: Milli(Varint.MAX_U53),
+				groups: {
+					start: range.start ? { included: Number(range.start.group) } : undefined,
+					end: range.end ? { included: Number(range.end.group) } : undefined,
+				},
 			});
 			const startGroup = range.start ? Number(range.start.group) : track.latest();
-			if (startGroup !== undefined) track.startAt(startGroup);
+			if (startGroup !== undefined) track.setGroups({ start: { included: startGroup } });
 
 			// A fill reads the group cache through its own consumer, independent of the
 			// subscription's cursor. Forked from this subscriber rather than resolved through
@@ -257,7 +303,7 @@ export class Publisher {
 			// asking the broadcast would mint a second producer nobody has accepted.
 			const fill =
 				msg.fill && Filter.isDraft20(version) ? fillRange(msg.fill, msg.filter, edge.largest) : undefined;
-			cache = fill && fill.kind !== "empty" ? track.fork({ priority }) : undefined;
+			cache = fill && fill.kind !== "empty" ? track.fork({ priority, maxAge: Milli(Varint.MAX_U53) }) : undefined;
 
 			// Send SUBSCRIBE_OK
 			await stream.writer.u53(SubscribeOk.id);
@@ -312,7 +358,7 @@ export class Publisher {
 					const group = await track.recvGroup();
 					if (!group) return;
 
-					// Past the filter's end. Dropped here rather than through `endAt`, which
+					// Past the filter's end. Dropped here rather than through `setGroups`, which
 					// parks a capped group instead: this range is fixed for the life of the
 					// subscription, so a group above it is never coming back in, and holding
 					// one keeps the loop from ever ending. A producer that publishes beyond
@@ -326,6 +372,7 @@ export class Publisher {
 						requestId: msg.requestId,
 						group,
 						timescale,
+						publisherPriority,
 						stamped: msg.propertiesWanted,
 						slice: groupSlice(range, group.sequence),
 						unsubscribed,
@@ -398,7 +445,7 @@ export class Publisher {
 	 * Runs a group and sends its frames using ObjectStream (Subgroup delivery mode).
 	 */
 	async #runGroup(options: RunGroup) {
-		const { requestId, group, timescale, stamped, slice, unsubscribed } = options;
+		const { requestId, group, timescale, publisherPriority, stamped, slice, unsubscribed } = options;
 		try {
 			// One stream per group is faster than a peer at its limit can retire them, so this
 			// is the one path that doesn't wait for a slot: the transport would serve the opens
@@ -418,7 +465,7 @@ export class Publisher {
 				trackAlias: requestId,
 				groupId: group.sequence,
 				subGroupId: 0,
-				publisherPriority: 0,
+				publisherPriority,
 				flags: {
 					// The object properties carry the timestamp, so there is nothing to write
 					// when the track declared no units to read one in.
@@ -433,9 +480,8 @@ export class Publisher {
 				},
 			});
 
-			await header.encode(stream, this.#session.version);
-
 			try {
+				await hooks.guardGroup(group, header.encode(stream, this.#session.version));
 				// The first written object goes on the wire as its absolute id, so a trimmed
 				// head shows the true numbering rather than a silently renumbered group.
 				let first = true;
@@ -450,19 +496,27 @@ export class Publisher {
 					// outside the requested range, so stop without waiting for the group's end.
 					if (slice.until !== undefined && next >= slice.until) break;
 
-					// Reading from the filter's start drops the objects below it, including any the
-					// group's cache evicted: they are outside the requested range, so losing them is
-					// not the gap that would otherwise reset this stream and forfeit the rest of the
-					// group. An eviction at or above the start is a real gap and still throws.
-					const frame = await Promise.race([group.readFrameSequence({ from: slice.skip }), stream.closed]);
-					if (!frame) break;
-					next = frame.sequence + 1;
-					if (slice.until !== undefined && frame.sequence >= slice.until) break;
+					// Reading from the filter's start drops the objects below it: they are outside
+					// the requested range, so skipping them is not a gap.
+					const read = await Promise.race([hooks.readGroupFrame(group, slice.skip), stream.closed]);
+					if (!read) break;
+					next = read.sequence + 1;
+					if (slice.until !== undefined && read.sequence >= slice.until) {
+						read.complete();
+						break;
+					}
 
-					const obj = new Frame({ payload: frame.payload, timestamp: frame.timestamp });
-					const delta = first ? frame.sequence : 0;
-					first = false;
-					await obj.encode(stream, header.flags, timescale, this.#session.version, delta);
+					try {
+						const obj = new Frame({ payload: read.frame.payload, timestamp: read.frame.timestamp });
+						const delta = first ? read.sequence : 0;
+						first = false;
+						await hooks.guardGroup(
+							group,
+							obj.encode(stream, header.flags, timescale, this.#session.version, delta),
+						);
+					} finally {
+						read.complete();
+					}
 				}
 
 				stream.close();
@@ -556,8 +610,7 @@ export class Publisher {
 			// subscription, so stop without waiting for the group's end.
 			if (fill.until !== undefined && next >= fill.until) break;
 
-			// Reading from the fill's start drops everything below it, evicted objects included;
-			// see the same read in #runGroup.
+			// Reading from the fill's start drops everything below it; see the same read in #runGroup.
 			const frame = await Promise.race([
 				group.readFrameSequence({ from: Number(fill.skip) }),
 				stream.closed,
@@ -621,13 +674,14 @@ export class Publisher {
 
 			// Reports whether the peer now holds the namespace: an inline entry always
 			// lands, but a PUBLISH_NAMESPACE request can be declined.
-			const advertise = async (suffix: Path.Valid): Promise<boolean> => {
+			const advertise = async (suffix: Path.Valid, snap: Advertised): Promise<boolean> => {
+				const cluster = clusterFor(this.#advert, snap.route);
 				if (legacy) {
-					return await this.#advertise(Path.join(prefix, suffix), requests, refused);
+					return await this.#advertise(Path.join(prefix, suffix), requests, refused, cluster);
 				}
 
 				await stream.writer.u53(SubscribeNamespaceEntry.id);
-				await new SubscribeNamespaceEntry({ suffix, cluster: this.#advert }).encode(stream.writer, version);
+				await new SubscribeNamespaceEntry({ suffix, cluster }).encode(stream.writer, version);
 				return true;
 			};
 			const withdraw = async (suffix: Path.Valid) => {
@@ -639,13 +693,14 @@ export class Publisher {
 				}
 			};
 
-			// Which producer holds each advertised suffix. Keyed on the producer rather than
-			// the path alone, so a path handed to a new producer is withdrawn and re-offered
-			// instead of diffing away to nothing and leaving the peer on the dead generation.
-			let active = new Map<Path.Valid, broadcast.Producer>();
+			// What the peer holds: keyed by suffix, valued by the routing front, so a republish
+			// diffs as withdraw-then-advertise rather than nothing.
+			let active = new Map<Path.Valid, Advertised>();
 			let retry = 0;
 			// What the peer refused, and whether coming back is worth anything.
 			const refused = new Map<Path.Valid, Refused>();
+			// The identity each refusal was about, so a republish at the same path clears it.
+			const offered = new Map<Path.Valid, object>();
 
 			for (;;) {
 				// Subscribe BEFORE reconciling, for the same reason as
@@ -653,46 +708,53 @@ export class Publisher {
 				// waits for its reply only notifies listeners already registered.
 				// TODO Make a better helper within Signals.
 				let dispose!: Dispose;
-				const changed = new Promise<Map<Path.Valid, broadcast.Producer> | undefined>((resolve) => {
-					dispose = this.#broadcasts.changed(resolve);
+				const changed = new Promise<ReadonlyMap<Path.Valid, Advertised> | undefined>((resolve) => {
+					dispose = this.#advertised.changed(resolve);
 				});
 
-				const broadcasts = this.#broadcasts.peek();
-				if (!broadcasts) {
+				const advertised = this.#advertised.peek();
+				if (!advertised) {
 					dispose();
 					break;
 				}
 
-				const updated = new Map<Path.Valid, broadcast.Producer>();
-				for (const [name, producer] of broadcasts) {
-					const suffix = Path.stripPrefix(prefix, name);
+				const updated = new Map<Path.Valid, Advertised>();
+				for (const [covered, snap] of advertised) {
+					const suffix = Path.stripPrefix(prefix, covered);
 					if (suffix === null) continue;
-					updated.set(suffix, producer);
+					updated.set(suffix, snap);
 				}
 
-				// A namespace that is gone takes its refusal with it, so re-announcing the
-				// path offers it again.
-				const live = new Set<Path.Valid>([...updated.keys()].map((suffix) => Path.join(prefix, suffix)));
+				// A namespace that is gone, or that a republish replaced, takes its refusal with
+				// it: the peer refused a broadcast, not a path forever, so a different one at
+				// the same path is offered again. The origin swaps the front in one mutation,
+				// so the path never leaves `updated` and only the front says they differ.
 				for (const path of [...refused.keys()]) {
-					if (!live.has(path)) refused.delete(path);
+					const suffix = Path.stripPrefix(prefix, path);
+					const snap = suffix === null ? undefined : updated.get(suffix);
+					if (snap === undefined || offered.get(path) !== snap.identity) {
+						refused.delete(path);
+						offered.delete(path);
+					}
 				}
 
 				// Track what the peer holds rather than what we attempted: a declined
 				// advertisement stays out of `held`, so the next turn retries it instead of
 				// believing the namespace is already up.
-				const held = new Map<Path.Valid, broadcast.Producer>(active);
-
-				// Withdraw first, so a replacement reads as an end followed by a start.
-				for (const [suffix, producer] of active) {
-					if (updated.get(suffix) === producer) continue;
-					await withdraw(suffix);
-					held.delete(suffix);
+				const held = new Map<Path.Valid, Advertised>(active);
+				// Withdraw first so a republish or re-price reads as withdraw-then-advertise
+				// (a restart). Identity change is a new broadcast; a route change is the
+				// same one at a new cost or hop chain.
+				for (const [removed, snap] of active) {
+					if (sameAdvert(updated.get(removed), snap)) continue;
+					await withdraw(removed);
+					held.delete(removed);
 				}
-				for (const [suffix, producer] of updated) {
-					if (active.get(suffix) === producer) continue;
-					if (this.#offerable(Path.join(prefix, suffix), refused)) {
-						if (await advertise(suffix)) held.set(suffix, producer);
-					}
+				for (const [added, snap] of updated) {
+					if (sameAdvert(held.get(added), snap)) continue;
+					if (!this.#offerable(Path.join(prefix, added), refused)) continue;
+					offered.set(Path.join(prefix, added), snap.identity);
+					if (await advertise(added, snap)) held.set(added, snap);
 				}
 
 				active = held;
@@ -701,14 +763,14 @@ export class Publisher {
 				// does: only a legacy request can be declined, and nothing about the peer
 				// starting to answer raises a signal this loop is watching.
 				const outstanding = [...updated].some(
-					([suffix, producer]) =>
-						active.get(suffix) !== producer && this.#pending(Path.join(prefix, suffix), refused),
+					([suffix, snap]) =>
+						!sameAdvert(active.get(suffix), snap) && this.#pending(Path.join(prefix, suffix), refused),
 				);
 				retry = outstanding ? Math.min(retry ? retry * 2 : RETRY_BASE, RETRY_MAX) : 0;
 
 				// Wait for the next change, or for the peer to unsubscribe.
 				const next = await (retry
-					? Promise.race([changed, stream.reader.closed, retryAfter(retry).then(() => broadcasts)])
+					? Promise.race([changed, stream.reader.closed, retryAfter(retry).then(() => advertised)])
 					: Promise.race([changed, stream.reader.closed]));
 				dispose();
 				if (!next) break;
@@ -748,13 +810,26 @@ export class Publisher {
 		// The open PUBLISH_NAMESPACE request per advertised path.
 		const requests = new Map<Path.Valid, { path: Path.Valid; requestId: bigint; stream: Stream }>();
 
+		// The origin outlives the session and its signal never ends, so this loop needs the
+		// session's own ending to stop: without it a closed connection leaves the loop parked
+		// on a shared origin forever, waking on someone else's publish to fail on a dead
+		// transport. `runSubscribeNamespace` gets this from the stream the peer asked on; an
+		// unsolicited loop has no stream of its own, so the session is what it watches.
+		const closed = this.#quic.closed.then(
+			() => undefined,
+			() => undefined,
+		);
+
 		let dispose: Dispose | undefined;
 		try {
-			// Which producer holds each advertised path; see {@link runSubscribeNamespace}.
-			let active = new Map<Path.Valid, broadcast.Producer>();
+			// What the peer holds: keyed by path, valued by identity plus route, so a
+			// republish diffs as withdraw-then-advertise rather than nothing.
+			let active = new Map<Path.Valid, Advertised>();
 			let retry = 0;
 			// What the peer refused, and whether coming back is worth anything.
 			const refused = new Map<Path.Valid, Refused>();
+			// The identity each refusal was about, so a republish at the same path clears it.
+			const offered = new Map<Path.Valid, object>();
 
 			for (;;) {
 				// Subscribe BEFORE reconciling. Each advertisement below waits a round trip
@@ -763,57 +838,66 @@ export class Publisher {
 				// through it and leave the namespace unadvertised until something unrelated
 				// changed.
 				// TODO Make a better helper within Signals.
-				const changed = new Promise<Map<Path.Valid, broadcast.Producer> | undefined>((resolve) => {
-					dispose = this.#broadcasts.changed(resolve);
+				const changed = new Promise<ReadonlyMap<Path.Valid, Advertised> | undefined>((resolve) => {
+					dispose = this.#advertised.changed(resolve);
 				});
 
-				const broadcasts = this.#broadcasts.peek();
-				if (!broadcasts) {
+				const advertised = this.#advertised.peek();
+				if (!advertised) {
 					dispose?.();
 					break;
 				}
 
-				const updated = new Map<Path.Valid, broadcast.Producer>(broadcasts);
+				const updated = new Map<Path.Valid, Advertised>();
+				for (const [covered, snap] of advertised) {
+					updated.set(covered, snap);
+				}
 
-				// A namespace that is gone takes its refusal with it, so re-announcing the
-				// path offers it again. Rust gets this by rebuilding the watched entry.
+				// A namespace that is gone, or that a republish replaced, takes its refusal with
+				// it: the peer refused a broadcast, not a path forever, so a different one at
+				// the same path is offered again. Rust gets this by rebuilding the watched entry.
 				for (const path of [...refused.keys()]) {
-					if (!updated.has(path)) refused.delete(path);
+					const snap = updated.get(path);
+					if (snap === undefined || offered.get(path) !== snap.identity) {
+						refused.delete(path);
+						offered.delete(path);
+					}
 				}
 
-				// Withdraw first, so a replacement reads as an end followed by a start.
-				for (const [path, producer] of active) {
-					if (updated.get(path) === producer) continue;
-					await this.#withdraw(path, requests);
+				// Withdraw first so a republish or re-price reads as withdraw-then-advertise
+				// (a restart) rather than nothing.
+				for (const [removed, snap] of active) {
+					if (sameAdvert(updated.get(removed), snap)) continue;
+					await this.#withdraw(removed, requests);
 				}
-				for (const [path, producer] of updated) {
-					if (active.get(path) === producer) continue;
-					if (this.#offerable(path, refused)) {
-						await this.#advertise(path, requests, refused);
-					}
+				for (const [added, snap] of updated) {
+					if (sameAdvert(active.get(added), snap)) continue;
+					if (!this.#offerable(added, refused)) continue;
+					offered.set(added, snap.identity);
+					await this.#advertise(added, requests, refused, clusterFor(this.#advert, snap.route));
 				}
 
 				// What the peer holds, not what we attempted: a declined PUBLISH_NAMESPACE
 				// leaves no request behind, so it stays outstanding below.
-				const held = new Map<Path.Valid, broadcast.Producer>();
-				for (const path of requests.keys()) {
-					const producer = updated.get(path);
-					if (producer) held.set(path, producer);
-				}
-				active = held;
+				active = new Map<Path.Valid, Advertised>(
+					[...requests.keys()].flatMap((path) => {
+						const snap = updated.get(path);
+						return snap ? [[path, snap] as const] : [];
+					}),
+				);
 
 				// Whatever we wanted up and could not get up. Stream credit freeing, a
 				// transient failure clearing, or the peer starting to answer raises no
 				// signal of its own, so the only way back is to ask again on a timer.
 				const outstanding = [...updated].some(
-					([path, producer]) => active.get(path) !== producer && this.#pending(path, refused),
+					([path, snap]) => !sameAdvert(active.get(path), snap) && this.#pending(path, refused),
 				);
 				retry = outstanding ? Math.min(retry ? retry * 2 : RETRY_BASE, RETRY_MAX) : 0;
 
 				// Wait for the next change, which has already fired if one landed above.
 				const next = await (retry
-					? Promise.race([changed, retryAfter(retry).then(() => broadcasts)])
-					: changed);
+					? Promise.race([changed, closed, retryAfter(retry).then(() => advertised)])
+					: Promise.race([changed, closed]));
 				dispose?.();
 				if (!next) break;
 			}
@@ -866,6 +950,7 @@ export class Publisher {
 		path: Path.Valid,
 		requests: Map<Path.Valid, { path: Path.Valid; requestId: bigint; stream: Stream }>,
 		refused: Map<Path.Valid, Refused>,
+		cluster: Cluster.Advert | undefined = this.#advert,
 	): Promise<boolean> {
 		const requestId = await this.#session.nextRequestId();
 		if (requestId === undefined) return false;
@@ -886,7 +971,7 @@ export class Publisher {
 			await withTimeout(
 				(async () => {
 					await stream.writer.u53(PublishNamespace.id);
-					const msg = new PublishNamespace({ requestId, trackNamespace: path, cluster: this.#advert });
+					const msg = new PublishNamespace({ requestId, trackNamespace: path, cluster });
 					await msg.encode(stream.writer, this.#session.version);
 
 					// Read response (RequestOk and PublishNamespaceOk share 0x07)
@@ -904,7 +989,14 @@ export class Publisher {
 								err.retryInterval === 0n ? "never" : Date.now() + Number(err.retryInterval),
 							);
 						}
-						throw new Error(`PublishNamespace rejected: ${err.errorCode} ${err.reasonPhrase}`);
+						throw new Error(
+							`PublishNamespace rejected: ${requestReason(
+								err.errorCode,
+								err.reasonPhrase,
+								"publish_namespace",
+								this.#session.version,
+							)}`,
+						);
 					}
 					if (respTypeId !== RequestOk.id) {
 						throw new Error(`PublishNamespace rejected: typeId=0x${respTypeId.toString(16)}`);
@@ -923,7 +1015,8 @@ export class Publisher {
 			requests.set(path, { path, requestId, stream: request });
 			return true;
 		} catch (err: unknown) {
-			const e = error(err);
+			// The peer never answered the advertisement: a control timeout, not late content.
+			const e = err instanceof TimeoutError ? controlTimeout(err) : error(err);
 			console.warn(`announce failed: broadcast=${path} error=${reason(e)}`);
 			request?.abort(e);
 			return false;
@@ -992,20 +1085,6 @@ export class Publisher {
 			await ok.encode(stream.writer, version);
 		}
 		stream.close();
-	}
-
-	/**
-	 * Closes every published broadcast and stops accepting new ones.
-	 *
-	 * @internal
-	 */
-	close() {
-		this.#broadcasts.update((broadcasts) => {
-			for (const broadcast of broadcasts?.values() ?? []) {
-				broadcast.close();
-			}
-			return undefined;
-		});
 	}
 }
 

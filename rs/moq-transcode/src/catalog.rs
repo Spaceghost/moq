@@ -2,7 +2,7 @@
 //! against it, and fill the output catalog with rung + passthrough entries.
 
 use hang::catalog::{AV1, Video, VideoCodec, VideoConfig};
-use moq_net::PathRelativeOwned;
+use moq_net::path::RelativeOwned;
 
 use crate::{Error, Ladder};
 
@@ -18,8 +18,8 @@ pub(crate) struct Resolved {
 	pub height: u32,
 	/// The output resolution, derived from the source aspect ratio.
 	pub size: moq_video::Size,
-	pub bitrate: u64,
-	pub framerate: u32,
+	pub bitrate: moq_net::bandwidth::Rate,
+	pub framerate: Option<moq_video::Rate>,
 }
 
 impl Resolved {
@@ -145,11 +145,7 @@ pub(crate) fn resolve_rungs(ladder: &Ladder, source_name: &str, source: &VideoCo
 	let Some((source_width, source_height)) = dimensions(source) else {
 		return Err(Error::SourceDimensions(source_name.to_string()));
 	};
-	let framerate = source
-		.framerate
-		.map(|f| f.round() as u32)
-		.filter(|f| *f > 0)
-		.unwrap_or(30);
+	let framerate = source.framerate.map(moq_video::Rate::from_f64).transpose()?;
 
 	let mut resolved: Vec<Resolved> = Vec::new();
 	for rung in ladder.rungs() {
@@ -163,7 +159,7 @@ pub(crate) fn resolve_rungs(ladder: &Ladder, source_name: &str, source: &VideoCo
 		if height == source_height && source.bitrate.is_none() {
 			continue;
 		}
-		if source.bitrate.is_some_and(|bitrate| rung.bitrate >= bitrate) {
+		if source.bitrate.is_some_and(|bitrate| rung.bitrate.as_bps() >= bitrate) {
 			continue;
 		}
 		// Preserve the source aspect ratio, rounded to even for I420 chroma.
@@ -195,14 +191,23 @@ pub(crate) async fn rung_entry(
 	source: &VideoConfig,
 	encoder: &moq_video::encode::Kind,
 ) -> Result<VideoConfig, Error> {
-	let mut config = moq_video::encode::Config::new(rung.size.width, rung.size.height, rung.framerate);
+	let encode_rate = rung.framerate.unwrap_or(moq_video::Rate::new(30, 1).unwrap());
+	let mut config = moq_video::encode::Config::new(rung.size.width, rung.size.height, encode_rate);
 	config.bitrate = Some(rung.bitrate);
 	config.kind = encoder.clone();
 
 	let mut entry = config.probe().await?;
+	entry.framerate = rung.framerate.map(moq_video::Rate::as_f64);
 	// A property of the source rather than the ladder: every rung shows the same picture.
 	entry.optimize_for_latency = source.optimize_for_latency;
 	Ok(entry)
+}
+
+/// Rungs inherit the state of the rendition the pipeline actually decodes.
+pub(crate) fn inherit_stalled(rungs: &mut [Published], source: &VideoConfig) {
+	for published in rungs {
+		published.entry.stalled = source.stalled;
+	}
 }
 
 /// Fill the derivative catalog: rung entries plus, when `source_rel` is set,
@@ -213,10 +218,16 @@ pub(crate) fn populate(
 	out: &mut moq_mux::catalog::hang::Catalog,
 	source: &moq_mux::catalog::hang::Catalog,
 	rungs: &[Published],
-	source_rel: Option<&PathRelativeOwned>,
+	source_rel: Option<&RelativeOwned>,
 ) -> Result<(), Error> {
 	out.video = Video::default();
 	out.audio = hang::catalog::Audio::default();
+	// A derivative does not synthesize its own archive: keep the child's, including a
+	// live-only timeline, so replay/store discovery survives composition. The clock goes with
+	// it: the derivative republishes the child's timeline, so its timestamps only mean
+	// something under the child's wall mapping.
+	out.archive = source.archive.clone();
+	out.clock = source.clock;
 
 	// Display metadata applies to the rungs too (same picture, smaller).
 	out.video.display = source.video.display.clone();
@@ -280,6 +291,40 @@ mod tests {
 	}
 
 	#[test]
+	fn rungs_inherit_a_stalled_source() {
+		let mut source_catalog = moq_mux::catalog::hang::Catalog::default();
+		let mut src = source(1280, 720, Some(2_500_000));
+		src.stalled = Some(true);
+		source_catalog.video.insert("video", src).unwrap();
+
+		let mut published = [Published {
+			rung: Resolved {
+				name: "video/360p".into(),
+				height: 360,
+				size: moq_video::Size::new(640, 360),
+				bitrate: moq_net::bandwidth::Rate::from_bps(600_000),
+				framerate: Some(moq_video::Rate::new(30, 1).unwrap()),
+			},
+			entry: source(640, 360, Some(600_000)),
+		}];
+
+		inherit_stalled(&mut published, &source_catalog.video.renditions["video"]);
+		let mut out = moq_mux::catalog::hang::Catalog::default();
+		populate(&mut out, &source_catalog, &published, None).unwrap();
+		assert_eq!(
+			out.video.renditions.get("video/360p").and_then(|c| c.stalled),
+			Some(true)
+		);
+
+		// A different local rendition may stay stalled after the selected input recovers.
+		let healthy = source(1920, 1080, Some(5_000_000));
+		source_catalog.video.insert("healthy", healthy.clone()).unwrap();
+		inherit_stalled(&mut published, &healthy);
+		populate(&mut out, &source_catalog, &published, None).unwrap();
+		assert_eq!(out.video.renditions["video/360p"].stalled, None);
+	}
+
+	#[test]
 	fn rungs_never_upscale() {
 		let rungs = crate::Config::default().ladder;
 		let resolved = resolve_rungs(&rungs, "video", &source(854, 480, Some(2_000_000))).unwrap();
@@ -290,12 +335,28 @@ mod tests {
 	}
 
 	#[test]
+	fn fractional_and_unknown_source_rates_stay_explicit() {
+		let ladder = crate::Config::default().ladder;
+		let mut fractional = source(1280, 720, Some(2_500_000));
+		fractional.framerate = Some(30_000.0 / 1_001.0);
+		let resolved = resolve_rungs(&ladder, "video", &fractional).unwrap();
+		assert_eq!(
+			resolved[0].framerate,
+			Some(moq_video::Rate::new(30_000, 1_001).unwrap())
+		);
+
+		fractional.framerate = None;
+		let resolved = resolve_rungs(&ladder, "video", &fractional).unwrap();
+		assert_eq!(resolved[0].framerate, None);
+	}
+
+	#[test]
 	fn filtering_preserves_order_across_source_changes() {
 		let ladder = Ladder::new([
-			Rung::new(720, 2_500_000),
-			Rung::new(241, 350_000),
-			Rung::new(480, 1_200_000),
-			Rung::new(360, 600_000),
+			Rung::new(720, moq_net::bandwidth::Rate::from_bps(2_500_000)),
+			Rung::new(241, moq_net::bandwidth::Rate::from_bps(350_000)),
+			Rung::new(480, moq_net::bandwidth::Rate::from_bps(1_200_000)),
+			Rung::new(360, moq_net::bandwidth::Rate::from_bps(600_000)),
 		])
 		.unwrap();
 		for (picture, expected) in [
@@ -312,7 +373,7 @@ mod tests {
 
 	#[test]
 	fn same_height_needs_lower_bitrate() {
-		let rungs = Ladder::new([Rung::new(480, 1_200_000)]).unwrap();
+		let rungs = Ladder::new([Rung::new(480, moq_net::bandwidth::Rate::from_bps(1_200_000))]).unwrap();
 		// Unknown source bitrate: a same-height rung can't prove it's below.
 		assert!(
 			resolve_rungs(&rungs, "video", &source(854, 480, None))
@@ -330,7 +391,7 @@ mod tests {
 	#[test]
 	fn rung_geometry_follows_source_aspect() {
 		let resolved = resolve_rungs(
-			&Ladder::new([Rung::new(360, 600_000)]).unwrap(),
+			&Ladder::new([Rung::new(360, moq_net::bandwidth::Rate::from_bps(600_000))]).unwrap(),
 			"video",
 			&source(1920, 1080, Some(6_000_000)),
 		)
@@ -340,7 +401,7 @@ mod tests {
 
 		// Vertical video: aspect preserved, width rounded to even.
 		let resolved = resolve_rungs(
-			&Ladder::new([Rung::new(360, 600_000)]).unwrap(),
+			&Ladder::new([Rung::new(360, moq_net::bandwidth::Rate::from_bps(600_000))]).unwrap(),
 			"video",
 			&source(1080, 1920, Some(6_000_000)),
 		)
@@ -375,7 +436,11 @@ mod tests {
 		config.coded_width = None;
 		config.coded_height = None;
 		assert!(matches!(
-			resolve_rungs(&Ladder::new([Rung::new(360, 600_000)]).unwrap(), "video", &config),
+			resolve_rungs(
+				&Ladder::new([Rung::new(360, moq_net::bandwidth::Rate::from_bps(600_000))]).unwrap(),
+				"video",
+				&config
+			),
 			Err(Error::SourceDimensions(_))
 		));
 	}
@@ -406,8 +471,8 @@ mod tests {
 			name: "video/360p".to_string(),
 			height: 360,
 			size: moq_video::Size::new(640, 360),
-			bitrate: 600_000,
-			framerate: 30,
+			bitrate: moq_net::bandwidth::Rate::from_bps(600_000),
+			framerate: Some(moq_video::Rate::new(30, 1).unwrap()),
 		};
 		let mut source = source(1920, 1080, Some(6_000_000));
 		source.optimize_for_latency = Some(true);
@@ -432,6 +497,25 @@ mod tests {
 		assert_eq!(entry.optimize_for_latency, Some(true));
 	}
 
+	#[tokio::test]
+	async fn an_unknown_rate_stays_unknown_after_probe() {
+		let rung = Resolved {
+			name: "video/360p".to_string(),
+			height: 360,
+			size: moq_video::Size::new(640, 360),
+			bitrate: moq_net::bandwidth::Rate::from_bps(600_000),
+			framerate: None,
+		};
+		let entry = rung_entry(
+			&rung,
+			&source(1920, 1080, Some(6_000_000)),
+			&moq_video::encode::Kind::Software,
+		)
+		.await
+		.unwrap();
+		assert_eq!(entry.framerate, None);
+	}
+
 	/// A name is handed out once and never again: a retired rung's track ends for
 	/// good, so its replacement has to be a name no subscriber can already hold a
 	/// finished copy of.
@@ -451,7 +535,7 @@ mod tests {
 		video.insert("low", source(640, 360, None)).unwrap();
 		video.insert("high", source(1920, 1080, None)).unwrap();
 		let mut remote = source(3840, 2160, None);
-		remote.broadcast = Some(PathRelativeOwned::from("./other".to_string()));
+		remote.broadcast = Some(RelativeOwned::from("./other".to_string()));
 		video.insert("remote", remote).unwrap();
 
 		let (name, config) = choose_source(&video).unwrap();
@@ -487,5 +571,25 @@ mod tests {
 		let (name, config) = choose_source(&video).unwrap();
 		assert_eq!(name, "h264");
 		assert!(matches!(config.codec, VideoCodec::H264(_)));
+	}
+
+	#[test]
+	fn populate_preserves_the_child_archive() {
+		let mut child = moq_mux::catalog::hang::Catalog::<()>::default();
+		child
+			.video
+			.insert("video", source(1920, 1080, Some(6_000_000)))
+			.unwrap();
+		let mut archive = hang::catalog::Archive::new("timeline.z");
+		archive.replay = Some(RelativeOwned::from("./recordings/clip".to_string()));
+		archive.version = Some(hang::catalog::Archive::VERSION);
+		child.archive = Some(archive.clone());
+		let clock = hang::catalog::Clock::new(moq_net::Timestamp::from_micros(1_751_846_400_000_000).unwrap()).unwrap();
+		child.clock = Some(clock);
+
+		let mut out = moq_mux::catalog::hang::Catalog::<()>::default();
+		populate(&mut out, &child, &[], None).unwrap();
+		assert_eq!(out.archive, Some(archive), "a derivative keeps the child's archive");
+		assert_eq!(out.clock, Some(clock), "a derivative keeps the child's clock");
 	}
 }

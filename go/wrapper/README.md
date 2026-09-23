@@ -1,22 +1,29 @@
-# moq-go
+# moq.dev/moq
 
 Ergonomic Go bindings for [Media over QUIC](https://datatracker.ietf.org/doc/draft-lcurley-moq-lite/): real-time pub/sub with built-in caching, fan-out, and prioritization.
 
-This is the package most callers want. It wraps the raw [`github.com/moq-dev/moq-go-ffi`](../ffi) bindings in idiomatic Go: `context.Context` cancellation, Go `error` returns, and Go 1.23 range-over-func iterators (`iter.Seq2`) for streams.
+This is the package most callers want. It wraps the raw [`moq.dev/moq-ffi`](../ffi) bindings in idiomatic Go: `context.Context` cancellation, Go `error` returns, and Go 1.23 range-over-func iterators (`iter.Seq2`) for streams.
 
-The published module lives at [moq-dev/moq-go](https://github.com/moq-dev/moq-go), versioned independently of the native core. CI re-publishes it on every `moq-ffi-v*` tag with its `require` bumped to the newest `moq-go-ffi`, so `go get github.com/moq-dev/moq-go@latest` always pulls the latest native core.
+The import path is a vanity path: moq.dev serves a `go-import` meta tag pointing
+the go command at the [moq-dev/moq-go](https://github.com/moq-dev/moq-go) mirror,
+so the module can move without breaking consumers. The package sits at the module
+root, which is why `import "moq.dev/moq"` binds `moq` with no alias.
+
+The module is versioned independently of the native core. CI re-publishes it on
+every `moq-ffi-v*` tag with its `require` bumped to the newest `moq.dev/moq-ffi`,
+so `go get moq.dev/moq@latest` always pulls the latest native core.
 
 ## Install
 
 ```bash
-go get github.com/moq-dev/moq-go@latest
+go get moq.dev/moq@latest
 ```
 
 ```go
-import "github.com/moq-dev/moq-go/moq"
+import "moq.dev/moq"
 ```
 
-`CGO_ENABLED=1` is required (the default on Unix); the prebuilt `libmoq_ffi.a` comes transitively from `moq-go-ffi`, so there is no Rust toolchain or shared-library setup.
+`CGO_ENABLED=1` is required (the default on Unix); the prebuilt `libmoq_ffi.a` comes transitively from `moq.dev/moq-ffi`, so there is no Rust toolchain or shared-library setup.
 
 ## Quick start
 
@@ -29,7 +36,7 @@ if err != nil {
 }
 defer client.Close()
 
-announced, err := client.Announced("demos/")
+announced, err := client.Announced(moq.AnnounceOptions{Prefix: "demos/"})
 if err != nil {
 	log.Fatal(err)
 }
@@ -40,7 +47,9 @@ for ann, err := range announced.All(ctx) {
 		}
 		log.Fatal(err)
 	}
-	fmt.Println("got broadcast", ann.Path())
+	// Prefix stays origin-relative; Captures reports wildcard matches.
+	fmt.Println("got broadcast", ann.Prefix())
+	fmt.Println("captures", ann.Captures())
 }
 ```
 
@@ -59,10 +68,12 @@ is consistent across transports and returns an empty string for the root or
 missing path. `Query()` returns the encoded query and may contain credentials.
 
 `BroadcastProducer.Dynamic()` accepts subscriber-requested tracks. Call
-`TrackRequest.Accept()` for raw tracks, or `BroadcastProducer.PublishMediaOnTrack()`
+`TrackRequest.Accept()` for raw tracks, or `BroadcastProducer.PublishAudioOnTrack()` /
+`PublishVideoOnTrack()`
 for media tracks whose timescale should be selected by the importer.
 
-`PublishMedia`, `PublishMediaOnTrack`, and `PublishMediaStream` accept
+`PublishAudio`, `PublishVideo`, `PublishContainer`, their `OnTrack` variants, and
+`PublishVideoStream` / `PublishContainerStream` accept
 `WithVideoHint(moq.VideoHint{...})` for video catalog fields that are known
 before the stream reveals them.
 
@@ -78,15 +89,16 @@ Publishing takes `JSONSnapshotOptions` or `JSONStreamOptions`; both subscribe ca
 
 All FFI errors come back as the `moq.Error` type. The error variants are
 re-exported as sentinels (`moq.ErrClosed`, `moq.ErrUnauthorized`, ...) so you can
-`errors.Is` against them without importing `moq-go-ffi`. Two helpers cover the
+`errors.Is` against them without importing `moq.dev/moq-ffi`. Two helpers cover the
 common cases: `moq.IsShutdown(err)` (a stream ended because it was cancelled or
 the session closed, i.e. not a real failure) and `moq.IsAuthError(err)` (HTTP
 401/403).
 
-Blocking calls take a `context.Context`. Most abort cleanly when the context is
-cancelled; the few that have no native cancel (`Used`/`Unused` and
-`Server.Accept`) return `ctx.Err()` promptly but keep running in the background
-until the owning producer/server is closed. See the package doc for details.
+Every call that can block takes a `context.Context` and aborts cleanly when it is
+cancelled, leaving nothing running in the background. A one-shot call (a subscribe,
+a fetch, `RequestBroadcast`, `Resolve`, `Used`/`Unused`, `Server.Accept`) aborts on
+its own and leaves the object usable; a stream read cancels the stream it reads.
+See the package doc for details.
 
 ## Raw datagrams
 
@@ -99,9 +111,9 @@ deliver them, and there is no stream fallback.
 
 ## Versioning
 
-`VERSION` holds the human-owned `MAJOR.MINOR` line (the wrapper API version). Bump it in a PR when the wrapper's own API changes. The patch number is derived by CI from the existing mirror tags, so every release (whether triggered by a wrapper change or by a new `moq-go-ffi`) just takes the next patch on that line.
+`VERSION` holds the human-owned `MAJOR.MINOR` line (the wrapper API version). Bump it in a PR when the wrapper's own API changes. The patch number is derived by CI from the existing mirror tags, so every release (whether triggered by a wrapper change or by a new `moq.dev/moq-ffi`) just takes the next patch on that line.
 
-The committed `go.mod` carries a `require github.com/moq-dev/moq-go-ffi v0.0.0` **placeholder**. Do not "fix" it or add a `replace`: `just go check` injects a local `replace` to the freshly-generated bindings, and CI rewrites the `require` to the latest published `moq-go-ffi` at release time. Because Go resolves to the maximum version across the build graph, that `require` is a floor. Consumers always get an ffi at least as new as the wrapper was built against.
+The committed `go.mod` carries a `require moq.dev/moq-ffi v0.0.0` **placeholder**. Do not "fix" it or add a `replace`: `just go check` injects a local `replace` to the freshly-generated bindings, and CI rewrites the `require` to the latest published `moq.dev/moq-ffi` at release time. Because Go resolves to the maximum version across the build graph, that `require` is a floor. Consumers always get an ffi at least as new as the wrapper was built against.
 
 ## Local development
 

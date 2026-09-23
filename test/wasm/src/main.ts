@@ -22,6 +22,7 @@ type Wasm = typeof import("@moq/wasm");
 type Session = import("@moq/wasm").Session;
 type Broadcast = import("@moq/wasm").Broadcast;
 type Track = import("@moq/wasm").Track;
+type Group = import("@moq/wasm").Group;
 
 /** One relay the suite runs against, and the version it must negotiate. */
 export interface RelayFixture {
@@ -132,53 +133,53 @@ async function connect(wasm: Wasm, relay: RelayFixture): Promise<Session> {
  * It keeps publishing rather than writing a fixed number of groups and closing:
  * a track that ends before the subscriber's stream is wired up is only reachable
  * through the relay's cache, so the test would be measuring retention, and would
- * race. A live edge that keeps moving has neither problem. Every track name
- * other than {@link TRACK} is rejected, which is what the refusal case reads.
+ * race. A live edge that keeps moving has neither problem. The `missing` track
+ * is rejected when subscribed, which is what the refusal case reads.
  */
 async function withPublisher<T>(relay: RelayFixture, path: string, run: () => Promise<T>): Promise<T> {
-	const connection = await Moq.Connection.connect(new URL(relay.url));
-	const broadcast = new Moq.Broadcast.Producer();
-	connection.publish(Moq.Path.from(path), broadcast);
+	// The session serves an origin rather than individual broadcasts, so the path is
+	// published into the origin and the session announces the table.
+	const origin = new Moq.Origin.Producer();
+	const broadcast = origin.createBroadcast(Moq.Path.from(path));
+	const track = broadcast.createTrack(TRACK);
+	const missing = broadcast.createTrack("missing");
+	broadcast.announce();
+	const connection = await Moq.Connection.connect({ url: new URL(relay.url), publish: origin.consume() });
 
 	let stopped = false;
-	const writers: Promise<void>[] = [];
-
-	// lite-05 looks a track's info up before subscribing, so the same name can be
-	// requested more than once. Each request gets its own producer writing the same
-	// groups; the subscriber only ever reads the one it asked for.
-	const serving = (async () => {
-		for (;;) {
-			const request = await broadcast.requested();
-			if (!request) break;
-			if (request.name !== TRACK) {
-				request.reject(new Error(`no such track: ${request.name}`));
+	const writer = (async () => {
+		while (!stopped && track.closed.peek() === undefined) {
+			if (!track.used.peek()) {
+				await Promise.race([track.used.changed(), track.closed]);
 				continue;
 			}
-			const track = request.accept();
-			writers.push(
-				(async () => {
-					while (!stopped && track.closed.peek() === undefined) {
-						const group = track.appendGroup();
-						for (const frame of FIXTURE) {
-							group.writeFrame({ payload: frame, timestamp: Moq.Time.Timestamp.now() });
-						}
-						group.close();
-						await sleep(GROUP_INTERVAL_MS);
-					}
-					track.close();
-				})(),
-			);
+			const group = track.appendGroup();
+			for (const frame of FIXTURE) {
+				group.writeFrame({ payload: frame, timestamp: Moq.Time.Timestamp.now() });
+			}
+			group.close();
+			await Promise.race([sleep(GROUP_INTERVAL_MS), track.used.changed(), track.closed]);
 		}
+		track.close();
+	})();
+	const rejecting = (async () => {
+		while (!missing.used.peek() && missing.closed.peek() === undefined) {
+			await Promise.race([missing.used.changed(), missing.closed]);
+		}
+		if (missing.used.peek()) missing.close(new Error("no such track: missing"));
 	})();
 
 	try {
 		return await run();
 	} finally {
 		stopped = true;
+		track.close();
+		missing.close();
 		broadcast.close();
 		connection.close();
-		await serving;
-		await Promise.all(writers);
+		origin.close();
+		await writer;
+		await rejecting;
 	}
 }
 
@@ -208,26 +209,51 @@ async function consume(session: Session, path: string): Promise<Broadcast> {
  */
 async function expectGroups(track: Track, count: number): Promise<void> {
 	let previous: bigint | undefined;
+	let read = 0;
 
-	for (let i = 0; i < count; i++) {
-		const group = await track.recvGroup();
-		if (!group) throw new Error(`track ended after ${i} groups, want ${count}`);
+	// A skip is legal (see `isOld`), so bound the attempts rather than the skips: a
+	// subscription that never delivers a whole group fails here instead of looping.
+	for (let attempt = 0; read < count; attempt++) {
+		if (attempt >= count * 4) throw new Error(`read ${read} whole groups in ${attempt} attempts, want ${count}`);
+
+		let group: Group | undefined;
 		try {
-			if (previous !== undefined && group.sequence !== previous + 1n) {
-				throw new Error(`group ${i}: sequence is ${group.sequence}, want ${previous + 1n}`);
+			group = await track.recvGroup();
+			if (!group) throw new Error(`track ended after ${read} groups, want ${count}`);
+
+			// Forward, not consecutive: a skipped group leaves a gap in the sequence.
+			if (previous !== undefined && group.sequence <= previous) {
+				throw new Error(`group ${read}: sequence is ${group.sequence}, want greater than ${previous}`);
 			}
 			previous = group.sequence;
 
 			for (const [j, want] of FIXTURE.entries()) {
 				const frame = await group.readFrame();
-				if (!frame) throw new Error(`group ${i}: ended after ${j} frames, want ${FIXTURE.length}`);
-				expectBytes(frame, want, `group ${i} frame ${j}`);
+				if (!frame) throw new Error(`group ${read}: ended after ${j} frames, want ${FIXTURE.length}`);
+				expectBytes(frame, want, `group ${read} frame ${j}`);
 			}
-			if (await group.readFrame()) throw new Error(`group ${i}: got more than ${FIXTURE.length} frames`);
+			if (await group.readFrame()) throw new Error(`group ${read}: got more than ${FIXTURE.length} frames`);
+			read++;
+		} catch (err) {
+			if (!isOld(err)) throw err;
 		} finally {
-			group.free();
+			group?.free();
 		}
 	}
+}
+
+/**
+ * Whether the live edge passed this group before it was delivered whole.
+ *
+ * The subscription's budget is the default `Latency::REAL_TIME`, which drops a group
+ * the edge has moved past rather than delivering it late, so the publisher writing one
+ * every {@link GROUP_INTERVAL_MS} can legitimately retire a group the reader is still
+ * on. Treating that as a case failure asserts a guarantee real-time delivery does not
+ * make, and loses the race on a loaded runner. What has to hold is that a group which
+ * *is* delivered arrives in order and whole, which the checks above still cover.
+ */
+function isOld(err: unknown): boolean {
+	return err instanceof Error && err.message === "old";
 }
 
 function expectBytes(got: Uint8Array, want: Uint8Array, where: string): void {

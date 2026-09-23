@@ -1,6 +1,10 @@
 import MoqFFI
 
 /// A MoQ server that accepts incoming QUIC/WebTransport sessions.
+///
+/// Bind and TLS are captured at `listen()`; those setters throw afterwards.
+/// Origins are captured at each `accept()`. Every setter throws `.Busy` while
+/// listen/accept is in flight and `.Cancelled` after `cancel()`.
 public final class Server: Sendable {
     let ffi: MoqServer
 
@@ -11,34 +15,36 @@ public final class Server: Sendable {
 
     /// Set the address to bind, e.g. `127.0.0.1:4443`, `[::]:443`, or `localhost:0`.
     /// Validated syntactically here; DNS hostnames resolve at `listen()` time.
+    /// Captured at `listen()`; throws afterwards.
     public func bind(_ addr: String) throws {
         try ffi.setBind(addr: addr)
     }
 
-    /// Load TLS certificate chains from PEM files on disk.
-    public func setTlsCert(_ paths: [String]) {
-        ffi.setTlsCert(paths: paths)
+    /// Load TLS certificate chains from PEM files on disk. Captured at `listen()`.
+    public func setTlsCert(_ paths: [String]) throws {
+        try ffi.setTlsCert(paths: paths)
     }
 
-    /// Load TLS private keys from PEM files on disk.
-    public func setTlsKey(_ paths: [String]) {
-        ffi.setTlsKey(paths: paths)
+    /// Load TLS private keys from PEM files on disk. Captured at `listen()`.
+    public func setTlsKey(_ paths: [String]) throws {
+        try ffi.setTlsKey(paths: paths)
     }
 
     /// Generate self-signed TLS certificates for the given hostnames. Clients
     /// must pin the fingerprint (see `certFingerprints`) or disable verification.
-    public func generateTls(hostnames: [String]) {
-        ffi.setTlsGenerate(hostnames: hostnames)
+    /// Captured at `listen()`.
+    public func generateTls(hostnames: [String]) throws {
+        try ffi.setTlsGenerate(hostnames: hostnames)
     }
 
-    /// Set the origin to publish broadcasts to incoming sessions.
-    public func setPublish(_ origin: OriginProducer?) {
-        ffi.setPublish(origin: origin?.ffi)
+    /// Set the origin to publish broadcasts to incoming sessions. Captured at each `accept()`.
+    public func setPublish(_ origin: OriginProducer?) throws {
+        try ffi.setPublish(origin: origin?.ffi)
     }
 
-    /// Set the origin to consume broadcasts from incoming sessions.
-    public func setConsume(_ origin: OriginProducer?) {
-        ffi.setConsume(origin: origin?.ffi)
+    /// Set the origin to consume broadcasts from incoming sessions. Captured at each `accept()`.
+    public func setConsume(_ origin: OriginProducer?) throws {
+        try ffi.setConsume(origin: origin?.ffi)
     }
 
     /// Bind the listening socket. Returns the bound local address, useful when
@@ -60,6 +66,9 @@ public final class Server: Sendable {
     }
 
     /// Cancel any in-flight `listen()` or `accept()` call.
+    ///
+    /// Returns once the listening socket is closed, so the address can be bound
+    /// again immediately.
     public func cancel() {
         ffi.cancel()
     }
@@ -88,19 +97,21 @@ public final class Request: Sendable {
         ffi.query()
     }
 
-    /// The transport type, e.g. `"quic"`, `"iroh"`, or `"websocket"`.
-    public var transport: String {
+    /// The network transport carrying this session.
+    public var transport: Transport {
         ffi.transport()
     }
 
     /// Override the publish origin for this session, falling back to the server's.
-    public func setPublish(_ origin: OriginProducer?) {
-        ffi.setPublish(origin: origin?.ffi)
+    /// Captured at `accept()`. Throws if the request is busy, already answered, or cancelled.
+    public func setPublish(_ origin: OriginProducer?) throws {
+        try ffi.setPublish(origin: origin?.ffi)
     }
 
     /// Override the consume origin for this session, falling back to the server's.
-    public func setConsume(_ origin: OriginProducer?) {
-        ffi.setConsume(origin: origin?.ffi)
+    /// Captured at `accept()`. Throws if the request is busy, already answered, or cancelled.
+    public func setConsume(_ origin: OriginProducer?) throws {
+        try ffi.setConsume(origin: origin?.ffi)
     }
 
     /// Complete the handshake and return the established session.
@@ -108,7 +119,7 @@ public final class Request: Sendable {
         Session(try await ffi.accept())
     }
 
-    /// Reject the session with the given HTTP status code.
+    /// Reject the session with an application error code; 401 and 403 map to unauthorized.
     public func reject(code: UInt16) async throws {
         try await ffi.reject(code: code)
     }

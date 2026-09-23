@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking
+
+- `--listen` needs `--auth-url` or `--auth-public`; a listener admits sessions through the same lease as moq-relay instead of accepting everyone.
+- `moq token` is `moq auth`, with `serve` answering the auth contract.
+
+### Added
+
+- `moq auth sessions` and `moq auth revalidate` list or nudge live sessions on a relay's internal listener
+- `--cluster-lan-app` names the DNS-SD application the LAN mesh advertises under
+- `--cluster-connect`, `--cluster-connect-api`, `--cluster-node`, `--cluster-mesh`, `--cluster-token`, `--cluster-id`, and `--cluster-tier` match `moq-relay`
+
+### Changed
+
+- `--cluster-lan` uses the relay's Cluster; a CLI process and a relay on the same LAN mesh with each other
+- MSRV is 1.95, matching `moq-relay` (sysinfo 0.39)
+
+### Fixed
+
+- `--cluster-connect` and `--cluster-connect-api` count as a MoQ side
+- local verbs refuse the WAN `--cluster-*` flags
+- HTTP `--cluster-connect-api` attaches client TLS so the CLI can fetch the peer list
+
 ## [0.11.2](https://github.com/moq-dev/moq/compare/moq-cli-v0.11.1...moq-cli-v0.11.2) - 2026-09-17
 
 ### Other

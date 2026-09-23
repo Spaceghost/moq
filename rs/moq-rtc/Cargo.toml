@@ -16,7 +16,6 @@ categories = ["multimedia", "network-programming", "web-programming"]
 # The CLI lives in `moq-cli` (the `rtc` subcommand); embedders mount the routers
 # / dial with `Client` against their own origin.
 [dependencies]
-anyhow = { workspace = true, features = ["backtrace"] }
 axum = { workspace = true }
 bytes = { workspace = true }
 hang = { workspace = true }
@@ -34,4 +33,5 @@ uuid = { version = "1", features = ["v4"] }
 # Signs the MESSAGE-INTEGRITY on a forged STUN binding request: str0m rejects a
 # request without one, and its own SHA1 provider is private.
 aws-lc-rs = { workspace = true }
+moq-tokio = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }

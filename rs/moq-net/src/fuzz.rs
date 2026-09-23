@@ -13,9 +13,10 @@
 use bytes::Buf;
 
 use crate::{
-	Path, PathRelative,
+	Path, Pattern,
 	coding::{Decode, Encode, VarInt},
 	ietf, lite,
+	path::Relative,
 };
 
 /// One fuzz target body: it returns whether the input decoded, which is what
@@ -28,6 +29,7 @@ pub const TARGETS: &[(&str, Target)] = &[
 	("ietf", ietf_wire),
 	("varint", varint),
 	("path", path),
+	("pattern", pattern),
 ];
 
 /// The moq-lite versions a target decodes at, selected by the input's first byte.
@@ -50,13 +52,14 @@ const IETF_VERSIONS: &[ietf::Version] = &[
 	ietf::Version::Draft19,
 	ietf::Version::Draft20,
 	ietf::Version::Draft21,
+	ietf::Version::Draft22,
 ];
 
 /// How many types [`lite_wire`] dispatches over.
 const LITE_KINDS: u8 = 21;
 
 /// How many types [`ietf_wire`] dispatches over.
-const IETF_KINDS: u8 = 38;
+const IETF_KINDS: u8 = 39;
 
 /// Split the two selector bytes off the input: a version and a type.
 fn select(data: &[u8], versions: usize) -> Option<(usize, u8, &[u8])> {
@@ -204,6 +207,7 @@ pub fn ietf_wire(data: &[u8]) -> bool {
 		35 => roundtrip::<ietf::Parameters, _>(rest, version, stable),
 		36 => roundtrip::<ietf::Location, _>(rest, version, stable),
 		37 => roundtrip::<ietf::FetchObject, _>(rest, version, stable),
+		38 => roundtrip::<ietf::PublishNamespaceUpdate, _>(rest, version, stable),
 		_ => unreachable!("kind is taken modulo IETF_KINDS"),
 	}
 }
@@ -305,7 +309,7 @@ pub fn path(data: &[u8]) -> bool {
 	// Resolving arbitrary references must stay inside the clamped/unclamped contract:
 	// `try_resolve` only refuses by walking above the root, so whenever it answers, it
 	// answers the same as `resolve`.
-	let rel = PathRelative::new(base.as_str());
+	let rel = Relative::new(base.as_str());
 	if let Some(resolved) = target.try_resolve(&rel) {
 		assert_eq!(resolved, target.resolve(&rel), "try_resolve disagreed with resolve");
 	}
@@ -335,6 +339,55 @@ pub struct Seed {
 	pub kind: u8,
 	/// The bytes to feed the target.
 	pub data: Vec<u8>,
+}
+
+/// A pattern's text, a newline, and a path: the pattern algebra's invariants.
+///
+/// Parsing is the fixed point Display prints; a pattern contains and overlaps itself;
+/// rebasing at the path describes exactly what the pattern matches beneath it; and
+/// rooting at a literal path inverts rebasing.
+pub fn pattern(data: &[u8]) -> bool {
+	let Ok(text) = std::str::from_utf8(data) else {
+		return false;
+	};
+	let (pattern, path) = text.split_once('\n').unwrap_or((text, ""));
+	let Ok(pattern) = pattern.parse::<Pattern>() else {
+		return false;
+	};
+
+	assert_eq!(pattern.to_string(), pattern.as_str());
+	assert_eq!(
+		pattern.to_string().parse::<Pattern>().as_ref(),
+		Ok(&pattern),
+		"text is not canonical"
+	);
+	assert_eq!(
+		Pattern::new(pattern.segments().to_vec()).as_ref(),
+		Ok(&pattern),
+		"segments do not rebuild"
+	);
+	assert!(pattern.contains(&pattern) && pattern.overlaps(&pattern));
+	assert!(pattern.matches(pattern.head()) || !pattern.is_literal());
+
+	let rebased = pattern.rebase(path);
+	assert_eq!(
+		rebased.matches(""),
+		pattern.matches(path),
+		"rebase disagrees with matches at the root"
+	);
+	for member in rebased.iter() {
+		// Arbitrary roots may contain wildcard bytes or exceed the segment limit.
+		if let Ok(rooted) = member.rooted(path) {
+			assert!(
+				pattern.contains(&rooted),
+				"rebase produced a pattern outside the original"
+			);
+		}
+	}
+	if let Ok(rooted) = pattern.rooted(path) {
+		assert!(rooted.rebase(path).contains(&pattern), "rooted did not invert rebase");
+	}
+	true
 }
 
 /// The inputs the fuzzer starts from: every (version, type) pair the dispatch knows,
@@ -510,6 +563,24 @@ pub fn seeds() -> Vec<Seed> {
 	] {
 		seeds.push(Seed {
 			target: "path",
+			kind: 0,
+			data: text.as_bytes().to_vec(),
+		});
+	}
+
+	for text in [
+		"**\na",
+		"**/a\na",
+		"a/*/**/b\na/x",
+		"**/*.hang\npid/cam.hang",
+		"foo.*.hang/**\nfoo.1.hang/x",
+		"*\n",
+		"\n",
+		"a/b\na/b",
+		"a*b*c\n",
+	] {
+		seeds.push(Seed {
+			target: "pattern",
 			kind: 0,
 			data: text.as_bytes().to_vec(),
 		});

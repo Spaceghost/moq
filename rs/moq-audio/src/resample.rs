@@ -10,7 +10,25 @@ use rubato::{
 	Async, FixedAsync, Resampler as RubatoTrait, SincInterpolationParameters, SincInterpolationType, WindowFunction,
 };
 
-use crate::Error;
+use crate::{Error, Layout};
+
+#[derive(Debug, thiserror::Error)]
+enum BackendError {
+	#[error(transparent)]
+	Construction(#[from] rubato::ResamplerConstructionError),
+
+	#[error(transparent)]
+	Process(#[from] rubato::ResampleError),
+}
+
+impl BackendError {
+	fn into_public(self) -> Error {
+		match self {
+			Self::Construction(err) => Error::ResamplerConstruction(err.to_string()),
+			Self::Process(err) => Error::Resample(err.to_string()),
+		}
+	}
+}
 
 /// Sample-rate converter over interleaved `f32` PCM.
 pub struct Resampler {
@@ -52,6 +70,10 @@ impl Resampler {
 			return Err(Error::Unsupported("chunk_frames must be > 0".into()));
 		}
 
+		Self::new_inner(input_rate, output_rate, channels, chunk_frames).map_err(BackendError::into_public)
+	}
+
+	fn new_inner(input_rate: u32, output_rate: u32, channels: u32, chunk_frames: usize) -> Result<Self, BackendError> {
 		let params = SincInterpolationParameters {
 			sinc_len: 128,
 			f_cutoff: Some(0.95),
@@ -188,7 +210,7 @@ impl Resampler {
 			// neither the output nor the skip, which cannot repeat.
 			let skip_before = self.skip;
 			self.pending.resize(self.chunk_frames * self.channels, 0.0);
-			let produced = self.convert()?;
+			let produced = self.convert().map_err(BackendError::into_public)?;
 			if produced.is_empty() && self.skip == skip_before {
 				break;
 			}
@@ -222,7 +244,7 @@ impl Resampler {
 		self.started |= !samples.is_empty();
 		self.pending.extend_from_slice(samples);
 		let buffered = self.pending.len();
-		let out = self.convert()?;
+		let out = self.convert().map_err(BackendError::into_public)?;
 
 		// Earlier calls leave less than one chunk, so consuming any chunk also
 		// consumes all their samples. The remainder belongs to this packet.
@@ -238,7 +260,7 @@ impl Resampler {
 	}
 
 	/// Convert every whole chunk that is buffered, keeping the remainder.
-	fn convert(&mut self) -> Result<Vec<f32>, Error> {
+	fn convert(&mut self) -> Result<Vec<f32>, BackendError> {
 		let chunk_samples = self.chunk_frames * self.channels;
 		let mut out = Vec::new();
 		while self.pending.len() >= chunk_samples {
@@ -279,33 +301,44 @@ impl Resampler {
 	}
 }
 
-/// Whether [`remix`] can produce this channel count, checked up front so a
-/// consumer fails at construction rather than on its first frame.
-pub(crate) fn validate_channels(count: u32) -> Result<(), Error> {
-	match count {
-		1 | 2 => Ok(()),
-		other => Err(Error::Unsupported(format!(
-			"channel remix only supports mono and stereo (got {other})"
-		))),
-	}
-}
-
-/// Remix interleaved mono/stereo PCM into the requested channel count.
-pub(crate) fn remix(samples: &[f32], input_channels: u32, output_channels: u32) -> Result<Vec<f32>, Error> {
-	match (input_channels, output_channels) {
-		(1, 1) | (2, 2) => Ok(samples.to_vec()),
-		(1, 2) => {
+/// Convert between known layouts without assigning positions to discrete channels.
+pub(crate) fn remix(samples: &[f32], input: Layout, output: Layout) -> Result<Vec<f32>, Error> {
+	validate_remix(input, output)?;
+	match (input, output) {
+		(input, output) if input == output => Ok(samples.to_vec()),
+		(Layout::Mono, Layout::Stereo) => {
 			let mut output = Vec::with_capacity(samples.len() * 2);
 			for &sample in samples {
 				output.extend_from_slice(&[sample, sample]);
 			}
 			Ok(output)
 		}
-		(2, 1) => Ok(samples.chunks_exact(2).map(|pair| (pair[0] + pair[1]) * 0.5).collect()),
+		(Layout::Stereo, Layout::Mono) => Ok(samples
+			.as_chunks::<2>()
+			.0
+			.iter()
+			.map(|pair| (pair[0] + pair[1]) * 0.5)
+			.collect()),
 		_ => Err(Error::Unsupported(format!(
-			"channel remix only supports mono and stereo (got {input_channels} to {output_channels})"
+			"cannot convert audio layout {input:?} to {output:?} without speaker positions"
 		))),
 	}
+}
+
+/// Check that [`remix`] can convert between two layouts.
+pub(crate) fn validate_remix(input: Layout, output: Layout) -> Result<(), Error> {
+	input.validate()?;
+	output.validate()?;
+	if input == output
+		|| matches!(
+			(input, output),
+			(Layout::Mono, Layout::Stereo) | (Layout::Stereo, Layout::Mono)
+		) {
+		return Ok(());
+	}
+	Err(Error::Unsupported(format!(
+		"cannot convert audio layout {input:?} to {output:?} without speaker positions"
+	)))
 }
 
 #[cfg(test)]
@@ -502,11 +535,17 @@ mod tests {
 
 	#[test]
 	fn remix_mono_to_stereo_duplicates_samples() {
-		assert_eq!(remix(&[1.0, 2.0], 1, 2).unwrap(), [1.0, 1.0, 2.0, 2.0]);
+		assert_eq!(
+			remix(&[1.0, 2.0], Layout::Mono, Layout::Stereo).unwrap(),
+			[1.0, 1.0, 2.0, 2.0]
+		);
 	}
 
 	#[test]
 	fn remix_stereo_to_mono_averages_channels() {
-		assert_eq!(remix(&[1.0, 3.0, 2.0, 4.0], 2, 1).unwrap(), [2.0, 3.0]);
+		assert_eq!(
+			remix(&[1.0, 3.0, 2.0, 4.0], Layout::Stereo, Layout::Mono).unwrap(),
+			[2.0, 3.0]
+		);
 	}
 }

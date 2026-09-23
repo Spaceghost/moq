@@ -10,8 +10,8 @@
 #
 # One relay per protocol flavour, because negotiation is the part that broke:
 #   lite   default versions        -> moq-lite-05 over its own ALPN
-#   ietf   --server-version 19     -> moq-transport-19 over its own ALPN
-#   setup  --server-version lite-02 -> the "moql" ALPN, version chosen by SETUP
+#   ietf   --listen-version 19     -> moq-transport-19 over its own ALPN
+#   setup  --listen-version lite-02 -> the "moql" ALPN, version chosen by SETUP
 #
 # The publisher is @moq/net (TypeScript) and the subscriber is @moq/wasm (Rust),
 # so each case is also an interop check. See README.md.
@@ -140,8 +140,8 @@ for flavour in "${FLAVOURS[@]}"; do
         exit 1
     fi
 
-    args=("$WASM_DIR/relay.toml" --server-bind "127.0.0.1:${port}" --web-http-listen "127.0.0.1:${port}")
-    [[ -z "$version_flag" ]] || args+=(--server-version "$version_flag")
+    args=("$WASM_DIR/relay.toml" --listen "127.0.0.1:${port}" --web-http-listen "127.0.0.1:${port}")
+    [[ -z "$version_flag" ]] || args+=(--listen-version "$version_flag")
 
     echo "starting $name relay on 127.0.0.1:${port}..."
     harness_spawn "relay-$name" "$HARNESS_RUN/relay-$name.log" "$RELAY" "${args[@]}"

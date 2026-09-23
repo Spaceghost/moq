@@ -1,9 +1,10 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { Signal } from "@moq/signals";
 import { Camera } from "./camera";
 import { Microphone } from "./microphone";
 import { Retry } from "./retry";
 import { Screen } from "./screen";
+import type { Media } from "./types";
 
 // A MediaStreamTrack ends on its own when the device disappears or the OS revokes it. Only the bits
 // the sources touch, plus end() to fire it.
@@ -168,7 +169,8 @@ const QUIET_MARGIN = 100;
 const SPENT_TIMEOUT = 30_000;
 
 /** The track a source published, or undefined. */
-function published(source: { track: MediaStreamTrack } | MediaStreamTrack | undefined): unknown {
+function published(media: Media | undefined): unknown {
+	const source = media?.audio ?? media?.video;
 	if (!source) return undefined;
 	return "track" in source ? source.track : source;
 }
@@ -433,3 +435,25 @@ test("screen capture prompts again after being switched off and on", async () =>
 
 	screen.close();
 });
+
+for (const screenPixelRatio of [undefined, 2]) {
+	test(`screen capture maps pixel ratio ${screenPixelRatio} into source scale`, async () => {
+		using media = install(new FakeScreenDevices());
+		const settings = spyOn(media.video, "getSettings").mockReturnValue({
+			deviceId: "default",
+			screenPixelRatio,
+		} as MediaTrackSettings);
+		const screen = new Screen({ enabled: true });
+		try {
+			await settle();
+			const source = screen.out.source.peek()?.video;
+			expect(source).toMatchObject({ track: media.video, scale: screenPixelRatio });
+			settings.mockReturnValue({ deviceId: "default", screenPixelRatio: 1 } as MediaTrackSettings);
+			expect(source).toMatchObject({ track: media.video, scale: 1 });
+			expect(screen.out.source.peek()?.video).toBe(source);
+		} finally {
+			screen.close();
+			settings.mockRestore();
+		}
+	});
+}

@@ -32,6 +32,7 @@ This file is split into nested `CLAUDE.md` files based on the language/situation
 # Guidelines
 
 - Prefer a maintained crate over hand-rolling non-core functionality.
+- Anything that fans out (N publishers, M subscribers, routes, sessions) gets a benchmark swept over both axes, so a cost that grows with the table instead of the touched path shows up as a slope.
 - New dependencies should use the newest, stable version.
 - Do not bump package versions unless asked. Releases are cut separately.
 - Comments should explain the non-obvious why, and never the history.
@@ -107,6 +108,6 @@ These diff the branch against its base and only run the affected packages.
 
 Any wire-format change updates its matching IETF draft in the same PR, including framing, message fields, enum values, and version negotiation. Use the feature-specific draft for extensions and validate with `just drafts check`. See `drafts/CLAUDE.md`.
 
-For wire, `moq-ffi`, or gateway changes, also run `just test smoke-full` for cross-language interop; plain `smoke` is Rust-only.
+For wire, `moq-ffi`, or gateway changes, also run `just test smoke --all` for cross-language interop; plain `smoke` is Rust-only.
 
 When a CLI interface changes, search the whole repo for the binary name and update every example invocation, including docs and demo recipes. Check examples against `--help`.

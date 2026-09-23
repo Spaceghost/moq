@@ -1,7 +1,7 @@
 //! Headless multi-participant rooms over MoQ.
 //!
 //! A room is a path prefix. There is no service and no storage: joining is
-//! minting a moq-token rooted at that prefix (the LiveKit AccessToken analogue)
+//! minting a moq-auth token rooted at that prefix (the LiveKit AccessToken analogue)
 //! and dialing the relay.
 //!
 //! Participants are discovered from the announce stream. Identity is the path
@@ -39,4 +39,7 @@ pub enum Error {
 	/// A participant identity must contain a nonempty path.
 	#[error("participant identity must not be empty")]
 	EmptyIdentity,
+	/// A participant identity holds a wildcard, so it cannot name one participant.
+	#[error("participant identity is not a literal path: {0}")]
+	InvalidIdentity(#[from] moq_auth::InvalidPattern),
 }

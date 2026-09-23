@@ -1,3 +1,4 @@
+use anyhow::Context;
 use hang::moq_net;
 use moq_mux::container::{flv, fmp4, ts};
 
@@ -14,9 +15,9 @@ pub enum PublishFormat {
 	Flv,
 }
 
-/// `clap` adapter for [`moq_video::encode::Codec`].
+/// Command-line adapter for [`moq_video::encode::Codec`].
 #[cfg(feature = "capture")]
-#[derive(clap::ValueEnum, Clone, Copy, Default)]
+#[derive(usage::ValueEnum, Clone, Copy, Default)]
 pub enum VideoCodec {
 	/// H.264 / AVC (the default; widest support).
 	#[default]
@@ -44,88 +45,89 @@ impl From<VideoCodec> for moq_video::encode::Codec {
 /// the default camera and microphone. Run `moq devices` to list the ids each one
 /// takes.
 #[cfg(feature = "capture")]
-#[derive(clap::Args, Clone)]
-#[command(group = clap::ArgGroup::new("video-source").multiple(false))]
-#[command(group = clap::ArgGroup::new("audio-source").multiple(false))]
+#[derive(usage::Args, Clone)]
+#[usage(unknown_flags = "error", args_override_self = false)]
+#[usage(group("video-source"))]
+#[usage(group("audio-source"))]
 pub struct CaptureArgs {
 	/// Capture a camera, by the id `moq devices` reports (an AVFoundation
 	/// `uniqueID`, `/dev/videoN` path, or Media Foundation symbolic link).
 	/// Bare `--camera`, or no source flag at all, opens the default camera.
-	#[arg(long, num_args = 0..=1, group = "video-source")]
+	#[usage(long, group = "video-source")]
 	pub camera: Option<Option<String>>,
 
 	/// Capture a whole display, by the id `moq devices` reports. Bare
 	/// `--display` captures the main display. On Wayland the desktop portal opens
 	/// a picker dialog; X11 accepts the listed monitor id.
-	#[arg(long, num_args = 0..=1, group = "video-source", alias = "screen")]
+	#[usage(long, group = "video-source", alias = "screen")]
 	pub display: Option<Option<String>>,
 
 	/// Capture a single window, by the id `moq devices` reports. Supported on
 	/// macOS, Windows, and X11.
-	#[arg(long, group = "video-source")]
+	#[usage(long, group = "video-source")]
 	pub window: Option<String>,
 
 	/// Capture every window of an application, by the bundle id `moq devices`
 	/// reports. Windows opened later are included. macOS only.
-	#[arg(long, group = "video-source")]
+	#[usage(long, group = "video-source")]
 	pub app: Option<String>,
 
 	/// Hide the mouse cursor. Display/window/app capture only.
-	#[arg(long)]
+	#[usage(long)]
 	pub no_cursor: bool,
 
 	/// Requested capture width. The source snaps to its nearest supported mode.
-	#[arg(long)]
+	#[usage(long)]
 	pub width: Option<u32>,
 
 	/// Requested capture height.
-	#[arg(long)]
+	#[usage(long)]
 	pub height: Option<u32>,
 
 	/// Capture/encode framerate. Omit to use the source's reported rate.
-	#[arg(long)]
+	#[usage(long)]
 	pub fps: Option<u32>,
 
 	/// Maximum video bitrate in bits per second. Omit to derive one from the resolution.
 	///
 	/// When publishing to a relay, the encoder backs off below this while the uplink is
 	/// congested and climbs back afterwards; it never encodes above it.
-	#[arg(long)]
+	#[usage(long)]
 	pub bitrate: Option<u64>,
 
 	/// Video codec to encode. H.265 is hardware-only (VideoToolbox on macOS).
-	#[arg(long, value_enum, default_value_t)]
+	#[usage(long, value_enum, default = "h264")]
 	pub codec: VideoCodec,
 
 	/// Force a hardware encoder (error if none is available).
-	#[arg(long, conflicts_with = "software")]
+	#[usage(long, conflicts = "--software")]
 	pub hardware: bool,
 
 	/// Force the software encoder (openh264).
-	#[arg(long)]
+	#[usage(long)]
 	pub software: bool,
 
 	/// Capture a microphone, by the id `moq devices` reports. Bare
 	/// `--microphone`, or no audio source flag, opens the default input.
-	#[arg(long, num_args = 0..=1, group = "audio-source")]
+	#[usage(long, group = "audio-source")]
 	pub microphone: Option<Option<String>>,
 
 	/// Capture the system (desktop) audio instead of a microphone: everything the
 	/// machine is playing, minus this process. macOS only, and it needs the Screen
 	/// Recording permission.
-	#[arg(long, group = "audio-source")]
+	#[usage(long, group = "audio-source")]
 	pub system_audio: bool,
 
 	/// Target audio bitrate in bits per second (Opus). Omit for the codec default.
-	#[arg(long)]
+	#[usage(long)]
 	pub audio_bitrate: Option<u32>,
 
 	/// Capture audio only (no camera).
-	#[arg(long, conflicts_with = "no_audio", conflicts_with = "video-source")]
+	#[usage(long, conflicts("--no-audio", "--camera", "--display", "--window", "--app"))]
 	pub no_video: bool,
 
 	/// Capture video only (no microphone).
-	#[arg(long, conflicts_with = "audio-source")]
+	#[usage(long, conflicts("--microphone", "--system-audio"))]
 	pub no_audio: bool,
 }
 
@@ -249,21 +251,21 @@ pub struct Publish {
 
 impl Publish {
 	/// Build a publisher decoding the given container format from stdin into
-	/// `broadcast` (typically created on the origin that announces it).
+	/// `broadcast`. Announce the broadcast afterwards: this constructor creates
+	/// the catalog tracks, so announcing after it lands the advertisement with
+	/// the tracks already in place.
 	pub fn new(
 		mut broadcast: moq_net::broadcast::Producer,
 		format: &PublishFormat,
-		latency_max: Option<std::time::Duration>,
+		config: moq_mux::catalog::Config,
 	) -> anyhow::Result<Self> {
 		// TS carries undecoded elementary streams (SCTE-35, teletext, DVB AC-3, ...)
 		// verbatim, so it uses the `mpegts` catalog extension rather than the media-only
 		// `()`. The catalog producer owns the broadcast's catalog tracks, so each broadcast
 		// gets exactly one; TS builds its `Ext` catalog here instead of the shared `()` below.
-		let config = moq_mux::catalog::Config::default().with_latency_max(latency_max);
-
 		if let PublishFormat::Ts = format {
 			let config = config.with_catalog(moq_mux::catalog::hang::Catalog::<ts::Ext>::default());
-			let catalog = moq_mux::catalog::Producer::with_config(&mut broadcast, config)?;
+			let catalog = moq_mux::catalog::Producer::new(&mut broadcast, config)?;
 			let ts = ts::Import::new(broadcast.clone(), catalog.reserve());
 			return Ok(Self {
 				source: Source::Stream(PublishDecoder::Ts(Box::new(ts))),
@@ -271,10 +273,10 @@ impl Publish {
 			});
 		}
 
-		let catalog = moq_mux::catalog::Producer::with_config(&mut broadcast, config)?;
+		let catalog = moq_mux::catalog::Producer::new(&mut broadcast, config)?;
 		let source = match format {
 			PublishFormat::Avc3 => {
-				let track = broadcast.unique_track(".avc3", catalog.track_info())?;
+				let track = broadcast.unique_track(".avc3", catalog.track_info(hang::catalog::PRIORITY.video))?;
 				let import = moq_mux::codec::h264::Import::new(track, catalog.reserve(), Default::default())?;
 				let split = Box::new(moq_mux::codec::h264::Split::new());
 				Source::Stream(PublishDecoder::Avc3 {
@@ -299,27 +301,41 @@ impl Publish {
 	/// Build a publisher capturing local devices (camera/screen and microphone).
 	///
 	/// `bandwidth` is the uplink's send estimate, when there is one: the video
-	/// encoder follows it down while the link is congested rather than
+	/// encoder follows its share down while the link is congested rather than
 	/// overshooting a pipe that can't carry it. Pass `None` to encode at the
 	/// configured bitrate regardless.
+	///
+	/// Audio and video share one allocator, so the video encoder targets what's
+	/// left after audio's reservation rather than the whole uplink.
 	#[cfg(feature = "capture")]
 	pub fn capture(
 		mut broadcast: moq_net::broadcast::Producer,
 		args: &CaptureArgs,
-		bandwidth: Option<moq_net::bandwidth::Consumer>,
-		latency_max: Option<std::time::Duration>,
+		bandwidth: moq_net::bandwidth::Allocator,
+		max_age: Option<std::time::Duration>,
 	) -> anyhow::Result<Self> {
-		let config = moq_mux::catalog::Config::default().with_latency_max(latency_max);
-		let catalog = moq_mux::catalog::Producer::with_config(&mut broadcast, config)?;
+		let config = moq_mux::catalog::Config::default().with_max_age(max_age);
+		let catalog = moq_mux::catalog::Producer::new(&mut broadcast, config)?;
 
-		let video = (!args.no_video).then(|| (args.video_config(), args.video_encode(bandwidth)));
-		let audio = (!args.no_audio).then(|| (args.audio_config(), args.audio_encode()));
+		let video = if args.no_video {
+			None
+		} else {
+			Some((args.video_config()?, args.video_encode(bandwidth.clone())))
+		};
+		let audio = (!args.no_audio).then(|| (args.audio_config(), args.audio_encode(bandwidth)));
 		anyhow::ensure!(video.is_some() || audio.is_some(), "nothing to capture");
 
 		Ok(Self {
 			source: Source::Capture { catalog, video, audio },
 			broadcast,
 		})
+	}
+
+	/// Advertise the broadcast's path, now that the catalog tracks are in place.
+	pub fn announce(&self) -> anyhow::Result<()> {
+		self.broadcast
+			.announce(Default::default())
+			.context("failed to announce broadcast")
 	}
 
 	/// Drive the source until stdin EOF (or the capture devices stop).
@@ -369,13 +385,13 @@ impl Publish {
 			#[cfg(feature = "capture")]
 			Source::Capture { catalog, video, audio } => {
 				// Each enabled medium publishes its own track onto the shared
-				// broadcast + catalog. A single shared clock keeps the audio and
-				// video timelines aligned even though the devices open at
-				// different times. Video encodes on demand (camera opens only
-				// while subscribed). Both run on this task rather than a spawn:
-				// on macOS the audio future holds ObjC handles across an await,
+				// broadcast + catalog. Frames are stamped from the catalog's
+				// advertised clock so HLS/DASH wall times match the mapping on
+				// the wire. Video encodes on demand (camera opens only while
+				// subscribed). Both run on this task rather than a spawn: on
+				// macOS the audio future holds ObjC handles across an await,
 				// so it is `!Send`.
-				let clock = moq_mux::Clock::new();
+				let clock = catalog.clock();
 				let video_fut = {
 					let broadcast = self.broadcast.clone();
 					let catalog = catalog.clone();
@@ -395,7 +411,11 @@ impl Publish {
 					async move {
 						match audio {
 							Some((config, encode)) => {
-								moq_audio::encode::publish_capture(broadcast, catalog, config, encode, clock)
+								let mut options = moq_audio::encode::PublicationOptions::default();
+								options.capture = config;
+								options.encode = encode;
+								options.clock = clock;
+								moq_audio::encode::publish_capture(broadcast, catalog, options)
 									.await
 									.map_err(anyhow::Error::from)
 							}
@@ -430,19 +450,23 @@ impl CaptureArgs {
 		}
 	}
 
-	fn video_config(&self) -> moq_video::capture::Config {
+	fn video_config(&self) -> anyhow::Result<moq_video::capture::Config> {
 		let mut config = moq_video::capture::Config::default();
 		config.source = self.video_source();
 		config.width = self.width;
 		config.height = self.height;
-		config.framerate = self.fps;
+		config.framerate = self
+			.fps
+			.map(|fps| moq_video::Rate::new(fps, 1))
+			.transpose()
+			.map_err(anyhow::Error::from)?;
 		config.cursor = !self.no_cursor;
-		config
+		Ok(config)
 	}
 
-	fn video_encode(&self, bandwidth: Option<moq_net::bandwidth::Consumer>) -> moq_video::encode::Options {
+	fn video_encode(&self, bandwidth: moq_net::bandwidth::Allocator) -> moq_video::encode::Options {
 		let mut options = moq_video::encode::Options::default();
-		options.bitrate = self.bitrate;
+		options.bitrate = self.bitrate.map(moq_net::bandwidth::Rate::from_bps);
 		options.codec = self.codec.into();
 		options.kind = if self.software {
 			moq_video::encode::Kind::Software
@@ -476,9 +500,12 @@ impl CaptureArgs {
 	/// The audio counterpart to [`video_encode`](Self::video_encode). `track` is
 	/// left unset so the name derives from the codec, the way the video side
 	/// names its track; consumers find it through the catalog either way.
-	fn audio_encode(&self) -> moq_audio::encode::Options {
+	fn audio_encode(&self, bandwidth: moq_net::bandwidth::Allocator) -> moq_audio::encode::Options {
 		let mut options = moq_audio::encode::Options::default();
-		options.bitrate = self.audio_bitrate;
+		options.settings.bitrate = self
+			.audio_bitrate
+			.map(|bps| moq_net::bandwidth::Rate::from_bps(bps.into()));
+		options.bandwidth = bandwidth;
 		options
 	}
 }
@@ -543,26 +570,27 @@ mod tests {
 
 	async fn manufacture_input() -> Vec<u8> {
 		// Create the broadcast on a throwaway origin so the exporter can resolve it by path.
-		let origin = moq_net::Origin::random().produce();
-		let mut broadcast = origin
-			.create_broadcast("cli", moq_net::broadcast::Route::new().with_announce(true))
-			.unwrap();
+		let origin = moq_tokio::origin::spawn();
+		let mut broadcast = origin.create_broadcast("cli").unwrap();
+		broadcast.announce(Default::default()).unwrap();
 		settle().await;
-		let mut catalog =
-			moq_mux::catalog::Producer::with_catalog(&mut broadcast, Catalog::<tscat::Ext>::default()).unwrap();
+		let config = moq_mux::catalog::Config::default().with_catalog(Catalog::<tscat::Ext>::default());
+		let mut catalog = moq_mux::catalog::Producer::new(&mut broadcast, config).unwrap();
 
 		// Section-framed verbatim stream (SCTE-35, stream_type 0x86).
 		let section = broadcast
-			.unique_track(".scte35", hang::container::track_info())
+			.unique_track(".scte35", hang::container::track_info(hang::catalog::PRIORITY.text))
 			.unwrap();
 		let mut section_track = tscat::Track::new(SECTION_PID);
 		section_track.verbatim = Some(tscat::Verbatim::new(0x86, tscat::Framing::Section));
 		catalog
-			.lock()
+			.modify()
+			.unwrap()
+			.ext
 			.mpegts
 			.tracks
 			.insert(section.name().to_string(), section_track);
-		let mut section_producer = Producer::new(section, Container::Legacy);
+		let mut section_producer = Producer::new(section, Container::Legacy(moq_mux::container::Kind::Data));
 		// bbb's first video keyframe is at 1.4 s; stamp the ancillary streams just after
 		// it so they clear the export's keyframe alignment (anything before the first
 		// keyframe is dropped on tune-in).
@@ -579,13 +607,21 @@ mod tests {
 
 		// PES-framed verbatim stream (undecoded private data, stream_type 0x06), with
 		// an explicit PES stream_id to round-trip.
-		let pes = broadcast.unique_track(".data", hang::container::track_info()).unwrap();
+		let pes = broadcast
+			.unique_track(".data", hang::container::track_info(hang::catalog::PRIORITY.text))
+			.unwrap();
 		let mut verbatim = tscat::Verbatim::new(0x06, tscat::Framing::Pes);
 		verbatim.stream_id = Some(VERBATIM_PES_STREAM_ID);
 		let mut pes_track = tscat::Track::new(VERBATIM_PES_PID);
 		pes_track.verbatim = Some(verbatim);
-		catalog.lock().mpegts.tracks.insert(pes.name().to_string(), pes_track);
-		let mut pes_producer = Producer::new(pes, Container::Legacy);
+		catalog
+			.modify()
+			.unwrap()
+			.ext
+			.mpegts
+			.tracks
+			.insert(pes.name().to_string(), pes_track);
+		let mut pes_producer = Producer::new(pes, Container::Legacy(moq_mux::container::Kind::Data));
 		pes_producer
 			.write(Frame {
 				timestamp: Timestamp::from_millis(1410).unwrap(),
@@ -608,17 +644,35 @@ mod tests {
 			Export::with_ts(moq_mux::Source::new(origin.consume(), "cli"), CatalogFormat::Hang)
 				.await
 				.unwrap()
-				.with_latency(Duration::ZERO),
+				.with_max_age(RECORDING_MAX_AGE),
 		)
 		.await
+	}
+
+	/// The media track's full retention window, so an exporter started after publishing
+	/// can still read every retained group. These tests publish a whole feed before
+	/// exporting it, which the default
+	/// [`Duration::ZERO`] collapses to the live edge:
+	/// completeness has to be asked for, exactly as a real recorder does.
+	const RECORDING_MAX_AGE: std::time::Duration = Duration::from_secs(30);
+	/// Full CLI round-trip over the hang catalog.
+	#[tokio::test(start_paused = true)]
+	async fn ts_verbatim_streams_round_trip_through_cli() {
+		ts_verbatim_round_trip(CatalogFormat::Hang).await;
+	}
+
+	/// The same round-trip over the MSF catalog: the `mpegts` section rides the MSF
+	/// track's root, so the export rebuilds the multiplex from either catalog.
+	#[tokio::test(start_paused = true)]
+	async fn ts_verbatim_streams_round_trip_through_msf() {
+		ts_verbatim_round_trip(CatalogFormat::Msf).await;
 	}
 
 	/// Full CLI round-trip: a TS feed with undecoded streams goes through `Publish`
 	/// (which selects the `mpegts` catalog) and the subscribe-side `Export::with_ts`,
 	/// and the SCTE-35 section and the verbatim PES survive with their PIDs, framing,
 	/// PES stream_id, and byte-exact payloads.
-	#[tokio::test(start_paused = true)]
-	async fn ts_verbatim_streams_round_trip_through_cli() {
+	async fn ts_verbatim_round_trip(format: CatalogFormat) {
 		// Paused time auto-advances when the exporter parks, so the `drain` timeouts
 		// fire instantly instead of waiting on the wall clock.
 		let input = manufacture_input().await;
@@ -626,12 +680,10 @@ mod tests {
 		// Publish side: `Publish::new(Ts)` builds a `ts::Import<Ext>`, so the verbatim
 		// streams land in the broadcast instead of being dropped by the media-only path.
 		// The broadcast is created on a throwaway origin so the exporter can resolve it by path.
-		let origin = moq_net::Origin::random().produce();
-		let broadcast = origin
-			.create_broadcast("cli", moq_net::broadcast::Route::new().with_announce(true))
-			.unwrap();
+		let origin = moq_tokio::origin::spawn();
+		let broadcast = origin.create_broadcast("cli").unwrap();
 		settle().await;
-		let mut publish = Publish::new(broadcast, &PublishFormat::Ts, None).unwrap();
+		let mut publish = Publish::new(broadcast, &PublishFormat::Ts, Default::default()).unwrap();
 		#[allow(irrefutable_let_patterns)]
 		let Source::Stream(decoder) = &mut publish.source else {
 			panic!("expected a stream source");
@@ -642,24 +694,25 @@ mod tests {
 		// Subscribe side: the same `with_ts` call `run_ts` makes, re-emitting the
 		// ancillary streams verbatim.
 		let output = drain(
-			Export::with_ts(moq_mux::Source::new(origin.consume(), "cli"), CatalogFormat::Hang)
+			Export::with_ts(moq_mux::Source::new(origin.consume(), "cli"), format)
 				.await
 				.unwrap()
-				.with_latency(Duration::ZERO),
+				.with_max_age(RECORDING_MAX_AGE),
 		)
 		.await;
 
 		// Re-import the round-tripped TS and inspect the recovered `mpegts` section.
 		let mut broadcast = moq_net::broadcast::Info::new().produce();
 		let consumer = broadcast.consume();
-		let catalog =
-			moq_mux::catalog::Producer::with_catalog(&mut broadcast, Catalog::<tscat::Ext>::default()).unwrap();
+		let config = moq_mux::catalog::Config::default().with_catalog(Catalog::<tscat::Ext>::default());
+		let catalog = moq_mux::catalog::Producer::new(&mut broadcast, config).unwrap();
 		let mut import = Import::new(broadcast, catalog.reserve());
 		import.decode(&BytesMut::from(&output[..])).unwrap();
 		import.finish().unwrap();
 		let snapshot = catalog.snapshot();
 
 		let (section_name, section) = snapshot
+			.ext
 			.mpegts
 			.tracks
 			.iter()
@@ -674,6 +727,7 @@ mod tests {
 		let section_name = section_name.clone();
 
 		let (pes_name, pes) = snapshot
+			.ext
 			.mpegts
 			.tracks
 			.iter()
@@ -704,7 +758,7 @@ mod tests {
 	/// Read the first frame of a verbatim track back as raw bytes.
 	async fn read_frame(consumer: &moq_net::broadcast::Consumer, name: &str) -> Vec<u8> {
 		let track = consumer.track(name).unwrap().subscribe(None).await.unwrap();
-		let mut reader = Consumer::new(track, Container::Legacy).with_latency(Duration::ZERO);
+		let mut reader = Consumer::new(track, Container::Legacy(moq_mux::container::Kind::Data));
 		let frame = tokio::time::timeout(Duration::from_secs(1), reader.read())
 			.await
 			.expect("verbatim read timed out")

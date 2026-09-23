@@ -324,7 +324,7 @@ struct ActiveTrack {
 	/// Identity we diff against on each catalog update; a change recreates the pad.
 	shape: Shape,
 	/// Tells the pump to drop its pad and exit (set on shutdown or when reconcile
-	/// removes/replaces the rendition).
+	/// replaces the rendition).
 	cancel: watch::Sender<bool>,
 	/// Handle to the pump task in the session's `JoinSet`. We only read
 	/// `is_finished()` to prune this entry once the pump ends (the `JoinSet` owns
@@ -351,21 +351,29 @@ async fn run_session(
 	element: glib::WeakRef<super::MoqSrc>,
 	shutdown: &mut watch::Receiver<bool>,
 ) -> Result<()> {
-	let mut config = moq_native::ClientConfig::default();
-	config.tls.disable_verify = Some(settings.tls_disable_verify);
+	let mut config = moq_tokio::connect::Config::default();
+	config.tls.insecure = Some(settings.tls_disable_verify);
 
-	let origin = moq_net::Origin::random().produce();
+	let origin = moq_tokio::origin::spawn();
 	let origin_consumer = origin.consume();
-	let client = config.init()?.with_subscriber(origin);
+	let client = config.init(Default::default())?.with_subscriber(origin);
 
-	let _session = client.connect(settings.url.clone()).await?;
+	// One-shot: the catalog subscription below dies with the session anyway, so a
+	// background redial could not resurrect this run. A drop surfaces as the
+	// catalog closing and the loop below winding down.
+	let _connection = client
+		.with_reconnect(false)
+		.connect(settings.url.clone())
+		.established()
+		.await?;
 
-	// Wait for the broadcast to be announced. Synchronous lookup would race the gossip of
-	// announcements that happens after the session is established.
+	// Wait for a route to cover the broadcast. Synchronous lookup would race the gossip
+	// of announcements that happens after the session is established.
 	tracing::info!(broadcast = %settings.broadcast, "waiting for broadcast to be announced");
 	let broadcast = tokio::select! {
-		broadcast = origin_consumer.announced_broadcast(&settings.broadcast) => broadcast
-			.context("broadcast not allowed or origin closed")?,
+		routed = origin_consumer.routed_broadcast(&settings.broadcast) => {
+			routed.context("broadcast unavailable")?
+		}
 		_ = shutdown.changed() => return Ok(()),
 	};
 
@@ -446,7 +454,8 @@ async fn follow_catalog(
 }
 
 /// Bring the live set of pumps in line with `catalog`: spawn pumps for newly announced
-/// renditions, tear down ones that vanished, and recreate any whose caps or container changed.
+/// renditions, recreate any whose caps or container changed, and leave ones that vanished to end
+/// with their track.
 ///
 /// Infallible by design: every way a single rendition can be unusable (unsupported codec,
 /// malformed init, a name the broadcast refuses) skips just that rendition, so one bad entry in
@@ -496,9 +505,17 @@ fn reconcile(
 		&active.iter().map(|(name, t)| (name.clone(), t.shape.clone())).collect(),
 	);
 
-	// Drop anything that disappeared or changed shape; each cancelled pump drops its own pad.
-	// Changed renditions also land in `plan.add`, so they respawn below under a fresh pad id.
+	// Drop anything that changed shape; each cancelled pump drops its own pad. Changed renditions
+	// also land in `plan.add`, so they respawn below under a fresh pad id.
+	//
+	// A rendition that vanished is only no longer selectable: a publisher retires one by
+	// delisting it and finishing its track, and the two arrive in either order. A pump that owns
+	// a pad stays in `active` and ends with its track (EOS, or a pad drop on error), where
+	// `follow_catalog` prunes it. One that never took a pad is stopped.
 	for name in plan.remove {
+		if !desired.contains_key(&name) && active.get(&name).is_some_and(|track| !track.state.cancel_before_live()) {
+			continue;
+		}
 		if let Some(track) = active.remove(&name) {
 			track.cancel();
 		}
@@ -509,7 +526,13 @@ fn reconcile(
 	// renditions that didn't change. A parse failure (malformed init) skips just this rendition.
 	for name in plan.add {
 		let d = &desired[&name];
-		let container = match moq_mux::catalog::hang::Container::try_from(&d.shape.container) {
+		let container = match moq_mux::catalog::hang::Container::new(
+			&d.shape.container,
+			match d.kind {
+				TrackKind::Video => moq_mux::container::Kind::Video,
+				TrackKind::Audio => moq_mux::container::Kind::Audio,
+			},
+		) {
 			Ok(container) => container,
 			Err(err) => {
 				gst::warning!(CAT, "ignoring rendition {name}: {err:?}");
@@ -651,7 +674,7 @@ impl Pump {
 		// rendition.
 		let subscriber = tokio::select! {
 			_ = cancel.changed() => return,
-			subscriber = track.subscribe(None) => match subscriber {
+			subscriber = track.subscribe(moq_net::track::Subscription::default().with_max_age(Duration::from_secs(1))) => match subscriber {
 				Ok(subscriber) => subscriber,
 				Err(err) => {
 					gst::warning!(CAT, "track {name} failed to subscribe: {err:?}");
@@ -659,7 +682,7 @@ impl Pump {
 				}
 			}
 		};
-		let mut track = moq_mux::container::Consumer::new(subscriber, container).with_latency(Duration::from_secs(1));
+		let mut track = moq_mux::container::Consumer::new(subscriber, container);
 
 		// Winning this is what earns a pad. Losing means a teardown got here while the
 		// subscription was still resolving (this rendition was removed, reshaped, or outlived by
@@ -869,7 +892,7 @@ fn audio_caps(config: &hang::catalog::AudioConfig) -> Result<gst::Caps> {
 
 #[cfg(test)]
 mod tests {
-	use super::{plan_reconcile, relative_pts};
+	use super::{PumpState, plan_reconcile, relative_pts};
 	use moq_net::Timestamp;
 	use std::collections::HashMap;
 
@@ -937,6 +960,29 @@ mod tests {
 			relative_pts(Timestamp::from_millis(2500).unwrap(), reference),
 			gst::ClockTime::from_mseconds(500)
 		);
+	}
+
+	/// The pad claim and the teardown race for every pump, and only one may win: a subscription
+	/// resolving after a teardown must not publish a rendition the session has finished with and
+	/// then yank it without an EOS. The cancel watch alone cannot say which happened, so this is
+	/// the state that does.
+	#[test]
+	fn a_pump_either_goes_live_or_is_cancelled() {
+		let cancelled = PumpState::new();
+		assert!(cancelled.cancel_before_live());
+		assert!(!cancelled.go_live(), "a cancelled pump still claimed a pad");
+		assert!(
+			!cancelled.cancel_before_live(),
+			"a second teardown claimed the same transition"
+		);
+
+		let live = PumpState::new();
+		assert!(live.go_live());
+		assert!(
+			!live.cancel_before_live(),
+			"a live pump was dropped without its cancel watch"
+		);
+		assert!(!live.go_live(), "a live pump claimed a second pad");
 	}
 }
 
@@ -1030,11 +1076,11 @@ mod session_tests {
 		// A live handler is what makes an unserved name park rather than resolve `NotFound`,
 		// which is how it behaves over the wire: the publisher just never answers.
 		let mut dynamic = broadcast.dynamic();
-		let mut catalog = moq_mux::catalog::Producer::new(&mut broadcast).unwrap();
+		let mut catalog = moq_mux::catalog::Producer::new(&mut broadcast, moq_mux::catalog::Config::default()).unwrap();
 
 		// First update announces audio only, and no producer ever answers for it.
 		{
-			let mut guard = catalog.lock();
+			let mut guard = catalog.modify().unwrap();
 			guard.audio.renditions = BTreeMap::from([("audio".to_string(), audio_rendition())]);
 		}
 
@@ -1053,7 +1099,7 @@ mod session_tests {
 		// Second update adds video, backed by a real track so its subscription resolves.
 		let _video = broadcast.create_track("video", None).unwrap();
 		{
-			let mut guard = catalog.lock();
+			let mut guard = catalog.modify().unwrap();
 			guard.video.renditions = BTreeMap::from([("video".to_string(), video_rendition())]);
 		}
 
@@ -1073,7 +1119,7 @@ mod session_tests {
 		let element = element();
 
 		let mut broadcast = moq_net::broadcast::Info::new().produce();
-		let mut catalog = moq_mux::catalog::Producer::new(&mut broadcast).unwrap();
+		let mut catalog = moq_mux::catalog::Producer::new(&mut broadcast, moq_mux::catalog::Config::default()).unwrap();
 
 		// Both renditions in one snapshot, so the result can't hinge on which update the
 		// session read: with no handler alive, `audio` resolves `NotFound` rather than parking,
@@ -1081,7 +1127,7 @@ mod session_tests {
 		// the session still has to end cleanly.
 		let _video = broadcast.create_track("video", None).unwrap();
 		{
-			let mut guard = catalog.lock();
+			let mut guard = catalog.modify().unwrap();
 			guard.audio.renditions = BTreeMap::from([("audio".to_string(), audio_rendition())]);
 			guard.video.renditions = BTreeMap::from([("video".to_string(), video_rendition())]);
 		}
@@ -1097,20 +1143,21 @@ mod session_tests {
 		super::RUNTIME.block_on(session).unwrap().unwrap();
 	}
 
-	/// A subscription can resolve after its pump was already torn down. The pump has to stay
-	/// dead: exposing a pad at that point publishes a rendition the session has finished with,
-	/// and then yanks it without an EOS.
+	/// A rendition delisted while its pump is still subscribing ends that pump, and answering
+	/// the subscription afterwards must not resurrect it into a pad. Which of the two the pump
+	/// sees first is the runtime's to decide, so the state machine that refuses the losing side
+	/// is covered by `a_pump_either_goes_live_or_is_cancelled` instead.
 	#[test]
-	fn a_subscription_resolving_after_cancellation_creates_no_pad() {
+	fn a_rendition_delisted_while_subscribing_takes_no_pad() {
 		let _pad_ids = pad_ids();
 		let element = element();
 
 		let mut broadcast = moq_net::broadcast::Info::new().produce();
 		let mut dynamic = broadcast.dynamic();
-		let mut catalog = moq_mux::catalog::Producer::new(&mut broadcast).unwrap();
+		let mut catalog = moq_mux::catalog::Producer::new(&mut broadcast, moq_mux::catalog::Config::default()).unwrap();
 
 		{
-			let mut guard = catalog.lock();
+			let mut guard = catalog.modify().unwrap();
 			guard.video.renditions = BTreeMap::from([("stalled".to_string(), video_rendition())]);
 		}
 
@@ -1123,15 +1170,27 @@ mod session_tests {
 		// is cancelled while it is still waiting.
 		let request = await_request(&mut dynamic);
 		{
-			let mut guard = catalog.lock();
+			let mut guard = catalog.modify().unwrap();
 			guard.video.renditions.clear();
 		}
 
-		// Only now answer it. The pump was torn down, so nothing may reach a pad. Proving a pad
-		// never appears has no edge to wait on, unlike `await_pad`, so this gives the runtime a
-		// window in which the un-cancelled version reliably creates one.
+		// A cancelled pump returns out of its subscribe, dropping the only consumer this request
+		// has: that edge says the session reconciled the removal, which a fixed beat can only
+		// guess at. Answering before it lands is a pump that legitimately goes live, so the
+		// wait is what the assertion below is about.
+		super::RUNTIME
+			.block_on(async {
+				tokio::time::timeout(
+					Duration::from_secs(10),
+					moq_net::kio::wait(|waiter| request.poll_unused(waiter)),
+				)
+				.await
+			})
+			.expect("the cancelled pump never dropped its subscription");
+
+		// Only now answer it. The pump is gone and its state is terminal, so no later scheduling
+		// can produce a pad.
 		let _serving = request.accept(moq_net::track::Info::default());
-		std::thread::sleep(Duration::from_millis(500));
 		assert!(pads(&element, "video_").is_empty(), "a cancelled pump still took a pad");
 
 		let _ = shutdown.send(true);
@@ -1148,11 +1207,11 @@ mod session_tests {
 		let element = element();
 
 		let mut broadcast = moq_net::broadcast::Info::new().produce();
-		let mut catalog = moq_mux::catalog::Producer::new(&mut broadcast).unwrap();
+		let mut catalog = moq_mux::catalog::Producer::new(&mut broadcast, moq_mux::catalog::Config::default()).unwrap();
 
 		let _video = broadcast.create_track("video", None).unwrap();
 		{
-			let mut guard = catalog.lock();
+			let mut guard = catalog.modify().unwrap();
 			guard.video.renditions = BTreeMap::from([("video".to_string(), video_rendition())]);
 		}
 		catalog.finish().unwrap();
@@ -1178,13 +1237,15 @@ mod session_tests {
 		let element = element();
 
 		let mut broadcast = moq_net::broadcast::Info::new().produce();
-		let mut catalog = moq_mux::catalog::Producer::new(&mut broadcast).unwrap();
+		let mut catalog = moq_mux::catalog::Producer::new(&mut broadcast, moq_mux::catalog::Config::default()).unwrap();
 
 		// One rendition that streams, and one reserved by name that nobody ever accepts.
-		let mut video = broadcast.create_track("video", hang::container::track_info()).unwrap();
+		let video = broadcast
+			.create_track("video", hang::container::track_info(hang::catalog::PRIORITY.video))
+			.unwrap();
 		let _reserved = broadcast.reserve_track("audio").unwrap();
 		{
-			let mut guard = catalog.lock();
+			let mut guard = catalog.modify().unwrap();
 			guard.video.renditions = BTreeMap::from([("video".to_string(), video_rendition())]);
 			guard.audio.renditions = BTreeMap::from([("audio".to_string(), audio_rendition())]);
 		}
@@ -1222,6 +1283,265 @@ mod session_tests {
 		drop(shutdown);
 	}
 
+	/// A publisher that ends one rendition finishes its track and retires it from the catalog,
+	/// which is what `moqsink` does on EOS. The two travel on different tracks, so the catalog
+	/// update can reach the subscriber before the tail of the media does. It must not cut the pump
+	/// short: the pad owes downstream every frame of the track and an EOS.
+	///
+	/// The subscriber's view of that arrival order is reproduced exactly: the head of the track,
+	/// then the catalog update, then the tail and the clean end.
+	#[test]
+	fn a_retired_rendition_drains_to_eos() {
+		const HEAD: u64 = 3;
+		const TAIL: u64 = 2;
+
+		let _pad_ids = pad_ids();
+		let element = element();
+
+		let mut broadcast = moq_net::broadcast::Info::new().produce();
+		let mut catalog = moq_mux::catalog::Producer::new(&mut broadcast, moq_mux::catalog::Config::default()).unwrap();
+		let video = broadcast
+			.create_track("video", hang::container::track_info(hang::catalog::PRIORITY.video))
+			.unwrap();
+		let _audio = broadcast
+			.create_track("audio", hang::container::track_info(hang::catalog::PRIORITY.audio))
+			.unwrap();
+		{
+			let mut guard = catalog.modify().unwrap();
+			guard.video.renditions = BTreeMap::from([("video".to_string(), video_rendition())]);
+		}
+
+		let (shutdown, mut shutdown_rx) = watch::channel(false);
+		let consumer = broadcast.consume();
+		let weak = element.downgrade();
+		let session = super::RUNTIME.spawn(async move { follow_catalog(consumer, weak, &mut shutdown_rx).await });
+
+		// Count what reaches the pad. The pad has no peer, so the probe swallows each buffer, which
+		// reports the push as OK.
+		let pad = await_pad(&element, "video_");
+		let buffers = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+		let eos = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+		let (counted, seen) = (buffers.clone(), eos.clone());
+		pad.add_probe(
+			gst::PadProbeType::BUFFER | gst::PadProbeType::EVENT_DOWNSTREAM,
+			move |_, info| match &info.data {
+				Some(gst::PadProbeData::Buffer(_)) => {
+					counted.fetch_add(1, Ordering::Relaxed);
+					gst::PadProbeReturn::Drop
+				}
+				Some(gst::PadProbeData::Event(event)) if event.type_() == gst::EventType::Eos => {
+					seen.store(true, Ordering::Relaxed);
+					gst::PadProbeReturn::Ok
+				}
+				_ => gst::PadProbeReturn::Ok,
+			},
+		);
+
+		let mut producer = moq_mux::container::Producer::new(
+			video,
+			moq_mux::catalog::hang::Container::Legacy(moq_mux::container::Kind::Video),
+		);
+		let mut write = |i: u64| {
+			producer
+				.write(moq_mux::container::Frame {
+					timestamp: moq_net::Timestamp::from_micros(i * 33_000).unwrap(),
+					payload: bytes::Bytes::from(vec![i as u8; 64]),
+					keyframe: i == 0,
+					duration: None,
+				})
+				.unwrap();
+		};
+
+		// The head of the track arrives and is delivered.
+		for i in 0..HEAD {
+			write(i);
+		}
+		for _ in 0..100 {
+			if buffers.load(Ordering::Relaxed) == HEAD {
+				break;
+			}
+			std::thread::sleep(Duration::from_millis(50));
+		}
+		assert_eq!(
+			buffers.load(Ordering::Relaxed),
+			HEAD,
+			"the head of the track never arrived"
+		);
+
+		// The catalog update retiring the rendition arrives next. The catalog and the broadcast
+		// stay open, so nothing else can end the pump. The same update lists an audio rendition:
+		// its pad appearing proves the session acted on the update before the tail is written.
+		{
+			let mut guard = catalog.modify().unwrap();
+			guard.video.renditions.clear();
+			guard.audio.renditions = BTreeMap::from([("audio".to_string(), audio_rendition())]);
+		}
+		await_pad(&element, "audio_");
+
+		// A pump the update cancelled still has to notice. It takes its pad with it when it does,
+		// so the wait is only ever served in full by one that is still reading.
+		for _ in 0..10 {
+			if pads(&element, "video_").is_empty() {
+				break;
+			}
+			std::thread::sleep(Duration::from_millis(50));
+		}
+
+		// The tail of the track and its clean end arrive last.
+		for i in HEAD..HEAD + TAIL {
+			write(i);
+		}
+		producer.finish().unwrap();
+
+		// The pump removes its pad on the way out, whichever way it goes.
+		for _ in 0..100 {
+			if pads(&element, "video_").is_empty() {
+				break;
+			}
+			std::thread::sleep(Duration::from_millis(50));
+		}
+		assert!(pads(&element, "video_").is_empty(), "the pump never ended");
+
+		let _ = shutdown.send(true);
+		super::RUNTIME.block_on(session).unwrap().unwrap();
+
+		assert_eq!(
+			buffers.load(Ordering::Relaxed),
+			HEAD + TAIL,
+			"the retired rendition lost the tail of its track"
+		);
+		assert!(eos.load(Ordering::Relaxed), "the retired rendition never emitted EOS");
+	}
+
+	/// A publisher that delists a rendition without finishing its track and lists it again later
+	/// (the browser toggling a source) is resuming the same track. The pump that is still reading
+	/// it carries on under the same pad.
+	#[test]
+	fn a_relisted_rendition_keeps_its_pad() {
+		const HEAD: u64 = 3;
+		const TAIL: u64 = 2;
+
+		let _pad_ids = pad_ids();
+		let element = element();
+
+		let mut broadcast = moq_net::broadcast::Info::new().produce();
+		let mut catalog = moq_mux::catalog::Producer::new(&mut broadcast, moq_mux::catalog::Config::default()).unwrap();
+		let video = broadcast
+			.create_track("video", hang::container::track_info(hang::catalog::PRIORITY.video))
+			.unwrap();
+		let _audio = broadcast
+			.create_track("audio", hang::container::track_info(hang::catalog::PRIORITY.audio))
+			.unwrap();
+		{
+			let mut guard = catalog.modify().unwrap();
+			guard.video.renditions = BTreeMap::from([("video".to_string(), video_rendition())]);
+		}
+
+		let added = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+		let count = added.clone();
+		element.connect_pad_added(move |_, pad| {
+			if pad.name().starts_with("video_") {
+				count.fetch_add(1, Ordering::Relaxed);
+			}
+		});
+
+		let (shutdown, mut shutdown_rx) = watch::channel(false);
+		let consumer = broadcast.consume();
+		let weak = element.downgrade();
+		let session = super::RUNTIME.spawn(async move { follow_catalog(consumer, weak, &mut shutdown_rx).await });
+
+		let pad = await_pad(&element, "video_");
+		let buffers = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+		let eos = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+		let (counted, seen) = (buffers.clone(), eos.clone());
+		pad.add_probe(
+			gst::PadProbeType::BUFFER | gst::PadProbeType::EVENT_DOWNSTREAM,
+			move |_, info| match &info.data {
+				Some(gst::PadProbeData::Buffer(_)) => {
+					counted.fetch_add(1, Ordering::Relaxed);
+					gst::PadProbeReturn::Drop
+				}
+				Some(gst::PadProbeData::Event(event)) if event.type_() == gst::EventType::Eos => {
+					seen.store(true, Ordering::Relaxed);
+					gst::PadProbeReturn::Ok
+				}
+				_ => gst::PadProbeReturn::Ok,
+			},
+		);
+
+		let mut producer = moq_mux::container::Producer::new(
+			video,
+			moq_mux::catalog::hang::Container::Legacy(moq_mux::container::Kind::Video),
+		);
+		let mut write = |i: u64| {
+			producer
+				.write(moq_mux::container::Frame {
+					timestamp: moq_net::Timestamp::from_micros(i * 33_000).unwrap(),
+					payload: bytes::Bytes::from(vec![i as u8; 64]),
+					keyframe: i == 0 || i == HEAD,
+					duration: None,
+				})
+				.unwrap();
+		};
+		let wait_for = |n: u64| {
+			for _ in 0..100 {
+				if buffers.load(Ordering::Relaxed) == n {
+					break;
+				}
+				std::thread::sleep(Duration::from_millis(50));
+			}
+		};
+
+		for i in 0..HEAD {
+			write(i);
+		}
+		wait_for(HEAD);
+
+		// Delist it. The catalog consumer only yields the newest snapshot, so the same update
+		// lists an audio rendition: its pad appearing proves the session acted on the delist
+		// rather than skipping straight to the relist below.
+		{
+			let mut guard = catalog.modify().unwrap();
+			guard.video.renditions.clear();
+			guard.audio.renditions = BTreeMap::from([("audio".to_string(), audio_rendition())]);
+		}
+		await_pad(&element, "audio_");
+
+		// List it again, unchanged.
+		{
+			let mut guard = catalog.modify().unwrap();
+			guard.video.renditions = BTreeMap::from([("video".to_string(), video_rendition())]);
+		}
+
+		// The same track resumes with a new group, then ends.
+		for i in HEAD..HEAD + TAIL {
+			write(i);
+		}
+		wait_for(HEAD + TAIL);
+		producer.finish().unwrap();
+		for _ in 0..100 {
+			if pads(&element, "video_").is_empty() {
+				break;
+			}
+			std::thread::sleep(Duration::from_millis(50));
+		}
+
+		let _ = shutdown.send(true);
+		super::RUNTIME.block_on(session).unwrap().unwrap();
+
+		assert_eq!(
+			added.load(Ordering::Relaxed),
+			1,
+			"the relisted rendition took a second pad"
+		);
+		assert_eq!(
+			buffers.load(Ordering::Relaxed),
+			HEAD + TAIL,
+			"the first pad lost frames"
+		);
+		assert!(eos.load(Ordering::Relaxed), "the track's end never reached the pad");
+	}
+
 	/// Pipelines link `moqsrc`'s pads by name, so the first video rendition that actually
 	/// arrives has to be `video_0`. A rendition announced but never served must not claim that
 	/// name and leave the real one on `video_1`, where `s.video_0 ! ...` never links.
@@ -1232,14 +1552,14 @@ mod session_tests {
 
 		let mut broadcast = moq_net::broadcast::Info::new().produce();
 		let _dynamic = broadcast.dynamic();
-		let mut catalog = moq_mux::catalog::Producer::new(&mut broadcast).unwrap();
+		let mut catalog = moq_mux::catalog::Producer::new(&mut broadcast, moq_mux::catalog::Config::default()).unwrap();
 
 		// A video rendition nobody serves, alongside an audio one that arrives. The audio pad
 		// is the signal that this update was reconciled, so the second update below is a
 		// separate one and the stalled rendition had its chance to claim an id first.
 		let _audio = broadcast.create_track("audio", None).unwrap();
 		{
-			let mut guard = catalog.lock();
+			let mut guard = catalog.modify().unwrap();
 			guard.video.renditions = BTreeMap::from([("stalled".to_string(), video_rendition())]);
 			guard.audio.renditions = BTreeMap::from([("audio".to_string(), audio_rendition())]);
 		}
@@ -1254,7 +1574,7 @@ mod session_tests {
 
 		let _video = broadcast.create_track("video", None).unwrap();
 		{
-			let mut guard = catalog.lock();
+			let mut guard = catalog.modify().unwrap();
 			guard.video.renditions.insert("video".to_string(), video_rendition());
 		}
 

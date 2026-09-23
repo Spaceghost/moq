@@ -69,10 +69,10 @@ The simplest way to watch a stream:
 | `muted`          | boolean                    | false         | Mute audio                               |
 | `visible`        | never, distance, or always | `20%`         | When to download video (see below)       |
 | `volume`         | number                     | 0.5           | Audio volume (0-1)                       |
-| `reload`         | boolean                    | true          | Wait for (re)announcement before subscribing. Ignored when the relay does not support broadcast discovery. |
-| `latency`        | `real-time`, ms, `instant` | `real-time`   | Target latency. `instant` paints frames as they decode and disables audio. |
-| `latency-min`    | `real-time` or ms          | `real-time`   | The latency floor, opening a range instead of a single target. |
-| `latency-max`    | `real-time` or ms          | `real-time`   | The latency ceiling: buffer freely below it, skip ahead past it. |
+| `announced`      | boolean                    | true          | Wait for (re)announcement before subscribing. Ignored when the relay does not support broadcast discovery. |
+| `delay`          | `auto`, duration, `instant` | `auto`       | Distance from the live edge. `instant` paints frames as they decode and disables audio. |
+| `buffer`         | duration                   | `0ms`         | Future-dated media held before playback skips ahead. |
+| `captions`       | string                     | off           | Text rendition to render. |
 | `catalog-format` | hang, hangz, msf, manual   | auto-detected | The catalog format; detected from the name suffix unless set. `hangz` (compressed) is opt-in. |
 
 The `visible` attribute controls when the video track is downloaded, based on the canvas
@@ -88,35 +88,36 @@ Only the distance mode suspends video while the tab is hidden; `always` keeps do
 
 ## JavaScript API
 
-For more control, `Broadcast` fetches the catalog and follows the broadcast across reconnects.
-The rest of the pipeline is assembled around it: a `Source` picks a rendition,
-a `Decoder` decodes it, `Sync` paces both media clocks, and a `Renderer` /
-`Emitter` paints to a canvas and plays through WebAudio.
+For a headless player, construct `Player` with a connection origin and a canvas.
+It owns the broadcast, rendition selection, synchronized decoders, video
+renderer, audio emitter, and captions. Pass `Signal` values to change controls
+later; call `close()` when playback ends.
 
 ```typescript
 import * as Watch from "@moq/watch";
+import { Signal } from "@moq/signals";
 
-const connection = new Watch.Net.Connection.Reload({
+const connection = new Watch.Net.Connection({
     url: new URL("https://relay.example.com/anon"),
     enabled: true,
 });
-
-const broadcast = new Watch.Broadcast({
-    connection: connection.established,
-    enabled: true,
+const muted = new Signal(false);
+const player = new Watch.Player({
+    origin: connection.origin,
+    probe: connection.probe,
     name: Watch.Net.Path.from("room/alice.hang"),
+    canvas,
+    muted,
 });
 
-const source = new Watch.Video.Source({ broadcast, supported: Watch.Video.Decoder.supported });
-const sync = new Watch.Sync({ connection: connection.established, video: source.out.jitter });
-const decoder = new Watch.Video.Decoder(source, sync, { enabled: true });
-
-// Video renders to a <canvas>; there is no MediaStream to assign.
-const renderer = new Watch.Video.Renderer(decoder, { canvas });
+// player.broadcast, player.video, player.audio, player.text,
+// player.renderer, player.emitter, and player.sync expose the pipeline.
+// Later: player.close(); connection.close();
 ```
 
-Audio is the same shape: `Audio.Source` into `Audio.Decoder` into
-`Audio.Emitter`, sharing the one `Sync`.
+`<moq-watch>` wraps this same `Player` and maps attributes to its controls.
+`Broadcast`, `Sync`, and the `Video`, `Audio`, and `Text` components remain
+available when an application needs a different pipeline.
 
 ## UI Web Component
 
@@ -141,7 +142,7 @@ The `<moq-watch-ui>` element automatically discovers the nested `<moq-watch>` el
 
 - **WebCodecs decoding**: Hardware-accelerated video and audio decoding
 - **Reactive state**: All properties are signals from `@moq/signals`
-- **Latency control**: A single target, or a range that buffers future-dated frames
+- **Latency control**: A delay target plus optional buffering for future-dated frames
 - **Quality selection**: Switch between available renditions
 - **Custom tracks**: Unknown catalog sections pass through, and `broadcast.out.active` subscribes your own tracks
 

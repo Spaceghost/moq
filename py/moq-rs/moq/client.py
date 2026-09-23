@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from moq_ffi import MoqClient
 
-from .origin import Announced, AnnouncedBroadcast, OriginConsumer, OriginProducer
+from .origin import AnnounceConsumer, AnnouncedBroadcast, OriginConsumer, OriginProducer
 from .publish import BroadcastProducer
 from .session import Session
 from .subscribe import BroadcastConsumer
+from .types import Backoff
 
 
 class Client:
@@ -28,6 +29,11 @@ class Client:
     For a relay that requires mTLS, pass a paired client certificate and key:
 
         client = Client("https://relay.example.com", tls_cert="client.pem", tls_key="client.key")
+
+    The session automatically reconnects with backoff when the transport drops, and
+    broadcasts consumed through it ride out the gap. Pass ``reconnect=False`` for a
+    one-shot dial, or a :class:`Backoff` to tune the retry pacing; watch
+    :meth:`Session.status` for the connect/disconnect transitions.
     """
 
     def __init__(
@@ -41,6 +47,9 @@ class Client:
         tls_cert: str | None = None,
         tls_key: str | None = None,
         bind: str | None = None,
+        max_streams: int | None = None,
+        reconnect: bool = True,
+        backoff: Backoff | None = None,
         publish: OriginProducer | None = None,
         subscribe: OriginProducer | None = None,
     ) -> None:
@@ -52,6 +61,9 @@ class Client:
         self._tls_cert = tls_cert
         self._tls_key = tls_key
         self._bind = bind
+        self._max_streams = max_streams
+        self._reconnect = reconnect
+        self._backoff = backoff
 
         # With neither side given, moq-ffi wires one shared origin to both, so a broadcast
         # announced here is discoverable via announced() (loopback).
@@ -67,7 +79,7 @@ class Client:
         self._inner = MoqClient()
 
         if not self._tls_verify:
-            self._inner.set_tls_disable_verify(True)
+            self._inner.set_tls_verify(False)
         if self._tls_roots:
             self._inner.set_tls_roots(self._tls_roots)
         if self._tls_system_roots is not None:
@@ -80,6 +92,12 @@ class Client:
             self._inner.set_tls_key(self._tls_key)
         if self._bind is not None:
             self._inner.set_bind(self._bind)
+        if self._max_streams is not None:
+            self._inner.set_quic_max_streams(self._max_streams)
+        if not self._reconnect:
+            self._inner.set_reconnect(False)
+        if self._backoff is not None:
+            self._inner.set_backoff(self._backoff)
 
         if self._publish_origin is not None:
             self._inner.set_publish(self._publish_origin._inner)
@@ -90,8 +108,8 @@ class Client:
 
         # The session always exposes both sides, wired from the origins above or
         # auto-created, so publishing and discovery always have somewhere to go.
-        self._publisher = self._session.publisher()
-        self._consumer = self._session.consumer()
+        self._publisher = self._session.publish()
+        self._consumer = self._session.consume()
 
         return self
 
@@ -107,18 +125,18 @@ class Client:
         self._session = None
 
     def create_broadcast(self, path: str) -> BroadcastProducer:
-        """Create a live broadcast at ``path`` so subscribers can discover it.
+        """Create a locally announced broadcast at ``path``. Advertise it to peers after populating tracks.
 
         See :meth:`OriginProducer.create_broadcast`.
         """
         return self._require_publisher().create_broadcast(path)
 
-    def announced(self, prefix: str = "") -> Announced:
-        """Async-iterate broadcasts announced under ``prefix`` (empty matches all).
+    def announced(self, prefix: str = "", *, filter: str | None = None) -> AnnounceConsumer:
+        """Async-iterate broadcasts under ``prefix`` matching an optional pattern.
 
         See :meth:`OriginConsumer.announced`.
         """
-        return self._require_consumer().announced(prefix)
+        return self._require_consumer().announced(prefix, filter=filter)
 
     def announced_broadcast(self, path: str) -> AnnouncedBroadcast:
         """Await announcement of the broadcast at exactly ``path``.
@@ -157,6 +175,9 @@ def connect(
     tls_cert: str | None = None,
     tls_key: str | None = None,
     bind: str | None = None,
+    max_streams: int | None = None,
+    reconnect: bool = True,
+    backoff: Backoff | None = None,
     publish: OriginProducer | None = None,
     subscribe: OriginProducer | None = None,
 ) -> Client:
@@ -176,6 +197,9 @@ def connect(
         tls_cert=tls_cert,
         tls_key=tls_key,
         bind=bind,
+        max_streams=max_streams,
+        reconnect=reconnect,
+        backoff=backoff,
         publish=publish,
         subscribe=subscribe,
     )

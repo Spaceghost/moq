@@ -14,11 +14,11 @@
 //! avcC/hvcC (for Annex-B sources).
 
 use std::task::{Poll, ready};
-use std::time::Duration;
 
 use bytes::Bytes;
 use hang::catalog::{AudioConfig, VideoCodec, VideoConfig};
 
+use super::consumer::Event;
 use crate::catalog::hang::Container as HangContainer;
 use crate::codec::h264::Avc1;
 use crate::codec::h265::Hvc1;
@@ -65,7 +65,7 @@ pub(crate) struct ExportSource {
 	state: SourceState,
 	/// Wire format, consumed when the subscription resolves into a consumer.
 	media: Option<HangContainer>,
-	latency: Duration,
+	max_age: std::time::Duration,
 	transform: Option<VideoTransform>,
 	/// Resolved codec configuration record (avcC / hvcC / AudioSpecificConfig /
 	/// OpusHead). Some once the codec config is available — from the catalog
@@ -79,45 +79,52 @@ pub(crate) struct ExportSource {
 
 impl ExportSource {
 	/// Subscribe to a video rendition and build an `ExportSource`.
+	///
+	/// Fails with [`Error::EscapingBroadcast`](crate::Error::EscapingBroadcast) if the catalog
+	/// `broadcast` reference escapes above the root, naming no broadcast to subscribe on. The
+	/// catalog stream rejects such a reference first, so this is a backstop for a caller that
+	/// built the config itself.
 	pub fn for_video(
 		source: &crate::Source,
 		name: &str,
 		config: &VideoConfig,
-		latency: Duration,
+		max_age: std::time::Duration,
 	) -> Result<Option<Self>, crate::Error> {
-		Self::video(source, name, config, latency, build_video_transform(config))
+		Self::video(source, name, config, max_age, build_video_transform(config))
 	}
 
 	/// Subscribe to a video rendition without attaching any codec-shape
 	/// transform. Payloads pass through untouched (Annex-B stays Annex-B,
 	/// avc1 length-prefixed stays length-prefixed). The Annex-B exporter
 	/// uses this to keep parameter sets in-band.
+	///
+	/// Rejects an escaping `broadcast` reference like [`Self::for_video`].
 	pub fn for_video_raw(
 		source: &crate::Source,
 		name: &str,
 		config: &VideoConfig,
-		latency: Duration,
+		max_age: std::time::Duration,
 	) -> Result<Option<Self>, crate::Error> {
-		Self::video(source, name, config, latency, None)
+		Self::video(source, name, config, max_age, None)
 	}
 
 	fn video(
 		source: &crate::Source,
 		name: &str,
 		config: &VideoConfig,
-		latency: Duration,
+		max_age: std::time::Duration,
 		transform: Option<VideoTransform>,
 	) -> Result<Option<Self>, crate::Error> {
-		let media: HangContainer = (&config.container).try_into()?;
+		let media: HangContainer = config.try_into()?;
 		let description = config.description.as_ref().filter(|b| !b.is_empty()).cloned();
-		let Some(request) = source.request(config.broadcast.as_ref()) else {
+		let Some(request) = source.try_request(config.broadcast.as_ref()) else {
 			return Ok(None);
 		};
 
 		let mut source = Self {
 			state: SourceState::Requesting(request, name.to_string()),
 			media: Some(media),
-			latency,
+			max_age,
 			transform,
 			description,
 			video_codec: Some(config.codec.clone()),
@@ -129,22 +136,24 @@ impl ExportSource {
 
 	/// Subscribe to an audio rendition. Audio has no codec-shape transform;
 	/// `description` is taken straight from the catalog.
+	///
+	/// Rejects an escaping `broadcast` reference like [`Self::for_video`].
 	pub fn for_audio(
 		source: &crate::Source,
 		name: &str,
 		config: &AudioConfig,
-		latency: Duration,
+		max_age: std::time::Duration,
 	) -> Result<Option<Self>, crate::Error> {
-		let media: HangContainer = (&config.container).try_into()?;
+		let media: HangContainer = config.try_into()?;
 		let description = config.description.as_ref().filter(|b| !b.is_empty()).cloned();
-		let Some(request) = source.request(config.broadcast.as_ref()) else {
+		let Some(request) = source.try_request(config.broadcast.as_ref()) else {
 			return Ok(None);
 		};
 
 		Ok(Some(Self {
 			state: SourceState::Requesting(request, name.to_string()),
 			media: Some(media),
-			latency,
+			max_age,
 			transform: None,
 			description,
 			video_codec: None,
@@ -155,12 +164,14 @@ impl ExportSource {
 	/// Subscribe to a verbatim `mpegts` stream rendition (SCTE-35, private PES, ...).
 	/// No codec-shape transform and no description: the frames are Legacy-framed
 	/// verbatim bytes the muxer writes back out as PES or private sections.
-	pub fn for_stream(source: &crate::Source, name: &str, latency: Duration) -> Result<Self, crate::Error> {
-		let request = source.request(None).expect("the catalog broadcast is always valid");
+	///
+	/// Such a rendition has no catalog `broadcast` field, so it always lives on the
+	/// catalog broadcast and can never carry an escaping reference.
+	pub fn for_stream(source: &crate::Source, name: &str, max_age: std::time::Duration) -> Result<Self, crate::Error> {
 		Ok(Self {
-			state: SourceState::Requesting(request, name.to_string()),
-			media: Some(HangContainer::Legacy),
-			latency,
+			state: SourceState::Requesting(source.request_catalog(), name.to_string()),
+			media: Some(HangContainer::Legacy(crate::container::Kind::Data)),
+			max_age,
 			transform: None,
 			description: None,
 			video_codec: None,
@@ -173,12 +184,12 @@ impl ExportSource {
 		self.description.as_ref()
 	}
 
-	/// The underlying consumer's timeline-discontinuity counter, or 0 until the
+	/// The underlying consumer's playhead generation, or 0 until the
 	/// subscription resolves.
 	///
 	/// See [`Consumer::discontinuity`]. Sample it alongside each frame returned by
 	/// [`poll_read`](Self::poll_read): the frame read while the counter changes is
-	/// the first of a new timeline, so anything anchored on the media clock (a
+	/// the first after a playhead event, so anything anchored on the media clock (a
 	/// repetition cadence, a clock grid, a pacer) has to re-anchor to it.
 	pub fn discontinuity(&self) -> u64 {
 		match &self.state {
@@ -220,6 +231,17 @@ impl ExportSource {
 	/// absorbed and the next frame is polled. Returns `Ready(None)` at
 	/// end-of-track.
 	pub fn poll_read(&mut self, waiter: &kio::Waiter) -> Poll<crate::Result<Option<Frame>>> {
+		loop {
+			match ready!(self.poll_event(waiter))? {
+				Some(Event::Frame(frame)) => return Poll::Ready(Ok(Some(frame))),
+				Some(Event::GroupEnd | Event::FrameEnd(_)) => continue,
+				None => return Poll::Ready(Ok(None)),
+			}
+		}
+	}
+
+	/// Read normalized media or a clean group boundary.
+	pub fn poll_event(&mut self, waiter: &kio::Waiter) -> Poll<crate::Result<Option<Event>>> {
 		// Resolve a cross-broadcast reference into a broadcast before subscribing.
 		if matches!(self.state, SourceState::Requesting(..)) {
 			let (broadcast, name) = {
@@ -228,7 +250,8 @@ impl ExportSource {
 				};
 				(ready!(pending.poll_ok(waiter))?, name.clone())
 			};
-			self.state = SourceState::Subscribing(broadcast.track(&name)?.subscribe(None));
+			let subscription = moq_net::track::Subscription::default().with_max_age(self.max_age);
+			self.state = SourceState::Subscribing(broadcast.track(&name)?.subscribe(subscription));
 		}
 
 		// Resolve the subscription before reading any frames.
@@ -244,7 +267,7 @@ impl ExportSource {
 				.media
 				.take()
 				.expect("media present until the subscription resolves");
-			self.state = SourceState::Active(Box::new(Consumer::new(track, media).with_latency(self.latency)));
+			self.state = SourceState::Active(Box::new(Consumer::new(track, media)));
 		}
 
 		loop {
@@ -254,15 +277,15 @@ impl ExportSource {
 				let SourceState::Active(consumer) = &mut self.state else {
 					unreachable!("subscription resolved into an Active consumer");
 				};
-				let Some(frame) = ready!(consumer.poll_read(waiter))? else {
-					return Poll::Ready(Ok(None));
-				};
-				frame
+				match ready!(consumer.poll_event(waiter))? {
+					Some(Event::Frame(frame)) => frame,
+					event => return Poll::Ready(Ok(event)),
+				}
 			};
 
 			let Some(transform) = self.transform.as_mut() else {
 				self.resolve_video_dimensions(&frame.payload)?;
-				return Poll::Ready(Ok(Some(frame)));
+				return Poll::Ready(Ok(Some(Event::Frame(frame))));
 			};
 
 			match transform.transform(frame.payload.clone())? {
@@ -277,7 +300,7 @@ impl ExportSource {
 				Some(payload) => {
 					self.refresh_description();
 					self.resolve_video_dimensions(&payload)?;
-					return Poll::Ready(Ok(Some(Frame { payload, ..frame })));
+					return Poll::Ready(Ok(Some(Event::Frame(Frame { payload, ..frame }))));
 				}
 			}
 		}
@@ -352,5 +375,104 @@ pub(crate) fn build_video_transform(config: &VideoConfig) -> Option<VideoTransfo
 		VideoCodec::H264(_) => Some(VideoTransform::Avc1(Avc1::new())),
 		VideoCodec::H265(_) => Some(VideoTransform::Hvc1(Hvc1::new())),
 		_ => None,
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use hang::catalog::{AudioCodec, Container, H264};
+	use moq_net::path::Relative;
+
+	use super::*;
+	use crate::container::test_util::Live;
+
+	fn video(broadcast: Option<&str>) -> VideoConfig {
+		let mut config = VideoConfig::new(H264 {
+			profile: 0x42,
+			constraints: 0xc0,
+			level: 0x1f,
+			inline: true,
+		});
+		config.container = Container::Legacy;
+		config.broadcast = broadcast.map(|b| Relative::new(b).into_owned());
+		config
+	}
+
+	fn audio(broadcast: Option<&str>) -> AudioConfig {
+		let mut config = AudioConfig::new(AudioCodec::Opus, 48_000, 2);
+		config.container = Container::Legacy;
+		config.broadcast = broadcast.map(|b| Relative::new(b).into_owned());
+		config
+	}
+
+	/// A rendition whose `broadcast` escapes the root is skipped, rather than resolving
+	/// against whatever broadcast the clamped path lands on. The test origin serves every
+	/// path it is asked for, so a clamped request would happily resolve.
+	#[tokio::test]
+	async fn escaping_reference_skips_the_rendition() {
+		let live = Live::avc3();
+		let source = live.source();
+		let max_age = std::time::Duration::ZERO;
+
+		let escaping = |result: Result<Option<ExportSource>, crate::Error>, what: &str| match result {
+			Ok(None) => {}
+			Err(err) => panic!("{what} failed instead of being skipped: {err:?}"),
+			Ok(Some(_)) => panic!("{what} should not resolve"),
+		};
+
+		// A reference resolves against the catalog's parent, and the source is rooted at a
+		// single-segment path, so its parent is the root and any `..` walks above it.
+		for reference in ["..", "../source", "../../elsewhere"] {
+			let config = video(Some(reference));
+			escaping(ExportSource::for_video(&source, "video", &config, max_age), reference);
+			escaping(
+				ExportSource::for_video_raw(&source, "video", &config, max_age),
+				reference,
+			);
+			escaping(
+				ExportSource::for_audio(&source, "audio", &audio(Some(reference)), max_age),
+				reference,
+			);
+		}
+	}
+
+	/// A legal reference still resolves, as does an absent or empty one (the catalog's own
+	/// broadcast). A lone `.` names the parent, which here is the root.
+	#[tokio::test]
+	async fn legal_reference_keeps_the_rendition() {
+		let live = Live::avc3();
+		let source = live.source();
+		let max_age = std::time::Duration::ZERO;
+
+		for reference in [None, Some(""), Some("./source"), Some("sub"), Some(".")] {
+			ExportSource::for_video(&source, "video", &video(reference), max_age)
+				.unwrap_or_else(|err| panic!("{reference:?} should keep the rendition: {err:?}"))
+				.unwrap_or_else(|| panic!("{reference:?} should keep the rendition"));
+			ExportSource::for_audio(&source, "audio", &audio(reference), max_age)
+				.unwrap_or_else(|err| panic!("{reference:?} should keep the rendition: {err:?}"))
+				.unwrap_or_else(|| panic!("{reference:?} should keep the rendition"));
+		}
+	}
+
+	/// The requested budget must be present on the first SUBSCRIBE. Updating it
+	/// after SUBSCRIBE_OK cannot recover backlog the publisher already skipped.
+	#[tokio::test]
+	async fn latency_is_sent_with_the_initial_subscription() {
+		let live = Live::avc3();
+		let max_age = std::time::Duration::from_secs(10);
+		let mut export = ExportSource::for_video(&live.source(), live.track.name(), &video(None), max_age)
+			.unwrap()
+			.expect("fixture should produce a video rendition");
+
+		let observed = kio::wait(|waiter| {
+			let _ = export.poll_read(waiter);
+			match live.track.subscription() {
+				Some(subscription) => Poll::Ready(subscription.max_age),
+				None => Poll::Pending,
+			}
+		})
+		.await;
+
+		assert_eq!(observed, max_age);
 	}
 }

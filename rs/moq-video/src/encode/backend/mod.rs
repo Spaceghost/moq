@@ -14,13 +14,14 @@
 //!
 //! [`open`] picks the best backend for a [`Codec`](super::Codec) +
 //! [`Kind`](super::Kind): only candidates that support the requested codec are
-//! considered, hardware (platform-gated) before the always-available openh264
-//! software fallback.
+//! considered, hardware (platform-gated) before the OpenH264 software fallback
+//! when this build enables it.
 
 use super::encoder::{Codec, Config, Kind};
 use crate::encode::Encoded;
 use crate::{Error, Frame};
 
+#[cfg(feature = "openh264")]
 mod openh264;
 
 #[cfg(test)]
@@ -47,11 +48,13 @@ mod vaapi;
 /// An opened video encoder. Feed it frames at the configured resolution; get
 /// back zero or more access units in the codec's wire framing, each stamped with
 /// the timestamp of the frame it came from.
-pub(crate) trait Backend: Send {
-	/// Encode one frame, forcing an IDR when `keyframe` is set. Backends key frames
-	/// automatically per [`Config::gop`], so this is only the caller's extra
-	/// request, arriving via [`Encoder::keyframe`](super::Encoder::keyframe).
-	fn encode(&mut self, frame: &Frame, keyframe: bool) -> Result<Vec<Encoded>, Error>;
+pub(crate) trait Backend {
+	/// Encode one frame, opening a group at it (an IDR) when `cut` is set.
+	/// Backends place group boundaries on their own per [`Config::gop`], so this
+	/// is only the caller's extra request, arriving via
+	/// [`Encoder::cut`](super::Encoder::cut), and only on a backend whose
+	/// [`can_cut`](Self::can_cut) said yes.
+	fn encode(&mut self, frame: &Frame, cut: bool) -> Result<Vec<Encoded>, Error>;
 
 	/// Return every access unit the codec is still holding, leaving the encoder
 	/// usable for the frames that follow.
@@ -79,8 +82,17 @@ pub(crate) trait Backend: Send {
 	/// than inherit a silent no-op and quietly ignore congestion.
 	fn set_bitrate(&mut self, bitrate: u64) -> Result<(), Error>;
 
-	/// The encoder name in use, e.g. `"videotoolbox"` (for logging).
-	fn name(&self) -> &str;
+	/// Whether [`encode`](Self::encode) honors `cut`.
+	///
+	/// Known at open: a V4L2 driver either has the force-keyframe control or
+	/// does not, and the encoder refuses a cut up front on one that does not
+	/// rather than queue a request the codec ignores. No default, for the same
+	/// reason as `set_bitrate`: a backend that cannot cut has to say so, not
+	/// inherit a yes and let the refusal surface as a mislaid group boundary.
+	fn can_cut(&self) -> bool;
+
+	/// The encoder name in use, e.g. `"videotoolbox"` (for logging and errors).
+	fn name(&self) -> &'static str;
 }
 
 /// Every encoder backend this crate has a name for, on any platform.
@@ -155,24 +167,34 @@ const HARDWARE: &[Candidate] = &[
 	},
 ];
 
-/// Software fallbacks, all platforms, always available so a box with no usable
-/// hardware encoder can still encode. Only H.264 (openh264) has one; H.265 is
-/// hardware-only. A slice so future software codecs slot in.
-const SOFTWARE: &[Candidate] = &[Candidate {
-	name: openh264::NAME,
-	codecs: &[Codec::H264],
-	open: openh264::Openh264::open,
-}];
+/// Software fallbacks compiled into this build. Only H.264 (OpenH264) has one;
+/// H.265 is hardware-only. A slice so a build can omit it entirely and future
+/// software codecs can slot in.
+const SOFTWARE: &[Candidate] = &[
+	#[cfg(feature = "openh264")]
+	Candidate {
+		name: openh264::NAME,
+		codecs: &[Codec::H264],
+		open: openh264::Openh264::open,
+	},
+];
 
 /// Test-only backends. Deliberately in neither list above, so `Auto` /
 /// `Hardware` / `Software` can never select one: they exist to be asked for by
 /// name.
 #[cfg(test)]
-const NAMED_ONLY: &[Candidate] = &[Candidate {
-	name: probe::NAME,
-	codecs: &[Codec::H264],
-	open: probe::Probe::open,
-}];
+const NAMED_ONLY: &[Candidate] = &[
+	Candidate {
+		name: probe::NAME,
+		codecs: &[Codec::H264],
+		open: probe::Probe::open,
+	},
+	Candidate {
+		name: probe::NO_CUT,
+		codecs: &[Codec::H264],
+		open: probe::Probe::open_no_cut,
+	},
+];
 
 #[cfg(not(test))]
 const NAMED_ONLY: &[Candidate] = &[];
@@ -308,6 +330,7 @@ fn available_names(codec: Codec) -> Vec<&'static str> {
 }
 
 #[cfg(test)]
+#[cfg_attr(not(feature = "openh264"), allow(dead_code))]
 pub(crate) mod test_util {
 	use h264_reader::nal::sps::SeqParameterSet;
 	use h264_reader::nal::{Nal, RefNal, UnitType};
@@ -388,6 +411,8 @@ pub(crate) mod test_util {
 
 #[cfg(test)]
 mod tests {
+	#![cfg_attr(not(feature = "openh264"), allow(dead_code, unused_imports))]
+
 	use super::*;
 
 	/// A backend that opens and encodes nothing. Stands in for a real candidate so
@@ -401,7 +426,7 @@ mod tests {
 	}
 
 	impl Backend for Stub {
-		fn encode(&mut self, _frame: &Frame, _keyframe: bool) -> Result<Vec<Encoded>, Error> {
+		fn encode(&mut self, _frame: &Frame, _cut: bool) -> Result<Vec<Encoded>, Error> {
 			Ok(Vec::new())
 		}
 
@@ -417,7 +442,11 @@ mod tests {
 			Ok(())
 		}
 
-		fn name(&self) -> &str {
+		fn can_cut(&self) -> bool {
+			true
+		}
+
+		fn name(&self) -> &'static str {
 			"stub"
 		}
 	}
@@ -437,7 +466,7 @@ mod tests {
 	};
 
 	fn config() -> Config {
-		Config::new(320, 240, 30)
+		Config::new(320, 240, crate::Rate::new(30, 1).unwrap())
 	}
 
 	#[tracing_test::traced_test]
@@ -491,12 +520,25 @@ mod tests {
 			Err(Error::UnknownEncoder { name, codec, available }) => {
 				assert_eq!(name, "vappi");
 				assert_eq!(codec, config.codec);
-				// openh264 is unconditional, so every build has one to offer.
+				#[cfg(feature = "openh264")]
 				assert!(available.contains(openh264::NAME), "nothing offered: {available}");
+				#[cfg(not(feature = "openh264"))]
+				assert!(!available.contains("openh264"), "disabled backend offered: {available}");
 			}
 			Err(other) => panic!("expected UnknownEncoder, got {other:?}"),
 			Ok(backend) => panic!("expected UnknownEncoder, opened {}", backend.name()),
 		}
+	}
+
+	#[cfg(not(feature = "openh264"))]
+	#[test]
+	fn disabled_software_backend_is_not_selected() {
+		let mut config = config();
+		config.kind = Kind::Software;
+		assert!(matches!(open(&config), Err(Error::NoEncoder(_))));
+
+		config.kind = Kind::Named("openh264".to_owned());
+		assert!(matches!(open(&config), Err(Error::UnknownEncoder { .. })));
 	}
 
 	/// The reason each candidate refused belongs in the error. Only the DEBUG

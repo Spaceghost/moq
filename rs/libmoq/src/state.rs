@@ -1,27 +1,28 @@
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
-use crate::{Client, Consume, Origin, Publish, Session, audio::Audio, video::Video};
+use crate::bandwidth::Bandwidth;
+use crate::{Consume, Origin, Publish, Session, audio::Audio, video::Video};
 
 pub struct State {
 	pub session: Session,
-	pub client: Client,
 	pub origin: Origin,
 	pub publish: Publish,
 	pub consume: Consume,
 	pub audio: Audio,
 	pub video: Video,
+	pub bandwidth: Bandwidth,
 }
 
 impl State {
 	pub fn new() -> Self {
 		Self {
 			session: Session::default(),
-			client: Client::default(),
 			origin: Origin::default(),
 			publish: Publish::default(),
 			consume: Consume::default(),
 			audio: Audio::default(),
 			video: Video::default(),
+			bandwidth: Bandwidth::default(),
 		}
 	}
 

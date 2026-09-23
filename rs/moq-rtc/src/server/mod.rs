@@ -14,9 +14,9 @@ mod mux;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::Router;
-use axum::extract::{Path, State};
 use axum::http::{HeaderValue, StatusCode, Uri};
 use tokio::sync::{OnceCell, oneshot};
 
@@ -62,7 +62,7 @@ struct AcceptedSession {
 	cancel: Option<oneshot::Receiver<()>>,
 	role: &'static str,
 	// WHIP only: a clone of the ingest broadcast, so a deliberate DELETE can
-	// finish() it (prompt unannounce) instead of lingering for a reconnect.
+	// finish() it: a clean end instead of an abort error.
 	broadcast: Option<moq_net::broadcast::Producer>,
 }
 
@@ -88,7 +88,7 @@ impl AcceptedSession {
 					tracing::debug!(role = self.role, "webrtc session terminated by DELETE");
 					// A deliberate end: finish the broadcast so the origin
 					// unannounces it immediately.
-					if let Some(mut broadcast) = self.broadcast.take() {
+					if let Some(broadcast) = self.broadcast.take() {
 						broadcast.finish();
 					}
 					Ok(())
@@ -145,6 +145,22 @@ pub struct Config {
 	/// exactly one media port in its firewall. `0.0.0.0:0` (the default) lets
 	/// the OS pick a port, which is fine for dev/loopback; production pins it.
 	pub udp_bind: SocketAddr,
+
+	/// How long relays keep a non-latest group of an ingested media track fetchable.
+	///
+	/// A retention budget, not a delivery one: it never makes a subscriber play further
+	/// behind live, it caps how far back a FETCH can still reach. `None` keeps hang's own
+	/// default, which suits a segmented egress (HLS/DASH) reading the broadcast downstream:
+	/// it may only advertise segments that are still fetchable. Lower it when nothing reads
+	/// history and the memory matters.
+	///
+	/// Ingest only (`server publish` / WHIP): WHEP egress reads a broadcast someone else
+	/// declared, so it ignores this.
+	pub max_age: Option<Duration>,
+
+	/// Connection allocator each ingested track claims its peak-hold bitrate on.
+	/// Ingest only (`server publish` / WHIP); WHEP egress ignores this.
+	pub bandwidth: moq_net::bandwidth::Allocator,
 }
 
 impl Default for Config {
@@ -152,15 +168,13 @@ impl Default for Config {
 		Self {
 			ice_candidates: Vec::new(),
 			udp_bind: SocketAddr::from(([0, 0, 0, 0], 0)),
+			max_age: None,
+			bandwidth: moq_net::bandwidth::Allocator::unlimited(),
 		}
 	}
 }
 
-/// Glue that owns the moq-net origin pair and hands axum routers to the caller.
-///
-/// `publisher` is where `server publish` (WHIP) writes ingested broadcasts;
-/// `subscriber` is what `server subscribe` (WHEP) reads from. They're
-/// typically the two halves of the same upstream [`moq_net::Session`].
+/// Shared WebRTC media state that hands axum routers to the caller.
 #[derive(Clone)]
 pub struct Server {
 	inner: Arc<Inner>,
@@ -168,9 +182,6 @@ pub struct Server {
 
 struct Inner {
 	config: Config,
-	publisher: moq_net::origin::Producer,
-	/// Source for `server subscribe` (WHEP) egress.
-	subscriber: moq_net::origin::Consumer,
 	/// The shared media socket + demux, bound lazily on the first accept so
 	/// `Server::new` can stay synchronous (and an idle server binds no port).
 	mux: OnceCell<Mux>,
@@ -181,14 +192,11 @@ struct Inner {
 }
 
 impl Server {
-	/// Build a server. `publisher` receives WHIP broadcasts; `subscriber`
-	/// is the source for WHEP egress.
-	pub fn new(config: Config, publisher: moq_net::origin::Producer, subscriber: moq_net::origin::Consumer) -> Self {
+	/// Build a server with shared ICE and media settings.
+	pub fn new(config: Config) -> Self {
 		Self {
 			inner: Arc::new(Inner {
 				config,
-				publisher,
-				subscriber,
 				mux: OnceCell::new(),
 				sessions: Mutex::new(HashMap::new()),
 			}),
@@ -210,8 +218,8 @@ impl Server {
 	/// no authentication. To own the route and authorize requests yourself
 	/// (resolving the broadcast name from a verified token), skip the router and
 	/// call [`whip::accept`] directly from your own handler.
-	pub fn publish_router(&self) -> Router {
-		whip::router(self.clone())
+	pub fn publish_router(&self, publisher: moq_net::origin::Producer) -> Router {
+		whip::router(self.clone(), publisher)
 	}
 
 	/// Router for `server subscribe` (WHEP). Mount under whichever HTTP path
@@ -221,16 +229,12 @@ impl Server {
 	/// no authentication. To own the route and authorize requests yourself
 	/// (resolving the broadcast name from a verified token), skip the router and
 	/// call [`whep::accept`] directly from your own handler.
-	pub fn subscribe_router(&self) -> Router {
-		whep::router(self.clone())
+	pub fn subscribe_router(&self, subscriber: moq_net::origin::Consumer) -> Router {
+		whep::router(self.clone(), subscriber)
 	}
 
-	pub(crate) fn publisher(&self) -> &moq_net::origin::Producer {
-		&self.inner.publisher
-	}
-
-	pub(crate) fn subscriber(&self) -> &moq_net::origin::Consumer {
-		&self.inner.subscriber
+	pub(crate) fn config(&self) -> &Config {
+		&self.inner.config
 	}
 
 	/// Register a session under its resource id, returning the cancel receiver.
@@ -265,8 +269,8 @@ impl Server {
 
 /// Shared `DELETE` handler for both bundled routers: parse the resource id from
 /// the trailing path segment and terminate the matching session.
-pub(crate) async fn delete(State(server): State<Server>, Path(path): Path<String>) -> StatusCode {
-	match crate::sdp::parse_resource_id(&path) {
+pub(crate) fn delete(server: &Server, path: &str) -> StatusCode {
+	match crate::sdp::parse_resource_id(path) {
 		Ok(id) if server.terminate(&id.to_string()) => StatusCode::OK,
 		Ok(_) => StatusCode::NOT_FOUND,
 		Err(_) => StatusCode::BAD_REQUEST,
@@ -278,9 +282,7 @@ mod tests {
 	use super::*;
 
 	fn server() -> Server {
-		let publisher = moq_net::Origin::random().produce();
-		let subscriber = moq_net::Origin::random().produce().consume();
-		Server::new(Config::default(), publisher, subscriber)
+		Server::new(Config::default())
 	}
 
 	#[test]

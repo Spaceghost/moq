@@ -16,7 +16,7 @@ export interface RoomProps {
 	 * Reconnecting connection whose URL (and token root) already carry the room
 	 * prefix. Announcements are relative to that prefix.
 	 */
-	connection: Moq.Connection.Reload;
+	connection: Moq.Connection;
 	/**
 	 * Local participant identity. Announcements under this identity are skipped
 	 * so the local camera/screen do not appear as remotes.
@@ -38,7 +38,7 @@ export interface RoomProps {
  */
 export class Room {
 	/** Connection supplying room announcements. */
-	readonly connection: Moq.Connection.Reload;
+	readonly connection: Moq.Connection;
 	/** Local identity excluded from the roster. */
 	readonly identity: Getter<Moq.Path.Valid | undefined>;
 	/** Whether room discovery is active. */
@@ -59,11 +59,13 @@ export class Room {
 			if (!effect.get(this.enabled)) return;
 
 			effect.get(this.identity);
+			const origin = effect.get(this.connection.origin);
+			if (!origin) return;
 			const prefix = effect.get(this.prefix) ?? Moq.Path.empty();
-			const announced = this.connection.announced(prefix);
+			const announced = origin.announced(Moq.Path.Pattern.subtree(prefix));
 			effect.cleanup(() => announced.close());
 
-			effect.spawn(this.#run.bind(this, announced, effect));
+			effect.spawn(this.#run.bind(this, announced, prefix, effect));
 			effect.cleanup(() => {
 				for (const remote of this.#remotes.peek().values()) remote.close();
 				this.#remotes.set(new Map());
@@ -76,19 +78,25 @@ export class Room {
 		return this.#remotes;
 	}
 
-	async #run(announced: Moq.Announce.Consumer, effect: Effect): Promise<void> {
+	async #run(announced: Moq.Announce.Consumer, prefix: Moq.Path.Valid, effect: Effect): Promise<void> {
 		for (;;) {
 			const update = await Promise.race([effect.cancel, announced.next()]);
 			if (!update) break;
 
-			const parsed = parse(update.path);
+			// The scope's `**` captures what lies beneath the prefix. A broad route
+			// that cannot pin that suffix names no participant to open.
+			const capture = update.captures?.[0];
+			const suffix = capture?.isLiteral ? capture.text : capture?.asPrefix();
+			if (suffix === undefined) continue;
+			const parsed = parse(Moq.Path.from(suffix));
 			if (!parsed) continue;
+			const covered = Moq.Path.join(prefix, Moq.Path.from(suffix));
 
 			const local = this.identity.peek();
 			if (local && parsed.identity === local) continue;
 
-			if (update.active) {
-				this.#add(parsed.identity, parsed.kind, Moq.Path.join(announced.prefix, update.path));
+			if (Moq.Announce.isActive(update.kind)) {
+				this.#add(parsed.identity, parsed.kind, Moq.Path.from(covered));
 			} else {
 				this.#remove(parsed.identity, parsed.kind);
 			}
@@ -98,7 +106,7 @@ export class Room {
 	#add(identity: Moq.Path.Valid, kind: Kind, path: Moq.Path.Valid): void {
 		let remote = this.#remotes.peek().get(identity);
 		if (!remote) {
-			const created = new Remote({ identity, connection: this.connection.established });
+			const created = new Remote({ identity, connection: this.connection });
 			this.#remotes.mutate((remotes) => remotes.set(identity, created));
 			remote = created;
 		}

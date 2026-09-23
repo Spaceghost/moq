@@ -9,10 +9,11 @@
 //!
 //! `track_recv_groups` covers the layer above: how much it costs to hand out one
 //! cached group, swept over cache depth so a per-delivery scan shows up as a slope.
+//! It also covers the steady-state path after a subscriber has reached the edge.
 //!
 //! Run with `cargo bench -p moq-net`.
 
-use std::hint::black_box;
+use std::{hint::black_box, time::Duration};
 
 use bytes::Bytes;
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
@@ -24,15 +25,19 @@ use moq_net::{Timestamp, broadcast, frame, group, track};
 /// overhead rather than payload allocation.
 const PAYLOAD: usize = 64;
 
-/// Frame counts to sweep. The top end intentionally reaches the raised
-/// `MAX_GROUP_FRAMES` so a full group of tiny frames is exercised.
-const COUNTS: [usize; 3] = [512, 8_192, 32_768];
+/// Frame counts to sweep. 8192 is the largest legal group (`MAX_GROUP_FRAMES`);
+/// the 8193rd write returns `GroupTooLarge`. The top end is that full group of
+/// tiny frames.
+const COUNTS: [usize; 3] = [512, 2_048, 8_192];
 
 /// Cached group counts to sweep for the track-level delivery benchmarks. A track
 /// publishing one group per frame at the default 5s retention sits in the hundreds,
 /// so the top end is deliberately past anything realistic: a per-delivery scan over
 /// the cache shows up as a slope here, while a seek stays flat.
 const DEPTHS: [usize; 3] = [64, 512, 4_096];
+
+/// Groups appended and received in one caught-up benchmark iteration.
+const LIVE_BATCH: usize = 128;
 
 /// Keeps the broadcast/track producers alive alongside the group so the group
 /// isn't torn down mid-benchmark. Only `group` is written to.
@@ -44,8 +49,8 @@ struct Ctx {
 
 /// Build a fresh, empty group via the public producer path.
 fn fresh_group() -> Ctx {
-	let mut broadcast = broadcast::Producer::new(broadcast::Info::default());
-	let mut track = broadcast.create_track("bench", None).unwrap();
+	let broadcast = broadcast::Producer::new(broadcast::Info::default());
+	let track = broadcast.create_track("bench", None).unwrap();
 	let group = track.append_group().unwrap();
 	Ctx {
 		_broadcast: broadcast,
@@ -192,8 +197,8 @@ struct TrackCtx {
 
 /// Build a track holding N cached groups, each with a single small frame.
 fn filled_track(n: usize, payload: &Bytes) -> TrackCtx {
-	let mut broadcast = broadcast::Producer::new(broadcast::Info::default());
-	let mut track = broadcast.create_track("bench", None).unwrap();
+	let broadcast = broadcast::Producer::new(broadcast::Info::default());
+	let track = broadcast.create_track("bench", None).unwrap();
 	for _ in 0..n {
 		let mut group = track.append_group().unwrap();
 		group.write_frame(Timestamp::ZERO, payload.clone()).unwrap();
@@ -203,6 +208,13 @@ fn filled_track(n: usize, payload: &Bytes) -> TrackCtx {
 		_broadcast: broadcast,
 		track,
 	}
+}
+
+/// Request the full cache window instead of the default live edge.
+fn replay() -> track::Subscription {
+	track::Subscription::default()
+		.with_max_age(Duration::MAX)
+		.with_start(track::Position::group(0))
 }
 
 /// Drain N cached groups from a track, in arrival order and in sequence order.
@@ -220,7 +232,7 @@ fn bench_track_recv(c: &mut Criterion) {
 			b.iter_batched(
 				|| {
 					let ctx = filled_track(n, &payload);
-					let subscriber = ctx.track.subscribe(None);
+					let subscriber = ctx.track.subscribe(replay());
 					(ctx, subscriber)
 				},
 				|(ctx, mut subscriber)| {
@@ -237,12 +249,35 @@ fn bench_track_recv(c: &mut Criterion) {
 			b.iter_batched(
 				|| {
 					let ctx = filled_track(n, &payload);
-					let subscriber = ctx.track.subscribe(None);
+					let subscriber = ctx.track.subscribe(replay()).ordered();
 					(ctx, subscriber)
 				},
 				|(ctx, mut subscriber)| {
 					for _ in 0..n {
 						let group = subscriber.next_group().now_or_never().unwrap().unwrap().unwrap();
+						black_box(group);
+					}
+					(ctx, subscriber)
+				},
+				BatchSize::SmallInput,
+			);
+		});
+		g.throughput(Throughput::Elements(LIVE_BATCH as u64));
+		g.bench_with_input(BenchmarkId::new("caught_up", n), &n, |b, &n| {
+			b.iter_batched(
+				|| {
+					let ctx = filled_track(n, &payload);
+					let mut subscriber = ctx.track.subscribe(None);
+					let edge = subscriber.recv_group().now_or_never().unwrap().unwrap().unwrap();
+					assert_eq!(edge.sequence, n as u64 - 1);
+					(ctx, subscriber)
+				},
+				|(ctx, mut subscriber)| {
+					for _ in 0..LIVE_BATCH {
+						let mut group = ctx.track.append_group().unwrap();
+						group.write_frame(Timestamp::ZERO, payload.clone()).unwrap();
+						group.finish().unwrap();
+						let group = subscriber.recv_group().now_or_never().unwrap().unwrap().unwrap();
 						black_box(group);
 					}
 					(ctx, subscriber)

@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { Track } from "@moq/net";
+import { Group, Error as NetError, Track } from "@moq/net";
 import { Decoder } from "./decoder.ts";
 import { Encoder } from "./encoder.ts";
 import { Producer } from "./producer.ts";
@@ -7,8 +7,9 @@ import { Producer } from "./producer.ts";
 type Rec = { n: number };
 
 function roundtrip(compression: boolean, values: Rec[]): Rec[] {
-	const encoder = new Encoder<Rec>({ compression });
-	const decoder = new Decoder<Rec>({ compression });
+	const config = { compression: compression ? ("deflate" as const) : ("none" as const) };
+	const encoder = new Encoder<Rec>(config);
+	const decoder = new Decoder<Rec>(config);
 	return values.map((value) => {
 		const record = encoder.encode(value);
 		const decoded = decoder.decode(record.payload);
@@ -28,7 +29,7 @@ test("compressed roundtrip in order", () => {
 });
 
 test("the shared window shrinks repetitive records", () => {
-	const encoder = new Encoder<{ group: number; pts: number }>({ compression: true });
+	const encoder = new Encoder<{ group: number; pts: number }>({ compression: "deflate" });
 	const sizes = Array.from({ length: 8 }, (_, n) => {
 		const record = encoder.encode({ group: n, pts: n * 2_000 });
 		record.commit();
@@ -42,8 +43,8 @@ test("the shared window shrinks repetitive records", () => {
 // A caller that rolls a group has to restart both windows, or the new group's frames decode against
 // context the decoder on the other side never received.
 test("reset starts a cold window on both sides", () => {
-	const encoder = new Encoder<Rec>({ compression: true });
-	const decoder = new Decoder<Rec>({ compression: true });
+	const encoder = new Encoder<Rec>({ compression: "deflate" });
+	const decoder = new Decoder<Rec>({ compression: "deflate" });
 
 	for (let n = 0; n < 4; n += 1) {
 		const record = encoder.encode({ n });
@@ -63,7 +64,7 @@ test("reset starts a cold window on both sides", () => {
 // has no keyframe to resynchronize on. Continuing would emit frames nothing can decode, so the
 // encoder refuses until the caller rolls a new group and resets.
 test("an uncommitted compressed record stops the encoder", () => {
-	const encoder = new Encoder<Rec>({ compression: true });
+	const encoder = new Encoder<Rec>({ compression: "deflate" });
 	encoder.encode({ n: 0 }).commit();
 
 	// This one fails to write, so the caller never commits it.
@@ -74,7 +75,7 @@ test("an uncommitted compressed record stops the encoder", () => {
 	// Rolling a new group gives the consumer a cold window too, so the reset clears it.
 	encoder.reset();
 	const record = encoder.encode({ n: 2 });
-	const decoder = new Decoder<Rec>({ compression: true });
+	const decoder = new Decoder<Rec>({ compression: "deflate" });
 	expect(decoder.decode(record.payload)).toEqual({ n: 2 });
 	record.commit();
 });
@@ -101,22 +102,25 @@ test("a record JSON cannot represent is rejected", () => {
 
 // A record the encoder rejects must not have published a group first: a live consumer would advance
 // into it and wait there even though nothing was ever appended.
-test("a rejected record does not open a group", async () => {
+test("a rejected record ends the track without opening a group", async () => {
 	const track = new Track.Producer("test");
-	const subscriber = track.subscribe();
-	const producer = new Producer<unknown>(track);
+	const subscriber = track.subscribe().ordered();
+	const producer = new Producer<unknown>({ track });
 
 	expect(() => producer.append(undefined)).toThrow("not representable as JSON");
 
 	// Nothing was appended, so the log has no group for a consumer to enter and wait in.
-	producer.finish();
-	expect(await subscriber.nextGroup()).toBeUndefined();
+	expect(subscriber.latest()).toBeUndefined();
+
+	// And the log is missing a record, so the track ends rather than staying writable: a later
+	// append would present that gap as a complete log. Matches the Rust producer.
+	await expect(subscriber.nextGroup()).rejects.toThrow("not representable as JSON");
 });
 
 // The same stale-commit hazard the snapshot encoder has: acknowledging a superseded record must not
 // clear the flag belonging to the newer one, or a desync goes undetected.
 test("a stale commit does not clear a newer pending record", () => {
-	const encoder = new Encoder<Rec>({ compression: true });
+	const encoder = new Encoder<Rec>({ compression: "deflate" });
 	const first = encoder.encode({ n: 0 });
 	first.commit();
 
@@ -131,7 +135,7 @@ test("a stale commit does not clear a newer pending record", () => {
 // A record committed after the encoder has been reset must not acknowledge whatever is outstanding
 // now: the newer record belongs to a different group and window.
 test("a commit from before a reset does not acknowledge a newer record", () => {
-	const encoder = new Encoder<Rec>({ compression: true });
+	const encoder = new Encoder<Rec>({ compression: "deflate" });
 	const stale = encoder.encode({ n: 0 });
 
 	// The caller rolled a new group and reset, then encoded into it.
@@ -150,7 +154,7 @@ test("a commit from before a reset does not acknowledge a newer record", () => {
 // `a_rejected_record_leaves_the_encoder_able_to_retry`.)
 test("a rejected record leaves the producer able to retry", () => {
 	const track = new Track.Producer("test");
-	const producer = new Producer<Rec>(track, { compression: true });
+	const producer = new Producer<Rec>({ track, compression: "deflate" });
 
 	// Closing the track makes every write fail, standing in for any post-appendGroup rejection.
 	track.close();
@@ -159,4 +163,23 @@ test("a rejected record leaves the producer able to retry", () => {
 	// The retry fails on the same closed track, but it must fail for that reason rather than the
 	// encoder having latched itself shut.
 	expect(() => producer.append({ n: 2 })).not.toThrow("compression desynchronized");
+});
+
+test("a failed write on the very first record still ends the track", async () => {
+	// The first append opens group 0 and then fails its write, which is as terminal as any later
+	// one: the group is live, so leaving the track writable would let a second group present the
+	// missing record as a complete log, and leave a consumer waiting in the empty group 0.
+	const track = new Track.Producer("test");
+	const subscriber = track.subscribe().ordered();
+	const producer = new Producer<string>({ track });
+
+	// Serializes past the group cache limit, so `appendGroup` succeeds and `writeFrame` rejects it.
+	const oversized = "x".repeat(Group.MAX_GROUP_CACHE_BYTES + 1);
+	expect(() => producer.append(oversized)).toThrow(NetError.FrameTooLarge);
+
+	// The consumer is handed the group that was already published, and reading it surfaces the
+	// abort. Without ending the track that group stays open and empty, so this read hangs instead.
+	const group = await subscriber.nextGroup();
+	expect(group).toBeDefined();
+	await expect(group?.readFrame()).rejects.toThrow(NetError.FrameTooLarge);
 });

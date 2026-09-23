@@ -15,35 +15,39 @@ pub struct TimeOverflow;
 /// arithmetic on [`Timestamp`] can divide by `self.scale` without ever risking
 /// a divide by zero. Use the named constants ([`Self::SECOND`], [`Self::MILLI`],
 /// [`Self::MICRO`], [`Self::NANO`]) instead of writing raw integers at call sites;
-/// for runtime values, use [`Self::new`] which returns [`TimeOverflow`] for `0` or
-/// for values past the QUIC varint range.
+/// for runtime values, use [`Self::new`] or [`TryFrom`], which return [`TimeOverflow`]
+/// for `0` or for values past the QUIC varint range.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Timescale(NonZero<u64>);
 
 impl Timescale {
 	/// One unit per second (`1`).
-	pub const SECOND: Self = Self(NonZero::<u64>::MIN);
+	pub const SECOND: Self = match Self::new(1) {
+		Ok(scale) => scale,
+		Err(_) => unreachable!(),
+	};
 	/// 1,000 units per second (`1_000`).
-	pub const MILLI: Self = match NonZero::new(1_000) {
-		Some(n) => Self(n),
-		None => unreachable!(),
+	pub const MILLI: Self = match Self::new(1_000) {
+		Ok(scale) => scale,
+		Err(_) => unreachable!(),
 	};
 	/// 1,000,000 units per second (`1_000_000`). Widely used by container formats;
 	/// this crate's own default is [`Self::MILLI`].
-	pub const MICRO: Self = match NonZero::new(1_000_000) {
-		Some(n) => Self(n),
-		None => unreachable!(),
+	pub const MICRO: Self = match Self::new(1_000_000) {
+		Ok(scale) => scale,
+		Err(_) => unreachable!(),
 	};
 	/// 1,000,000,000 units per second (`1_000_000_000`).
-	pub const NANO: Self = match NonZero::new(1_000_000_000) {
-		Some(n) => Self(n),
-		None => unreachable!(),
+	pub const NANO: Self = match Self::new(1_000_000_000) {
+		Ok(scale) => scale,
+		Err(_) => unreachable!(),
 	};
 
 	/// Construct a timescale from a raw value (units per second).
 	///
 	/// Returns [`TimeOverflow`] if `units_per_second` is `0` (would divide by zero)
 	/// or exceeds `2^62 - 1` (the QUIC varint range, matching [`Timestamp`] values).
+	/// Every runtime constructor, including [`TryFrom`], goes through this check.
 	pub const fn new(units_per_second: u64) -> Result<Self, TimeOverflow> {
 		// Reject values that wouldn't fit in a QUIC varint, keeping the constraint
 		// symmetric with Timestamp's raw value.
@@ -70,9 +74,13 @@ impl TryFrom<u64> for Timescale {
 	}
 }
 
-impl From<NonZero<u64>> for Timescale {
-	fn from(units_per_second: NonZero<u64>) -> Self {
-		Self(units_per_second)
+impl TryFrom<NonZero<u64>> for Timescale {
+	type Error = TimeOverflow;
+
+	/// Same bound as [`Self::new`]: non-zero is not enough, the value must also fit
+	/// in a QUIC varint.
+	fn try_from(units_per_second: NonZero<u64>) -> Result<Self, Self::Error> {
+		Self::new(units_per_second.get())
 	}
 }
 
@@ -173,12 +181,7 @@ impl Timestamp {
 	}
 
 	/// Const-context twin of [`Self::new`] that panics on overflow.
-	///
-	/// For building `const` timestamps where `?`/`unwrap` on the [`Result`] isn't
-	/// available. The panic fires only on a compile-time-known out-of-range literal, so
-	/// it's a build-time assertion, not a runtime failure path. Use [`Self::new`]
-	/// everywhere else.
-	pub const fn new_const(value: u64, scale: Timescale) -> Self {
+	const fn new_const(value: u64, scale: Timescale) -> Self {
 		match Self::new(value, scale) {
 			Ok(time) => time,
 			Err(_) => panic!("timestamp value exceeds 2^62 - 1"),
@@ -299,8 +302,8 @@ impl Timestamp {
 	/// This is the one-way bridge from a local clock to a track timestamp: there is
 	/// deliberately no inverse (a [`Timestamp`] is relative and jittered, never a clock).
 	/// Used to stamp frames that arrive without one, e.g. on protocols whose wire can't
-	/// carry a timestamp. Uses [`web_async::time::Instant::now`] so it works on wasm and honors
-	/// `tokio::time::pause` in tests.
+	/// carry a timestamp. Reads the model's clock, so it works on wasm and stays
+	/// deterministic under the crate's test clock.
 	pub fn now() -> Self {
 		clock::now()
 	}
@@ -398,8 +401,7 @@ mod clock {
 	});
 
 	pub(super) fn now() -> Timestamp {
-		let instant: std::time::Instant = web_async::time::Instant::now().into();
-		from_std_instant(instant)
+		from_std_instant(crate::model::clock::now())
 	}
 
 	fn from_std_instant(instant: std::time::Instant) -> Timestamp {
@@ -438,22 +440,27 @@ mod clock {
 
 	use super::Timestamp;
 
-	static TIME_ANCHOR: LazyLock<(web_async::time::Instant, std::time::Duration)> = LazyLock::new(|| {
+	static TIME_ANCHOR: LazyLock<(crate::runtime::Instant, std::time::Duration)> = LazyLock::new(|| {
 		let jitter = std::time::Duration::from_millis(rand::rng().random_range(1..69_420));
-		(web_async::time::Instant::now(), jitter)
+		(crate::model::clock::now(), jitter)
 	});
 
 	pub(super) fn now() -> Timestamp {
-		let (anchor_instant, anchor_duration) = *TIME_ANCHOR;
-		let instant = web_async::time::Instant::now();
-		let duration = match instant.checked_duration_since(anchor_instant) {
-			Some(forward) => anchor_duration + forward,
-			None => anchor_duration
-				.checked_sub(anchor_instant.duration_since(instant))
-				.unwrap_or(std::time::Duration::ZERO),
-		};
+		crate::model::clock::now().into()
+	}
 
-		Timestamp::from_millis(duration.as_millis() as u64).expect("clock is somehow past the year 2300")
+	impl From<crate::time::Instant> for Timestamp {
+		fn from(instant: crate::time::Instant) -> Timestamp {
+			let (anchor_instant, anchor_duration) = *TIME_ANCHOR;
+			let duration = match instant.checked_duration_since(anchor_instant) {
+				Some(forward) => anchor_duration + forward,
+				None => anchor_duration
+					.checked_sub(anchor_instant.duration_since(instant))
+					.unwrap_or(std::time::Duration::ZERO),
+			};
+
+			Timestamp::from_millis(duration.as_millis() as u64).expect("clock is somehow past the year 2300")
+		}
 	}
 }
 
@@ -506,6 +513,24 @@ mod tests {
 		assert!(Timescale::new(1u64 << 62).is_err());
 		// Right at the top of the varint range is still valid.
 		assert!(Timescale::new((1u64 << 62) - 1).is_ok());
+	}
+
+	#[test]
+	fn test_timescale_try_from_nonzero_enforces_varint() {
+		use std::num::NonZero;
+
+		assert_eq!(
+			Timescale::try_from(NonZero::new(1).unwrap()).unwrap(),
+			Timescale::SECOND
+		);
+		assert_eq!(
+			Timescale::try_from(NonZero::new((1u64 << 62) - 1).unwrap())
+				.unwrap()
+				.as_u64(),
+			(1u64 << 62) - 1
+		);
+		assert!(Timescale::try_from(NonZero::new(1u64 << 62).unwrap()).is_err());
+		assert!(Timescale::try_from(NonZero::new(u64::MAX).unwrap()).is_err());
 	}
 
 	#[test]

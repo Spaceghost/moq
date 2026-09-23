@@ -15,9 +15,7 @@
 //!
 //! ## Embedding
 //!
-//! Build a [`Server`] over your own
-//! [`OriginProducer`](moq_net::origin::Producer) /
-//! [`OriginConsumer`](moq_net::origin::Consumer) and merge
+//! Build a [`Server`] and pass your own origin handles when merging
 //! [`Server::publish_router`] / [`Server::subscribe_router`] into your own axum
 //! app, or dial out with [`Client`]. A command-line interface is provided by the
 //! `moq-cli` binary, on top of this library.
@@ -53,12 +51,6 @@ mod net;
 mod sdp;
 mod session;
 
-/// Re-export of the underlying WebRTC stack, so consumers can name the str0m
-/// types that surface through [`Error::Rtc`] / [`Error::RtcInput`] without adding
-/// their own str0m dependency (and risking a version mismatch). A major str0m
-/// bump is therefore a breaking change for this crate.
-pub use str0m;
-
 /// Re-export of the HTTP router stack, so consumers can merge the [`axum::Router`]
 /// returned by [`Server::publish_router`] / [`Server::subscribe_router`] (and by
 /// [`whip::router`] / [`whep::router`]) into their own app without adding their own
@@ -91,13 +83,17 @@ mod tests {
 
 	#[tokio::test]
 	async fn whip_and_whep_round_trip_opus() {
-		let source_origin = moq_net::Origin::random().produce();
+		let source_origin = moq_tokio::origin::spawn();
 		let source_consumer = source_origin.consume();
 		let mut announcements = source_consumer.announced();
 		let mut source = source_origin
-			.create_broadcast("source", moq_net::broadcast::Route::new().with_announce(true))
+			.create_broadcast("source")
 			.expect("create source broadcast");
-		let catalog = moq_mux::catalog::Producer::new(&mut source).expect("create source catalog");
+		source
+			.announce(moq_net::origin::Route::default())
+			.expect("announce source broadcast");
+		let catalog = moq_mux::catalog::Producer::new(&mut source, moq_mux::catalog::Config::default())
+			.expect("create source catalog");
 		let mut opus = crate::codec::opus::Bridge::new(source, catalog, 48_000, 2).expect("create Opus bridge");
 		Bridge::push(
 			&mut opus,
@@ -111,19 +107,15 @@ mod tests {
 			.await
 			.expect("source announcement timed out")
 			.expect("source origin closed");
-		assert_eq!(announcement.path.as_str(), "source");
-		assert!(announcement.broadcast.is_some(), "source was unannounced");
+		assert_eq!(announcement.prefix.as_str(), "source");
+		assert!(announcement.kind.is_active(), "source was unannounced");
 		drop(announcements);
 
-		let server_origin = moq_net::Origin::random().produce();
-		let server = Server::new(
-			server::Config::default(),
-			server_origin.clone(),
-			server_origin.consume(),
-		);
+		let server_origin = moq_tokio::origin::spawn();
+		let server = Server::new(server::Config::default());
 		let app = Router::new()
-			.nest("/whip", server.publish_router())
-			.nest("/whep", server.subscribe_router());
+			.nest("/whip", server.publish_router(server_origin.clone()))
+			.nest("/whep", server.subscribe_router(server_origin.consume()));
 		let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
 			.await
 			.expect("bind HTTP listener");
@@ -137,9 +129,9 @@ mod tests {
 			.expect("WHIP negotiation timed out")
 			.expect("WHIP negotiation failed");
 
-		let output_origin = moq_net::Origin::random().produce();
+		let output_origin = moq_tokio::origin::spawn();
 		let output = output_origin
-			.create_broadcast("output", moq_net::broadcast::Route::new().with_announce(true))
+			.create_broadcast("output")
 			.expect("create output broadcast");
 		let output_consumer = output.consume();
 		let whep = format!("http://{address}/whep/ingested").parse().expect("WHEP URL");

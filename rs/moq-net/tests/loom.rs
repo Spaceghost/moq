@@ -11,10 +11,10 @@
 //! asserted directly.
 //!
 //! Know the boundary before trusting a pass: only kio's primitives are swapped for
-//! loom's (see `kio/src/sync.rs`). moq-net's own `web_async::Lock`s and bare
-//! `std::sync::atomic` counters, like the ones in `model/cache.rs`, still execute
-//! under loom (its threads are cooperative) but loom does not permute around them.
-//! So these models cover the kio handoff every handle is built on, not every
+//! loom's (see `kio/src/sync.rs`). moq-net's bare `std::sync::atomic` counters and
+//! `std::sync::Mutex`es, like the ones in `model/cache.rs`, still execute under
+//! loom (its threads are cooperative) but loom does not permute around them. So
+//! these models cover the kio handoff every handle is built on, not every
 //! critical section moq-net owns.
 //!
 //! Run with `just rs loom`; the whole file compiles away without `cfg(loom)`.
@@ -22,7 +22,7 @@
 
 use bytes::Bytes;
 use loom::{future::block_on, thread};
-use moq_net::{Timestamp, broadcast, cache, origin};
+use moq_net::{Error, Timestamp, broadcast, cache};
 
 /// A frame written on the publisher thread must reach a subscriber parked on
 /// `next_frame`, however the write interleaves with the reader's parking.
@@ -82,6 +82,67 @@ fn back_to_back_groups_arrive_in_order() {
 	});
 }
 
+/// A track scan reads the group's abort through a mirrored flag rather than the
+/// group's state, so the two can disagree. The direction that disagreement is allowed
+/// to run is the invariant: the mirror may lag the state (a scan hands out a group
+/// that is already aborting, and its consumer surfaces the abort), but it may never
+/// lead it (a scan drops a group a reader could still drain).
+///
+/// So the racing scan asserts against the group's *own state*, not against the flag it
+/// just read: whenever the scan skips the group, a consumer must agree the group is
+/// aborted. Only the abort transition takes the loom-backed group lock while delivery
+/// takes the loom-backed track lock, which is what lets loom permute the two sides.
+///
+/// The mirror itself is a bare `std` atomic, which loom does not instrument (see the
+/// module docs). It cannot be: any cross-thread look at the group's state has to take
+/// the group lock the abort is holding, so a store moved earlier *within* that guard
+/// is unobservable by construction. What is observable, and what this pins down, is a
+/// store escaping the guard entirely.
+#[test]
+fn group_abort_flag_never_leads_the_group_state() {
+	loom::model(|| {
+		let mut broadcast = broadcast::Info::new().produce();
+		let mut track = broadcast.create_track("video", None).expect("create track");
+		let group = track.append_group().expect("append group");
+		let mut before = track.subscribe(None);
+		let mut racing = track.subscribe(None);
+		let mut after = track.subscribe(None);
+		track.finish().expect("finish track");
+
+		assert!(matches!(
+			before.poll_recv_group(&kio::Waiter::noop()),
+			std::task::Poll::Ready(Ok(Some(_)))
+		));
+
+		// The group holds no frames and the track is finished, so this consumer parks
+		// while the group is live and errors once the abort reaches the state itself.
+		let mut observer = group.consume();
+		let aborter = thread::spawn(move || group.abort(Error::Cancel).expect("abort group"));
+
+		match racing.poll_recv_group(&kio::Waiter::noop()) {
+			// Skipped, so the scan read the mirror as aborted. The state must already
+			// agree, or the mirror led it and this scan dropped a readable group.
+			std::task::Poll::Ready(Ok(None)) => assert!(
+				matches!(
+					observer.poll_next_frame(&kio::Waiter::noop()),
+					std::task::Poll::Ready(Err(_))
+				),
+				"a scan skipped a group whose own state is not aborted"
+			),
+			// Delivered, which the mirror is allowed to do right up until the abort
+			// commits; the consumer is what surfaces it.
+			std::task::Poll::Ready(Ok(Some(_))) => {}
+			_ => panic!("a finalized track cannot park during the abort race"),
+		}
+		aborter.join().unwrap();
+
+		assert!(matches!(
+			after.poll_recv_group(&kio::Waiter::noop()),
+			std::task::Poll::Ready(Ok(None))
+		));
+	});
+}
+
 /// A publisher parked on `Demand::used` drives on-demand capture, so a subscriber
 /// appearing on another thread must always wake it.
 #[test]
@@ -110,16 +171,18 @@ fn subscriber_wakes_parked_demand() {
 /// a cache leaks, and loom's Arc-leak check catches the reference-cycle flavor of the
 /// same bug.
 ///
-/// This does not model the charge accounting itself. `cache::Pool` counts with bare
-/// `AtomicU64`s and guards its LRU with a `web_async::Lock`, so loom permutes the two
-/// tracks only where they meet in kio. Reordering the pool's own counters would need
-/// those swapped for loom's too.
+/// This does not model the charge accounting itself. `cache::Pool` uses standard
+/// atomics, so loom permutes the two tracks only where they meet in kio. Reordering
+/// the pool's own counters would need those swapped for loom's atomics too.
 #[test]
 fn concurrent_tracks_drain_a_shared_pool() {
 	loom::model(|| {
-		let pool = cache::Pool::new(512);
+		let config = cache::Config::default()
+			.with_capacity(512)
+			.with_expiry(cache::DEFAULT_EXPIRY);
+		let pool = cache::Pool::new(config);
 		let mut info = broadcast::Info::new();
-		info.origin = origin::Info::default().with_pool(pool.clone());
+		info.pool = pool.clone();
 		let mut broadcast = info.produce();
 
 		let handles: Vec<_> = ["video", "audio"]
@@ -144,6 +207,51 @@ fn concurrent_tracks_drain_a_shared_pool() {
 		drop(broadcast);
 
 		assert_eq!(pool.used(), 0, "the pool kept a charge after every group was dropped");
+	});
+}
+
+/// The teardown every wire subscriber runs when its copy of a track goes idle,
+/// racing a viewer coming back for the same name.
+///
+/// `poll_unused` is a level snapshot, so the teardown it wakes can only be trusted
+/// at the instant it commits. The invariant is that the two can't both win: either
+/// the lookup gets a live consumer and the teardown declines, or the teardown
+/// commits and the lookup never sees the dead track at all. A consumer handed out
+/// and then cancelled by that teardown is the bug, and it shows up here as a
+/// subscribe resolving `Err` on a handle the broadcast just gave out.
+#[test]
+fn an_idle_teardown_never_cancels_a_returning_viewer() {
+	loom::model(|| {
+		let mut broadcast = broadcast::Info::new().produce();
+		let consumer = broadcast.consume();
+		// Nothing is consuming it, which is the wake the teardown acts on.
+		let track = broadcast.create_track("video", None).expect("create track");
+
+		let viewer = thread::spawn(move || consumer.track("video"));
+
+		let teardown = track.abort_unused(Error::Cancel);
+		let looked_up = viewer.join().unwrap();
+
+		match looked_up {
+			Ok(consumer) => {
+				// The info outlives an abort, so subscribing resolves either way; the
+				// read is what surfaces the cancellation. A live track parks (nothing
+				// has been published), and so does a fresh request nobody serves yet.
+				let subscribing = consumer.subscribe(None).into_inner();
+				if let std::task::Poll::Ready(res) = subscribing.poll_ok(&kio::Waiter::noop()) {
+					let mut subscriber = res.expect("subscribing to a track just handed out");
+					if let std::task::Poll::Ready(Err(err)) = subscriber.poll_recv_group(&kio::Waiter::noop()) {
+						panic!("the teardown cancelled a track the broadcast had handed out: {err}");
+					}
+				}
+			}
+			// The track was already gone, so nothing was handed out to cancel. Nobody
+			// is serving this broadcast on demand, so the re-request has nowhere to go.
+			Err(err) => {
+				assert!(teardown.is_ok(), "a declined teardown refused a viewer");
+				assert!(matches!(err, Error::NotFound), "unexpected lookup error: {err}");
+			}
+		}
 	});
 }
 

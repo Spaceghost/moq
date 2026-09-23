@@ -25,7 +25,6 @@
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
-use clap::Parser;
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -34,7 +33,7 @@ use std::time::{Duration, Instant};
 
 #[cfg(feature = "jemalloc")]
 #[global_allocator]
-static ALLOC: moq_native::jemalloc::tikv_jemallocator::Jemalloc = moq_native::jemalloc::tikv_jemallocator::Jemalloc;
+static ALLOC: moq_tokio::jemalloc::tikv_jemallocator::Jemalloc = moq_tokio::jemalloc::tikv_jemallocator::Jemalloc;
 
 mod audio;
 mod emulator;
@@ -43,39 +42,60 @@ mod stats;
 mod status;
 mod video;
 
-#[derive(Parser, Clone)]
+#[derive(usage::Cli, Clone)]
+#[usage(unknown_flags = "error", args_override_self = false)]
+#[usage(name = "moq-boy")]
+#[usage(completion, settings)]
 pub struct Config {
 	/// Path to the Game Boy ROM file.
-	#[arg(long)]
+	#[usage(long, value_hint = usage::ValueHint::FilePath, extensions("gb", "gbc"))]
 	pub rom: PathBuf,
 
 	/// Session name (used in broadcast path). Defaults to ROM filename.
-	#[arg(long)]
+	#[usage(long)]
 	pub name: Option<String>,
 
 	/// Base path prefix. Used to derive --prefix-game and --prefix-viewer defaults.
-	#[arg(long, default_value = "boy")]
+	#[usage(long, default = "boy")]
 	pub prefix: String,
 
 	/// Path prefix for game broadcasts ("{prefix-game}/{name}"). Defaults to "{prefix}/game".
-	#[arg(long)]
+	#[usage(long)]
 	pub prefix_game: Option<String>,
 
 	/// Path prefix for viewer broadcasts ("{prefix-viewer}/{name}"). Defaults to "{prefix}/viewer".
-	#[arg(long)]
+	#[usage(long)]
 	pub prefix_viewer: Option<String>,
 
 	/// Location label shown in viewer stats (e.g. "Dallas, TX").
-	#[arg(long)]
+	#[usage(long)]
 	pub location: Option<String>,
 
 	/// The MoQ client configuration.
-	#[command(flatten)]
-	pub client: moq_native::ClientConfig,
+	#[usage(flatten)]
+	pub client: moq_tokio::connect::Config,
+
+	/// QUIC transport tuning (`--quic-*`).
+	#[usage(flatten)]
+	pub quic: moq_tokio::quic::Config,
 
 	/// The log configuration.
-	#[command(flatten)]
-	pub log: moq_native::Log,
+	#[usage(flatten)]
+	pub log: moq_tokio::Log,
+}
+
+impl Config {
+	/// Refuse a config parsed from released spellings, naming what replaced each.
+	///
+	/// Checked before anything reads the config: those spellings land on hidden
+	/// fields that nothing honors, so continuing would dial with settings the
+	/// command line never asked for.
+	fn check_deprecated(&self) -> Result<()> {
+		let mut deprecated = self.client.deprecated();
+		deprecated.extend(self.quic.deprecated());
+		anyhow::ensure!(deprecated.is_empty(), "{deprecated}");
+		Ok(())
+	}
 }
 
 /// Shared state for a game session, accessible from multiple threads/tasks.
@@ -201,47 +221,49 @@ async fn run(config: &Config) -> Result<()> {
 	tracing::info!(rom = %rom_path.display(), %name, "starting Game Boy emulator");
 
 	let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<input::Command>(64);
-	let url = config.client.connect.clone().context("--client-connect is required")?;
-	let client = config.client.clone().init()?;
+	let url = config.client.url.clone().context("--connect is required")?;
+	let client = config.client.clone().init(config.quic.clone())?;
 
 	// Publish origin: the game session broadcast.
-	let publish_origin = moq_net::Origin::random().produce();
+	let publish_origin = moq_tokio::origin::spawn();
 	let default_game_prefix = format!("{}/game", config.prefix);
 	let default_viewer_prefix = format!("{}/viewer", config.prefix);
 	let game_prefix = config.prefix_game.as_deref().unwrap_or(&default_game_prefix);
 	let viewer_prefix = config.prefix_viewer.as_deref().unwrap_or(&default_viewer_prefix);
 
-	// Create the broadcast on the publish origin; the live route announces it.
+	// Create the broadcast on the publish origin and announce its path.
 	let broadcast_path = format!("{game_prefix}/{name}");
 	let mut broadcast = publish_origin
-		.create_broadcast(&broadcast_path, moq_net::broadcast::Route::new().with_announce(true))
+		.create_broadcast(&broadcast_path)
 		.context("failed to create broadcast")?;
+	broadcast
+		.announce(Default::default())
+		.context("failed to announce broadcast")?;
 
 	// Consume origin: viewer broadcasts under the viewer prefix.
 	// JS publishes viewer feedback at "{viewer_prefix}/{name}/{viewerId}"
 	let viewer_path = format!("{viewer_prefix}/{name}");
-	let consume_origin = moq_net::Origin::random().produce();
-	let mut viewer_consumer = consume_origin
-		.with_root(&viewer_path)
+	let consume_origin = moq_tokio::origin::spawn();
+	let viewer_consumer = consume_origin
+		.scope(&viewer_path, &moq_net::Patterns::from(moq_net::Pattern::all()))
 		.expect("viewer prefix should be valid")
-		.consume()
-		.announced();
+		.consume();
 
-	tracing::info!(url = %moq_native::RedactedUrl::new(&url), %name, broadcast = %broadcast_path, "connecting to relay");
+	tracing::info!(url = %moq_tokio::RedactedUrl::new(&url), %name, broadcast = %broadcast_path, "connecting to relay");
 
 	let reconnect = client
 		.with_publisher(&publish_origin)
 		.with_subscriber(consume_origin)
-		.reconnect(url);
+		.connect(url);
 
 	// Set up catalog and encoders.
-	let catalog = moq_mux::catalog::Producer::new(&mut broadcast)?;
+	let catalog = moq_mux::catalog::Producer::new(&mut broadcast, moq_mux::catalog::Config::default())?;
 	let video_encoder = video::VideoEncoder::spawn(broadcast.clone(), catalog.clone()).await;
 
 	let audio_encoder = audio::AudioEncoder::new(broadcast.clone(), catalog.clone(), 44100)?;
 
 	let video_track = video_encoder.demand.clone();
-	let audio_track = audio_encoder.track().demand();
+	let audio_track = audio_encoder.demand();
 
 	let status_publisher = status::StatusPublisher::new(&mut broadcast)?;
 
@@ -280,7 +302,7 @@ async fn run(config: &Config) -> Result<()> {
 			Err(join) => Err(join.into()),
 		},
 		res = reconnect.closed() => res.map_err(Into::into),
-		res = input::handle_viewers(&mut viewer_consumer, &cmd_tx) => res,
+		res = input::handle_viewers(&viewer_consumer, &cmd_tx) => res,
 	};
 
 	// Cleanly close the broadcast so subscribers see a normal end rather than
@@ -316,7 +338,7 @@ fn run_emulator(
 		if session.paused.load(Ordering::Acquire) {
 			// Mark the break BEFORE parking, not after resuming. Our PTS is the emulator
 			// clock, which keeps running while we sleep, so the next frame lands however
-			// long the pause was into the future. Published as an empty group that gap
+			// long the pause was into the future. Published as a marker group that gap
 			// reads as a discontinuity rather than one enormous frame duration, and the
 			// marker becomes the live edge -- so a viewer arriving mid-pause waits for real
 			// media instead of being served the pre-pause group as if it were live
@@ -444,9 +466,10 @@ fn run_emulator(
 async fn main() -> Result<()> {
 	let config = Config::parse();
 	config.log.init()?;
+	config.check_deprecated()?;
 
 	#[cfg(feature = "jemalloc")]
-	let jemalloc = moq_native::jemalloc::run();
+	let jemalloc = moq_tokio::jemalloc::run();
 	#[cfg(not(feature = "jemalloc"))]
 	let jemalloc = std::future::pending::<anyhow::Result<()>>();
 
@@ -473,31 +496,51 @@ async fn main() -> Result<()> {
 mod tests {
 	use super::*;
 
-	/// `--client-connect` is the only way to reach the relay: it must parse without
+	/// `--connect` is the only way to reach the relay: it must parse without
 	/// a connect flag of our own alongside it, and the URL must land where `run`
-	/// reads it. A second required flag would leave `--client-connect` inert.
+	/// reads it. A second required flag would leave `--connect` inert.
 	///
 	/// The argv is a copy of `demo/boy/justfile`, not a read of it, so this pins the
 	/// binary's flag surface rather than the two staying in sync.
+	/// `--connect` is the only spelling that reaches the dial, and the URL has to
+	/// land where `run` reads it. A second required flag would leave it inert.
 	#[test]
 	fn matches_demo_invocation() {
-		let config = Config::try_parse_from([
-			"moq-boy",
-			"--client-connect",
-			"http://localhost:4443",
-			"--rom",
-			"rom/big2small.gb",
-			"--location",
-			"localhost",
+		let config = Config::parse_from(&[
+			std::ffi::OsStr::new("--connect"),
+			std::ffi::OsStr::new("http://localhost:4443"),
+			std::ffi::OsStr::new("--rom"),
+			std::ffi::OsStr::new("rom/big2small.gb"),
+			std::ffi::OsStr::new("--location"),
+			std::ffi::OsStr::new("localhost"),
 		])
 		.expect("demo/boy/justfile invocation should parse");
+		config.check_deprecated().expect("the demo uses current spellings");
 
-		let connect = config
-			.client
-			.connect
-			.expect("--client-connect should reach the client config");
+		let connect = config.client.url.expect("the connect URL should reach the dial config");
 		assert_eq!(connect.scheme(), "http");
 		assert_eq!(connect.host_str(), Some("localhost"));
 		assert_eq!(connect.port(), Some(4443));
+	}
+
+	/// The spelling the demo used to pass. It still parses, so the process can name
+	/// `--connect` rather than leave the parser reporting an unexpected argument, but it
+	/// configures nothing and must stop the run.
+	#[test]
+	fn the_released_connect_spelling_is_refused() {
+		let config = Config::parse_from(&[
+			std::ffi::OsStr::new("--client-connect"),
+			std::ffi::OsStr::new("http://localhost:4443"),
+			std::ffi::OsStr::new("--rom"),
+			std::ffi::OsStr::new("rom/big2small.gb"),
+		])
+		.expect("the released spelling still parses");
+		assert_eq!(config.client.url, None);
+
+		let err = config.check_deprecated().expect_err("must refuse").to_string();
+		assert!(
+			err.contains("--client-connect / MOQ_CLIENT_CONNECT -> --connect / MOQ_CONNECT"),
+			"{err}"
+		);
 	}
 }

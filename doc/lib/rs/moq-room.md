@@ -9,7 +9,7 @@ description: Headless multi-participant rooms over MoQ
 [![docs.rs](https://docs.rs/moq-room/badge.svg)](https://docs.rs/moq-room)
 
 The native twin of [`@moq/room`](/lib/js/room). A room is a path prefix. There
-is no service and no storage: joining is minting a moq-token rooted at that
+is no service and no storage: joining is minting a moq-auth token rooted at that
 prefix and dialing the relay. Participants are discovered from the announce
 stream. Identity is the path before `camera.hang` / `screen.hang`.
 
@@ -23,11 +23,11 @@ cargo add moq-room
 ```
 
 ```rust
-use moq_net::{Origin, Path};
+use moq_net::Path;
 use moq_room::{Kind, Room, claims};
 
 let token = key.sign(&claims("meet/demo", "alice")?, None)?;
-let origin = Origin::random().produce();
+let origin = moq_tokio::origin::spawn();
 let mut room = Room::new(&origin.consume(), Some(Path::new("alice").to_owned()));
 while let Some(event) = room.next().await {
     if event.kind == Kind::Camera {
