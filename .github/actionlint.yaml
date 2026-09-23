@@ -1,0 +1,5 @@
+# actionlint: labels of the fork's self-hosted runners (fork-check.yml)
+self-hosted-runner:
+  labels:
+    - moq
+    - fedora-rust

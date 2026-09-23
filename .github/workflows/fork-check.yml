@@ -1,0 +1,57 @@
+name: Fork check
+
+# Fork-local: `just check` and `just test` on the fork's own pushes, on the
+# owner's fedora build host (x86_64). ci-dispatchd boots a one-shot container
+# from the ci-runner-rust image for the one job: Nix with this repository's
+# devshell already realised, and sccache warmed by a build of the workspace, so
+# a run skips the toolchain download and most of the compile.
+#
+# Upstream's check.yml is untouched and still runs every pull request, including
+# every pull request from a fork, on GitHub-hosted arm64. This workflow never
+# runs for a pull request, never outside Spaceghost/moq, and never for a run
+# anyone but the repository owner started, because a
+# self-hosted runner executes whatever the workflow file says. The dispatcher
+# refuses fork pull requests on its own as well. Setting the repository
+# variable CI_SELF_HOSTED to "false" turns this workflow off.
+#
+# It diffs against origin/main, the pristine upstream mirror, so a push to
+# `spaceghost` checks the fork's own patch series. See the README's
+# "Fork maintenance" section.
+
+on:
+  push:
+    branches-ignore: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    if: >-
+      github.repository == 'Spaceghost/moq' && vars.CI_SELF_HOSTED != 'false'
+      && github.actor == github.repository_owner
+      && github.triggering_actor == github.repository_owner
+    runs-on: [self-hosted, moq, fedora-rust]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history so `just check` can diff against origin/main.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check
+        run: nix develop --command just check
+
+      - name: Test
+        if: ${{ !cancelled() }}
+        run: nix develop --command just test
+
+      - name: sccache statistics
+        if: ${{ !cancelled() }}
+        run: sccache --show-stats

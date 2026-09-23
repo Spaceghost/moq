@@ -213,6 +213,10 @@ Two other operational notes:
 
 - `fork-sync.yml` and `fork-release.yml` are guarded with `if: github.repository_owner == 'Spaceghost'`, so forking this fork does not inherit the automation.
 
+### Self-hosted check
+
+[`.github/workflows/fork-check.yml`](.github/workflows/fork-check.yml) runs `just check` and `just test` on every push to a branch of this fork other than `main`, on the owner's fedora build host (x86\_64). For each job, `ci-dispatchd` there boots a one-shot container from the `ci-runner-rust` image, which already has Nix, this repository's devshell and a warm sccache. It diffs against `origin/main`, so a push to `spaceghost` checks the fork's patch series. It never runs for pull requests; upstream's `check.yml` still covers those on GitHub-hosted runners, forks included. Set the repository variable `CI_SELF_HOSTED` to `false` to switch it off.
+
 ### Adding a local change
 
 ```sh
