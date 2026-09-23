@@ -30,6 +30,8 @@ on:
       - Cache
       - Cachix
       - Docker
+      - Fork release
+      - Fork sync
       - libmoq
       - moq-cli
       - moq-gst
