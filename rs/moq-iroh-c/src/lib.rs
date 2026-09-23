@@ -259,7 +259,7 @@ unsafe fn write_text(text: &str, buf: *mut c_char, cap: usize) -> Result<i32, Er
 	}
 	// SAFETY: `buf` holds at least `cap >= need` bytes, per the caller.
 	unsafe {
-		std::ptr::copy_nonoverlapping(text.as_ptr(), buf as *mut u8, text.len());
+		std::ptr::copy_nonoverlapping(text.as_ptr(), buf.cast::<u8>(), text.len());
 		*buf.add(text.len()) = 0;
 	}
 	i32::try_from(text.len()).map_err(|_| Error::Small(need))
@@ -493,7 +493,7 @@ pub unsafe extern "C" fn moqi_last_error(buf: *mut c_char, cap: usize) -> i32 {
 			let n = e.len().min(cap - 1);
 			// SAFETY: `buf` holds `cap` bytes, per the caller.
 			unsafe {
-				std::ptr::copy_nonoverlapping(e.as_ptr(), buf as *mut u8, n);
+				std::ptr::copy_nonoverlapping(e.as_ptr(), buf.cast::<u8>(), n);
 				*buf.add(n) = 0;
 			}
 		}
