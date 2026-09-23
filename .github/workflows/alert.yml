@@ -30,6 +30,7 @@ on:
       - Cache
       - Cachix
       - Docker
+      - Fork check
       - Fork release
       - Fork sync
       - libmoq
