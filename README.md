@@ -195,6 +195,7 @@ git push origin --delete fork-sync/backup-<timestamp>-<sha>
 Two other operational notes:
 
 - GitHub disables scheduled workflows after 60 days without repository activity. If the sync goes quiet, one manual dispatch restarts the schedule.
+
 - Some of upstream's own workflows are guarded by `if: github.repository_owner == 'moq-dev'` and correctly skip here; several are **not**. Observed on the first mirror push to `main`: `Release RS`, `Release JS` and `Release Go` skipped as intended, while `Swift` and `Cache` both started real nix builds on this fork. Every sync push will start them again. They publish nothing (the registry credentials are upstream's), so this is wasted runner time and red checkmarks rather than a danger, and Actions minutes are free on a public repository, but it is worth switching off. Disable each unwanted workflow once, under Actions → the workflow → "Disable workflow"; the setting is per workflow and survives pushes:
 
   ```sh

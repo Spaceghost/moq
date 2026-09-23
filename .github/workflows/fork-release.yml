@@ -6,6 +6,8 @@ name: Fork release
 #   moq-relay   the relay binary, to deploy on a host with a public UDP port
 #   moq_ffi     the uniffi cdylib a C#/.NET host (e.g. a Dalamud plugin)
 #               P/Invokes, for linux-x64 and win-x64
+#   moq_iroh    moq over iroh as a static library and C header, for a host
+#               that links C (ghostty-agent), for linux-x64
 #
 # Rust consumers do not need this workflow at all: pin the fork by git in
 # Cargo.toml (see the README). This is for the things you cannot pin by
@@ -74,6 +76,15 @@ jobs:
             crate: moq-ffi
             artifact: moq_ffi.dll
             kind: lib
+          # moq over iroh behind a poll-driven C ABI (rs/moq-iroh-c): the
+          # static library and its header, which a C-ABI host (ghostty-agent)
+          # links into its own binary.
+          - name: moq_iroh (linux-x64)
+            runs-on: ubuntu-22.04
+            crate: moq-iroh-c
+            artifact: libmoq_iroh.a
+            header: rs/moq-iroh-c/include/moq_iroh.h
+            kind: lib
 
     steps:
       - name: Checkout
@@ -98,6 +109,7 @@ jobs:
         env:
           ARTIFACT: ${{ matrix.artifact }}
           KIND: ${{ matrix.kind }}
+          HEADER: ${{ matrix.header }}
           RUNNER: ${{ matrix.runs-on }}
         run: |
           set -euo pipefail
@@ -120,6 +132,12 @@ jobs:
 
           cp "$src" "dist/${ARTIFACT}"
           ( cd dist && sha256sum "${ARTIFACT}" > "${ARTIFACT}.sha256" )
+          # a C library ships its header beside it
+          if [[ -n "${HEADER}" ]]; then
+            h="$(basename "${HEADER}")"
+            cp "${HEADER}" "dist/${h}"
+            ( cd dist && sha256sum "${h}" > "${h}.sha256" )
+          fi
           echo "rid=${rid}" >>"$GITHUB_OUTPUT"
 
       - name: Upload artifact
@@ -198,7 +216,7 @@ jobs:
           moq-native = { git = \"https://github.com/Spaceghost/moq\", tag = \"${tag}\" }
           \`\`\`
 
-          Assets: \`moq-relay\` for linux-x64/linux-arm64, and the \`moq_ffi\` cdylib for linux-x64/win-x64 (the native library a .NET host P/Invokes). Each has a \`.sha256\` beside it."
+          Assets: \`moq-relay\` for linux-x64/linux-arm64, the \`moq_ffi\` cdylib for linux-x64/win-x64 (the native library a .NET host P/Invokes), and \`libmoq_iroh.a\` with \`moq_iroh.h\` for linux-x64 (moq over iroh for a C-ABI host, rs/moq-iroh-c). Each has a \`.sha256\` beside it."
 
           gh release create "$tag" \
             --target "$GITHUB_SHA" \

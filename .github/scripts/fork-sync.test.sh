@@ -72,7 +72,7 @@ setup() { # setup <patch-fn>
 
 run() {
     set +e
-    ( cd "$WORK/clone" && UPSTREAM_URL="$WORK/upstream" DRY_RUN=true bash "$SCRIPT" ) \
+    (cd "$WORK/clone" && UPSTREAM_URL="$WORK/upstream" DRY_RUN=true bash "$SCRIPT") \
         >"$WORK/log" 2>&1
     RC=$?
     set -e
