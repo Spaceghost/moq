@@ -33,6 +33,7 @@ on:
       - Fork check
       - Fork release
       - Fork sync
+      - Interop
       - libmoq
       - moq-cli
       - moq-gst
@@ -53,7 +54,6 @@ on:
       - Release Swift Lib
       - release-winget
       - rpm-repo
-      - Smoke
       - Swift
     types:
       - completed

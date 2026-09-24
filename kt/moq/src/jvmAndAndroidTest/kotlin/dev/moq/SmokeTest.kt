@@ -190,7 +190,7 @@ class SmokeTest {
     /**
      * Video has the same Flow audio does. Decoding real frames needs an encoder
      * backend, so this pins the extension's shape; the decode itself is covered
-     * by the interop smoke tests.
+     * by the interop test (`just test interop`).
      */
     @Test
     fun `video consumer exposes a frames flow like audio does`() {
@@ -234,6 +234,21 @@ class SmokeTest {
 
             val consumer = broadcast.consume().subscribeJsonSnapshot("status", config)
             assertEquals(Status(state = "live"), consumer.valuesAs<Status>().first())
+        }
+    }
+
+    @Test
+    fun `json producer demand follows subscribers`() = runTest {
+        BroadcastProducer().use { broadcast ->
+            val config = JsonSnapshotConfig(deltaRatio = 0u, compression = false)
+            val demand: TrackDemand = broadcast.publishJsonSnapshot("status", config).demand()
+            assertEquals("status", demand.name())
+            assertEquals(false, demand.isUsed())
+
+            val consumer = broadcast.consume().subscribeJsonSnapshot("status", config)
+            demand.used()
+            consumer.cancel()
+            demand.unused()
         }
     }
 
